@@ -1,5 +1,5 @@
 /*
- * Game Compressor - keep PS5 auto power-down timer reset during operations.
+ * Game Compressor - keep PS5 idle/display timers reset during operations.
  */
 
 #pragma once

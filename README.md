@@ -109,19 +109,19 @@ the UI returns to that title when it is still available.
 Persistent validation markers:
 
 ```text
-/data/ps5-image-stack/GameCompressor/validations
+/data/GameCompressor/validations
 ```
 
 Repair workspace:
 
 ```text
-/data/ps5-image-stack/GameCompressor/repair
+/data/GameCompressor/logs/repair
 ```
 
 Launcher marker:
 
 ```text
-/data/ps5-image-stack/GameCompressor/launcher.ok
+/data/GameCompressor/launcher.ok
 ```
 
 Compatibility shutdown endpoint:

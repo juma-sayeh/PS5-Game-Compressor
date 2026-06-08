@@ -16,10 +16,10 @@
 #include <unistd.h>
 
 #define GC_DATA_ROOT "/data"
-#define GC_STACK_DIR "/data/ps5-image-stack"
-#define GC_DATA_DIR "/data/ps5-image-stack/GameCompressor"
-#define GC_LOG_PATH GC_DATA_DIR "/log.txt"
-#define GC_CRASH_LOG_PATH GC_DATA_DIR "/crash.log"
+#define GC_DATA_DIR "/data/GameCompressor"
+#define GC_LOG_DIR GC_DATA_DIR "/logs"
+#define GC_LOG_PATH GC_LOG_DIR "/log.txt"
+#define GC_CRASH_LOG_PATH GC_LOG_DIR "/crash.log"
 
 static pthread_mutex_t g_diag_lock = PTHREAD_MUTEX_INITIALIZER;
 static char g_checkpoint[128] = "not-started";
@@ -34,8 +34,8 @@ mkdir_if_needed(const char *path) {
 static void
 ensure_diag_dir(void) {
   mkdir_if_needed(GC_DATA_ROOT);
-  mkdir_if_needed(GC_STACK_DIR);
   mkdir_if_needed(GC_DATA_DIR);
+  mkdir_if_needed(GC_LOG_DIR);
 }
 
 static const char *

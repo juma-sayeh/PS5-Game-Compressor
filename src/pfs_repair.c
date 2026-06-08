@@ -43,7 +43,7 @@
 #define PFSC_INITIAL_DATA_OFFSET 0x10000ULL
 #define PFSC_OFFSET_ENTRY_SIZE 8ULL
 
-#define REPAIR_BASE "/data/ps5-image-stack/GameCompressor/repair"
+#define REPAIR_BASE "/data/GameCompressor/logs/repair"
 #define SHADOW_PFSC_BASE "/mnt/shadowmnt/pfsc"
 #define REPAIR_PROGRESS_INTERVAL 256ULL
 #define REPAIR_DEFAULT_WORKERS 4
@@ -56,7 +56,6 @@
 #define REPAIR_COPY_CHUNK_LOW (8ULL * 1024ULL * 1024ULL)
 #define REPAIR_COPY_CHUNK_MIN (1ULL * 1024ULL * 1024ULL)
 #define REPAIR_VHASH_CACHE_BYTES (8ULL * 1024ULL * 1024ULL)
-#define PFS_REPAIR_SCAN_REPAIR_NEEDED 2
 #define JOURNAL_SYNC_INTERVAL_SECONDS 2
 
 #define JOURNAL_SUFFIX "_scan_journal.bin"
@@ -136,6 +135,7 @@ typedef struct repair_ctx {
   uint64_t journal_flushed_blocks;
   time_t journal_last_sync_at;
   time_t progress_last_sync_at;
+  char journal_resume_status[160];
   uint64_t raw_mismatches;
   uint64_t read_errors;
   uint64_t decode_errors;
@@ -1172,7 +1172,11 @@ journal_resume_available(repair_ctx_t *ctx, const pfsc_image_t *img,
                          char *err, size_t err_size) {
   struct stat st;
   if(stat(ctx->journal_path, &st) != 0) {
-    if(errno == ENOENT) return 0;
+    if(errno == ENOENT) {
+      snprintf(ctx->journal_resume_status,
+               sizeof(ctx->journal_resume_status), "%s", "missing");
+      return 0;
+    }
     set_err(err, err_size, "stat journal: %s", strerror(errno));
     return -1;
   }
@@ -1185,6 +1189,8 @@ journal_resume_available(repair_ctx_t *ctx, const pfsc_image_t *img,
   unsigned char hdr[JOURNAL_HEADER_SIZE];
   if(journal_read_header_at(ctx->journal_path, hdr) != 0 ||
      !journal_header_identity_matches(hdr, ctx, img)) {
+    snprintf(ctx->journal_resume_status, sizeof(ctx->journal_resume_status),
+             "%s", "rejected identity mismatch");
     if(unlink(ctx->journal_path) != 0 && errno != ENOENT) {
       set_err(err, err_size, "remove stale journal: %s", strerror(errno));
       return -1;
@@ -1193,7 +1199,13 @@ journal_resume_available(repair_ctx_t *ctx, const pfsc_image_t *img,
   }
 
   uint32_t phase = rd32(hdr + JOURNAL_OFF_PHASE);
-  if(phase == JOURNAL_PHASE_SCAN) return 1;
+  if(phase == JOURNAL_PHASE_SCAN) {
+    snprintf(ctx->journal_resume_status, sizeof(ctx->journal_resume_status),
+             "%s", "accepted");
+    return 1;
+  }
+  snprintf(ctx->journal_resume_status, sizeof(ctx->journal_resume_status),
+           "rejected phase %u", phase);
   if(unlink(ctx->journal_path) != 0 && errno != ENOENT) {
     set_err(err, err_size, "remove completed journal: %s", strerror(errno));
     return -1;
@@ -2059,6 +2071,14 @@ repair_store_hash_counters(repair_ctx_t *ctx) {
 }
 
 static void
+repair_store_found_counters(repair_ctx_t *ctx) {
+  long blocks = ctx->info.repaired_blocks > (uint64_t)LONG_MAX ? LONG_MAX :
+      (long)ctx->info.repaired_blocks;
+  atomic_store(&g_job.bad_blocks_found, blocks);
+  atomic_store(&g_job.raw_blocks, blocks);
+}
+
+static void
 repair_account_result(repair_ctx_t *ctx, const repair_slot_t *slot) {
   if(slot->used_hash) ctx->info.hash_checked_blocks++;
   if(slot->hash_match) ctx->info.hash_matched_blocks++;
@@ -2092,8 +2112,7 @@ repair_record_validation_result(repair_ctx_t *ctx, pfsc_image_t *img,
     if(ctx->journal_states) ctx->journal_states[slot->index] = JOURNAL_STATE_BAD;
     ctx->bad_blocks[slot->index] = 1;
     ctx->info.repaired_blocks++;
-    atomic_store(&g_job.raw_blocks,
-                 job_long_from_u64(ctx->info.repaired_blocks));
+    repair_store_found_counters(ctx);
     fprintf(ctx->bad_tsv, "%llu\t%zu\t%llu\t%lld\t%016llx\t%016llx\n",
             (unsigned long long)slot->index,
             slot->stored_len,
@@ -2380,6 +2399,8 @@ scan_blocks(repair_ctx_t *ctx, pfsc_image_t *img, int mounted_fd,
   atomic_store(&g_job.raw_blocks,
                ctx->info.repaired_blocks > (uint64_t)LONG_MAX ? LONG_MAX :
                (long)ctx->info.repaired_blocks);
+  repair_store_found_counters(ctx);
+  atomic_store(&g_job.repaired_blocks, 0);
   atomic_store(&g_job.compressed_blocks,
                ctx->info.matched_blocks > (uint64_t)LONG_MAX ? LONG_MAX :
                (long)ctx->info.matched_blocks);
@@ -2958,14 +2979,11 @@ copy_replace_repair(repair_ctx_t *ctx, pfsc_image_t *img, int mounted_fd,
   progress_line(ctx, "COPY_REPLACE_START old_stored=%llu",
                 (unsigned long long)img->stored_size);
 
-  ctx->bad_blocks = calloc((size_t)img->block_count, 1);
-  if(!ctx->bad_blocks) {
-    set_err(err, err_size, "out of memory");
-    errno = ENOMEM;
-    goto done;
-  }
-
   ctx->info.old_stored_size = img->stored_size;
+  progress_line(ctx, "SCAN mounted=%s nested=%s type=%s blocks=%llu",
+                ctx->info.mounted_path, ctx->info.nested_name,
+                nested_type_name(ctx->info.nested_type),
+                (unsigned long long)img->block_count);
   if(scan_blocks(ctx, img, mounted_fd, err, err_size) != 0) goto done;
   uint64_t rebuild_limit = temp_only && ctx->block_limit &&
       ctx->block_limit < img->block_count ? ctx->block_limit : img->block_count;
@@ -3003,6 +3021,7 @@ copy_replace_repair(repair_ctx_t *ctx, pfsc_image_t *img, int mounted_fd,
   job_set_phase("copying", 0, job_long_from_u64(ctx->info.new_stored_size),
                 "Rebuilding repaired PFSC image");
   atomic_store(&g_job.copied_bytes, 0);
+  atomic_store(&g_job.repaired_blocks, 0);
   progress_line(ctx, "COPY_REPLACE_REBUILD_LIMIT blocks=%llu/%llu",
                 (unsigned long long)rebuild_limit,
                 (unsigned long long)img->block_count);
@@ -3057,6 +3076,7 @@ copy_replace_repair(repair_ctx_t *ctx, pfsc_image_t *img, int mounted_fd,
         goto done;
       }
       job_add_bytes(&g_job.repair_written_bytes, PFS_BLOCK_SIZE);
+      job_add_bytes(&g_job.repaired_blocks, 1);
       ctx->info.bytes_moved += PFS_BLOCK_SIZE;
       progress_line(ctx,
                     "RAW_ADDED block=%llu old_offset=%llu new_offset=%llu old_len=%llu",
@@ -3230,6 +3250,8 @@ apply_repair(repair_ctx_t *ctx, pfsc_image_t *img,
   atomic_store(&g_job.raw_blocks,
                ctx->info.repaired_blocks > (uint64_t)LONG_MAX ? LONG_MAX :
                (long)ctx->info.repaired_blocks);
+  repair_store_found_counters(ctx);
+  atomic_store(&g_job.repaired_blocks, 0);
   atomic_store(&g_job.compressed_blocks,
                ctx->info.matched_blocks > (uint64_t)LONG_MAX ? LONG_MAX :
                (long)ctx->info.matched_blocks);
@@ -3271,6 +3293,7 @@ apply_repair(repair_ctx_t *ctx, pfsc_image_t *img,
         goto done;
       }
       job_add_bytes(&g_job.repair_written_bytes, PFS_BLOCK_SIZE);
+      job_add_bytes(&g_job.repaired_blocks, 1);
       ctx->info.bytes_moved += PFS_BLOCK_SIZE;
       progress_line(ctx,
                     "RAW_ADDED block=%llu old_offset=%llu new_offset=%llu old_len=%zu",
@@ -3465,13 +3488,14 @@ pfs_repair_ffpfsc_run(const char *path, const repair_options_t *opts,
   }
 
   if(open_outputs(&ctx, &img, err, err_size) != 0) goto done;
-  if(local_opts.mode == PFS_REPAIR_MODE_COPY_REPLACE) {
-    ctx.info.resumed = 0;
-  }
   progress_line(&ctx, "START path=%s title=%s nested=%s type=%s%s",
                 path, ctx.info.title_id, ctx.info.nested_name,
                 nested_type_name(ctx.info.nested_type),
                 ctx.info.resumed ? " resume=1" : "");
+  progress_line(&ctx, "JOURNAL status=%s path=%s",
+                ctx.journal_resume_status[0] ?
+                    ctx.journal_resume_status : "new",
+                ctx.info.journal_path);
   progress_line(&ctx,
                 "STRATEGY mode=%s%s%s%s source=%llu required_free=%llu available_free=%llu storage_check=%s%s%s",
                 repair_mode_name(ctx.info.repair_mode),
@@ -3499,6 +3523,14 @@ pfs_repair_ffpfsc_run(const char *path, const repair_options_t *opts,
                                        (uint64_t)PFS_VHASH_HASH_SIZE));
   }
 
+  ctx.bad_blocks = calloc((size_t)img.block_count, 1);
+  if(!ctx.bad_blocks) {
+    set_err(err, err_size, "out of memory");
+    errno = ENOMEM;
+    goto done;
+  }
+  if(journal_open_or_create(&ctx, &img, err, err_size) != 0) goto done;
+
   if(local_opts.mode == PFS_REPAIR_MODE_COPY_REPLACE) {
     if(copy_replace_repair(&ctx, &img, mounted_fd, local_opts.temp_only,
                            local_opts.force_rebuild, err, err_size) != 0) {
@@ -3508,13 +3540,6 @@ pfs_repair_ffpfsc_run(const char *path, const repair_options_t *opts,
     goto done;
   }
 
-  ctx.bad_blocks = calloc((size_t)img.block_count, 1);
-  if(!ctx.bad_blocks) {
-    set_err(err, err_size, "out of memory");
-    errno = ENOMEM;
-    goto done;
-  }
-  if(journal_open_or_create(&ctx, &img, err, err_size) != 0) goto done;
   progress_line(&ctx, "SCAN mounted=%s nested=%s type=%s blocks=%llu",
                 ctx.info.mounted_path, ctx.info.nested_name,
                 nested_type_name(ctx.info.nested_type),

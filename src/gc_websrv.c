@@ -25,6 +25,7 @@
 #define HEADER_MAX 65536
 #define CLIENT_RCVBUF_SIZE (1024 * 1024)
 #define CLIENT_THREAD_STACK_SIZE (1024 * 1024)
+#define GC_HANDOFF_TOKEN "gc-local-reload"
 
 static int             g_websrv_srvfd = -1;
 static pthread_mutex_t g_websrv_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -310,12 +311,15 @@ diag_request(const http_request_t *req) {
                    "\"launcher_final_state\":\"%s\"},"
                    "\"routes\":[\"/\",\"/api/status\",\"/api/diag\","
                    "\"/api/control/shutdown\","
+                   "\"/api/control/handoff-state\","
+                   "\"/api/control/handoff-shutdown\","
                    "\"/api/gc/games\",\"/api/gc/usb\","
-                   "\"/api/gc/history\",\"/api/gc/job\","
-                   "\"/api/gc/job/cancel\",\"/api/gc/queue/cancel\","
-                   "\"/api/gc/compress\",\"/api/gc/uncompress\","
-                   "\"/api/gc/validate-repair\","
-                   "\"/api/gc/refresh-mount\","
+	                   "\"/api/gc/history\",\"/api/gc/job\","
+	                   "\"/api/gc/job/cancel\",\"/api/gc/queue/cancel\","
+	                   "\"/api/gc/bad-blocks\","
+	                   "\"/api/gc/compress\",\"/api/gc/uncompress\","
+	                   "\"/api/gc/validate-repair\",\"/api/gc/validate-only\","
+	                   "\"/api/gc/refresh-mount\","
                    "\"/api/gc/move-to-usb\","
                    "\"/api/gc/move-to-internal\"]}",
                    checkpoint,
@@ -348,6 +352,32 @@ shutdown_request(const http_request_t *req) {
 }
 
 static int
+handoff_shutdown_request(const http_request_t *req) {
+  char token[64];
+  char mode[32];
+  if(!websrv_get_query_arg(req, "token", token, sizeof(token)) ||
+     strcmp(token, GC_HANDOFF_TOKEN)) {
+    return websrv_send_error_json(req->fd, 403, "bad handoff token");
+  }
+  if(!websrv_get_query_arg(req, "mode", mode, sizeof(mode))) {
+    snprintf(mode, sizeof(mode), "%s", "reload");
+  }
+  if(strcmp(mode, "reload") && strcmp(mode, "takeover")) {
+    snprintf(mode, sizeof(mode), "%s", "reload");
+  }
+  char body[128];
+  int n = snprintf(body, sizeof(body),
+                   "{\"ok\":true,\"shutdown\":true,\"handoff\":true,"
+                   "\"mode\":\"%s\"}", mode);
+  if(n < 0 || (size_t)n >= sizeof(body)) {
+    return websrv_send_error_json(req->fd, 500, "handoff response too large");
+  }
+  int rc = websrv_send(req->fd, 200, "application/json", body, (size_t)n);
+  websrv_request_exit();
+  return rc;
+}
+
+static int
 dispatch_request(const http_request_t *req) {
   if(!strcmp(req->method, "GET") || !strcmp(req->method, "HEAD")) {
     if(!strcmp(req->path, "/") || !strcmp(req->path, "/index.html")) {
@@ -362,6 +392,12 @@ dispatch_request(const http_request_t *req) {
     if(!strcmp(req->path, "/api/control/shutdown")) {
       return shutdown_request(req);
     }
+    if(!strcmp(req->path, "/api/control/handoff-state")) {
+      return gc_api_handoff_state_request(req);
+    }
+    if(!strcmp(req->path, "/api/control/handoff-shutdown")) {
+      return handoff_shutdown_request(req);
+    }
     if(!strcmp(req->path, "/api/gc/icon")) {
       return gc_api_icon_request(req);
     }
@@ -374,10 +410,11 @@ dispatch_request(const http_request_t *req) {
   if(!strcmp(req->method, "POST")) {
     if(!strcmp(req->path, "/api/gc/job/cancel") ||
        !strcmp(req->path, "/api/gc/queue/cancel") ||
-       !strcmp(req->path, "/api/gc/compress") ||
-       !strcmp(req->path, "/api/gc/uncompress") ||
-       !strcmp(req->path, "/api/gc/validate-repair") ||
-       !strcmp(req->path, "/api/gc/refresh-mount") ||
+	       !strcmp(req->path, "/api/gc/compress") ||
+	       !strcmp(req->path, "/api/gc/uncompress") ||
+	       !strcmp(req->path, "/api/gc/validate-repair") ||
+	       !strcmp(req->path, "/api/gc/validate-only") ||
+	       !strcmp(req->path, "/api/gc/refresh-mount") ||
        !strcmp(req->path, "/api/gc/move-to-usb") ||
        !strcmp(req->path, "/api/gc/move-to-internal")) {
       return gc_api_request(req, req->path);

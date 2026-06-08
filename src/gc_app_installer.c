@@ -24,8 +24,7 @@
 #define GC_APP_ROOT "/user/app"
 #define GC_APP_PARENT GC_APP_ROOT "/"
 #define GC_DATA_ROOT "/data"
-#define GC_STACK_DIR "/data/ps5-image-stack"
-#define GC_DATA_DIR GC_STACK_DIR "/GameCompressor"
+#define GC_DATA_DIR "/data/GameCompressor"
 #define GC_MARKER_PATH GC_DATA_DIR "/launcher.ok"
 #define GC_INSTALL_MARKER "game-compressor-launcher-v1\n"
 #define GC_APPINST_MODULE "libSceAppInstUtil.sprx"
@@ -274,7 +273,6 @@ file_differs(const char *path, const uint8_t *expected, size_t expected_size) {
 static int
 ensure_data_dir(void) {
   if(mkdir_if_needed(GC_DATA_ROOT) != 0) return -1;
-  if(mkdir_if_needed(GC_STACK_DIR) != 0) return -1;
   return mkdir_if_needed(GC_DATA_DIR);
 }
 
@@ -363,7 +361,6 @@ gc_install_app_if_needed(void) {
   char sce_sys_dir[256];
   char param_path[256];
   char icon_path[256];
-  char msg[128];
   struct stat st;
 
   reset_launcher_diag();
@@ -390,11 +387,11 @@ gc_install_app_if_needed(void) {
                                     sizeof(g_install_marker) - 1);
 
   if(app_exists && assets_changed) {
-    gc_notify_message("Launcher app", "Updating PS5 home-screen tile");
+    gc_notify_message("Updating home tile", NULL);
   } else if(app_exists) {
-    gc_notify_message("Launcher app", "Refreshing PS5 home-screen tile");
+    gc_notify_message("Refreshing home tile", NULL);
   } else {
-    gc_notify_message("Launcher app", "Installing PS5 home-screen tile");
+    gc_notify_message("Installing home tile", NULL);
   }
 
   if(!api.initialize) {
@@ -402,7 +399,7 @@ gc_install_app_if_needed(void) {
     publish_launcher_diag();
     gc_log("launcher install AppInst initialize missing");
     set_launcher_final("failed_nonfatal", -ENOSYS);
-    gc_notify_message("Launcher app failed", "AppInst initialize missing");
+    gc_notify_message("Home tile setup failed", "Use web UI");
     return -1;
   }
 
@@ -413,8 +410,7 @@ gc_install_app_if_needed(void) {
     gc_log("launcher install sceAppInstUtilInitialize failed rc=0x%08x",
            (unsigned)err);
     set_launcher_final("failed_nonfatal", err);
-    snprintf(msg, sizeof(msg), "AppInst init failed 0x%08x", (unsigned)err);
-    gc_notify_message("Launcher app failed", msg);
+    gc_notify_message("Home tile setup failed", "Use web UI");
     return -1;
   }
 
@@ -424,8 +420,7 @@ gc_install_app_if_needed(void) {
   if(mkdir_if_needed(app_dir) != 0 || mkdir_if_needed(sce_sys_dir) != 0) {
     gc_log("launcher install mkdir failed errno=%d", errno);
     set_launcher_final("failed_nonfatal", -errno);
-    snprintf(msg, sizeof(msg), "mkdir failed errno %d", errno);
-    gc_notify_message("Launcher app failed", msg);
+    gc_notify_message("Home tile setup failed", "Use web UI");
     return -1;
   }
 
@@ -433,7 +428,7 @@ gc_install_app_if_needed(void) {
                 gc_launcher_param_json_size) != 0) {
     gc_log("launcher install failed writing %s errno=%d", param_path, errno);
     set_launcher_final("failed_nonfatal", -errno);
-    gc_notify_message("Launcher app failed", "could not write param.json");
+    gc_notify_message("Home tile setup failed", "Use web UI");
     return -1;
   }
 
@@ -441,7 +436,7 @@ gc_install_app_if_needed(void) {
                 gc_launcher_icon0_png_size) != 0) {
     gc_log("launcher install failed writing %s errno=%d", icon_path, errno);
     set_launcher_final("failed_nonfatal", -errno);
-    gc_notify_message("Launcher app failed", "could not write icon0.png");
+    gc_notify_message("Home tile setup failed", "Use web UI");
     return -1;
   }
 
@@ -449,9 +444,7 @@ gc_install_app_if_needed(void) {
   if(err) {
     gc_log("launcher install install_app failed rc=0x%08x", (unsigned)err);
     set_launcher_final("failed_nonfatal", err);
-    snprintf(msg, sizeof(msg), "register %s failed 0x%08x",
-             GAME_COMPRESSOR_LAUNCHER_TITLE_ID, (unsigned)err);
-    gc_notify_message("Launcher app failed", msg);
+    gc_notify_message("Home tile setup failed", "Use web UI");
     return -1;
   }
 
@@ -465,19 +458,13 @@ gc_install_app_if_needed(void) {
   }
 
   set_launcher_final("installed", 0);
-  gc_notify_message("Launcher ready",
-                    "Tile PSGC50001 opens http://127.0.0.1:5910/");
+  gc_notify_message("Ready", "Home tile installed");
   return 1;
 }
 
 static void *
 launcher_thread(void *arg) {
   launcher_thread_arg_t *state = arg;
-  char fallback[128];
-
-  snprintf(fallback, sizeof(fallback), "Use http://%s:%u/",
-           state && state->ip[0] ? state->ip : "<PS5_IP>",
-           (unsigned int)GAME_COMPRESSOR_PORT);
 
   gc_log("launcher started after web server");
   init_ps5_services();
@@ -488,7 +475,7 @@ launcher_thread(void *arg) {
   } else {
     gc_log("launcher skipped rc=%d, web server remains available",
            app_install_status);
-    gc_notify_message("Launcher skipped", fallback);
+    gc_notify_message("Home tile skipped", "Use web UI");
   }
 
   free(state);
@@ -509,7 +496,7 @@ gc_launcher_start(const char *ip) {
   if(!state) {
     set_launcher_final("failed_nonfatal", -ENOMEM);
     gc_log("launcher skipped: failed allocating thread state");
-    gc_notify_message("Launcher skipped", "Use http://<PS5_IP>:5910/");
+    gc_notify_message("Home tile skipped", "Use web UI");
     return -1;
   }
   snprintf(state->ip, sizeof(state->ip), "%s",
@@ -524,7 +511,7 @@ gc_launcher_start(const char *ip) {
   if(rc != 0) {
     set_launcher_final("failed_nonfatal", -rc);
     gc_log("launcher skipped: pthread_create rc=%d", rc);
-    gc_notify_message("Launcher skipped", "Use http://<PS5_IP>:5910/");
+    gc_notify_message("Home tile skipped", "Use web UI");
     free(state);
     return -1;
   }

@@ -20,6 +20,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <zlib.h>
 #include "miniz.h"
 #include "pfs_compress.h"
 #include "pfs_validate_hash.h"
@@ -67,12 +68,22 @@
 #define PFSC_BLOCK_OFFSETS_OFFSET 0x400
 #define PFSC_INITIAL_DATA_OFFSET 0x10000ULL
 #define PFSC_OFFSET_ENTRY_SIZE 8
-#define PFSC_ZLIB_LEVEL MZ_BEST_SPEED
+#define PFSC_FAST_ZLIB_LEVEL MZ_BEST_SPEED
 #define PFSC_SLOTS_PER_WORKER 32
 #define PFSC_OUTPUT_BUFFER_SIZE (16U * 1024U * 1024U)
 #define PFSC_OUTPUT_BUFFER_MIN_SIZE (64U * 1024U)
 #define PFS_READ_CACHE_SIZE (16U * 1024U * 1024U)
 #define PFS_READ_CACHE_MIN_SIZE (64U * 1024U)
+#define PFS_STREAM_REVERSE_CHUNK_MAX_SIZE (128U * 1024U * 1024U)
+#define PFS_STREAM_REVERSE_CHUNK_MIN_SIZE (8U * 1024U * 1024U)
+#define PFS_STREAM_REVERSE_WORKERS 10
+#define PFS_STREAM_REVERSE_LOOKAHEAD_BYTES \
+  ((uint64_t)PFS_STREAM_REVERSE_WORKERS * PFS_STREAM_REVERSE_CHUNK_MAX_SIZE)
+#define PFS_STREAM_COMPRESS_WORKERS 4
+#define PFS_STREAM_TRUNCATE_GRANULARITY (512ULL * 1024ULL * 1024ULL)
+#define PFS_STREAM_JOURNAL_MAGIC "GCSTRM2"
+#define PFS_STREAM_JOURNAL_VERSION 4U
+#define PFS_STREAM_DEFAULT_RESERVE_BYTES (128ULL * 1024ULL * 1024ULL)
 
 #define EXFAT_SECTOR_SIZE 512ULL
 #define EXFAT_SECTORS_PER_CLUSTER 128ULL
@@ -94,6 +105,11 @@ typedef struct scan_file {
   char rel[1024];
   char abs[1024];
   uint64_t size;
+  uint64_t stream_predicted_stored;
+  uint32_t stream_schedule_order;
+  uint32_t stream_predicted_gain_permille;
+  int stream_reverse_required;
+  int stream_passthrough_delete;
 } scan_file_t;
 
 typedef struct scan_list {
@@ -132,6 +148,11 @@ typedef struct pfs_file_node {
   uint64_t block_start;
   uint64_t blocks;
   int source_deleted;
+  uint64_t stream_predicted_stored;
+  uint32_t stream_schedule_order;
+  uint32_t stream_predicted_gain_permille;
+  int stream_reverse_required;
+  int stream_passthrough_delete;
 } pfs_file_node_t;
 
 typedef enum pfs_segment_type {
@@ -146,6 +167,8 @@ typedef struct pfs_segment {
   const unsigned char *mem;
   char path[1024];
 } pfs_segment_t;
+
+typedef struct destructive_stream_ctx destructive_stream_ctx_t;
 
 typedef struct pfs_layout {
   pfs_dir_node_t *dirs;
@@ -198,6 +221,7 @@ typedef struct virtual_reader {
   size_t cache_len;
   uint64_t cache_offset;
   ssize_t cache_seg;
+  destructive_stream_ctx_t *stream;
 } virtual_reader_t;
 
 typedef enum pfsc_slot_state {
@@ -219,6 +243,25 @@ typedef struct pfsc_slot {
   pfsc_slot_state_t state;
 } pfsc_slot_t;
 
+#ifndef GC_PFSC_ZLIB_LEVEL
+#define GC_PFSC_ZLIB_LEVEL 7
+#endif
+#ifndef GC_PFSC_THRESHOLD_GAIN
+#define GC_PFSC_THRESHOLD_GAIN 5
+#endif
+#ifndef GC_PFSC_FORCE_RAW_EXEC
+#define GC_PFSC_FORCE_RAW_EXEC 0
+#endif
+typedef tdefl_compressor pfsc_comp_state_t;
+
+typedef struct pfsc_comp_config {
+  int profile;
+  int zlib_level;
+  int threshold_gain;
+  int force_raw_exec;
+  mz_uint miniz_flags;
+} pfsc_comp_config_t;
+
 typedef struct pfsc_pool {
   pthread_mutex_t lock;
   pthread_cond_t cond;
@@ -226,7 +269,7 @@ typedef struct pfsc_pool {
   int slot_count;
   int stop;
   int error;
-  mz_uint flags;
+  pfsc_comp_config_t comp_config;
 } pfsc_pool_t;
 
 typedef struct pfsc_output_buffer {
@@ -235,6 +278,200 @@ typedef struct pfsc_output_buffer {
   size_t cap;
   uint64_t offset;
 } pfsc_output_buffer_t;
+
+typedef struct destructive_stream_file {
+  char rel[1024];
+  char abs[1024];
+  uint64_t original_size;
+  uint64_t virtual_offset;
+  uint64_t committed;
+  uint64_t reverse_pos;
+  uint64_t reverse_claim;
+  atomic_int reversed;
+  int deleted;
+  int reverse_committing;
+  int passthrough_delete;
+  int reverse_required;
+  uint32_t schedule_order;
+  uint32_t predicted_gain_permille;
+  uint64_t predicted_stored;
+} destructive_stream_file_t;
+
+typedef struct destructive_stream_header_disk {
+  char magic[8];
+  uint32_t version;
+  uint32_t header_size;
+  uint32_t file_record_size;
+  uint32_t file_count;
+  uint32_t format;
+  uint32_t nested_type;
+  uint32_t rollback_requested;
+  uint32_t mutation_started;
+  uint32_t compression_complete;
+  uint32_t output_finalized;
+  uint64_t block_count;
+  uint64_t logical_size;
+  uint64_t nested_size;
+  uint64_t pfsc_header_size;
+  uint64_t completed_blocks;
+  uint64_t data_pos;
+  uint64_t budget_bytes;
+  uint64_t reserve_bytes;
+  uint64_t current_credit;
+  uint64_t actual_output_bytes;
+  uint64_t actual_deleted_bytes;
+  uint64_t actual_reverse_temp_bytes;
+  uint64_t forward_file_count;
+  uint64_t reverse_file_count;
+  char source_path[1024];
+  char output_path[1024];
+  char tmp_path[1024];
+  char vhash_tmp_path[1024];
+  char vhash_output_path[1024];
+  char nested_name[256];
+} destructive_stream_header_disk_t;
+
+typedef struct destructive_stream_file_disk {
+  char rel[1024];
+  uint64_t original_size;
+  uint64_t virtual_offset;
+  uint64_t committed;
+  uint64_t reverse_pos;
+  uint64_t predicted_stored;
+  uint32_t schedule_order;
+  uint32_t predicted_gain_permille;
+  uint32_t reverse_required;
+  uint32_t passthrough_delete;
+  uint32_t reversed;
+  uint32_t deleted;
+} destructive_stream_file_disk_t;
+
+struct destructive_stream_ctx {
+  int journal_fd;
+  char journal_path[1024];
+  char source_path[1024];
+  char output_path[1024];
+  char tmp_path[1024];
+  char vhash_tmp_path[1024];
+  char vhash_output_path[1024];
+  char nested_name[256];
+  int format;
+  int nested_type;
+  int rollback_requested;
+  int mutation_started;
+  int compression_complete;
+  int output_finalized;
+  uint64_t block_count;
+  uint64_t logical_size;
+  uint64_t nested_size;
+  uint64_t pfsc_header_size;
+  uint64_t completed_blocks;
+  uint64_t journaled_blocks;
+  uint64_t data_pos;
+  uint64_t budget_bytes;
+  uint64_t reserve_bytes;
+  uint64_t current_credit;
+  uint64_t actual_output_bytes;
+  uint64_t actual_deleted_bytes;
+  uint64_t actual_reverse_temp_bytes;
+  uint64_t forward_file_count;
+  uint64_t reverse_file_count;
+  destructive_stream_file_t *files;
+  size_t file_count;
+  uint64_t *offsets;
+  int owns_offsets;
+  size_t reverse_cap;
+  pthread_mutex_t reverse_ahead_lock;
+  pthread_cond_t reverse_ahead_cond;
+  pthread_t reverse_ahead_threads[PFS_STREAM_REVERSE_WORKERS];
+  int reverse_ahead_thread_count;
+  int reverse_ahead_sync_initialized;
+  int reverse_ahead_started;
+  int reverse_ahead_stop;
+  int reverse_ahead_done;
+  int reverse_ahead_error;
+  int reverse_ahead_active;
+  int reverse_ahead_inflight;
+  size_t reverse_ahead_demand_file;
+  uint64_t reverse_ahead_demand_pos;
+  size_t reverse_ahead_next_file;
+  char reverse_ahead_err[256];
+};
+
+static void destructive_stream_reverse_ahead_stop(destructive_stream_ctx_t *ctx);
+static int
+destructive_stream_file_passthrough_delete(const destructive_stream_file_t *f);
+
+static int
+destructive_stream_file_reversed(const destructive_stream_file_t *f) {
+  return f && atomic_load_explicit(&f->reversed, memory_order_acquire) != 0;
+}
+
+static void
+destructive_stream_file_set_reversed(destructive_stream_file_t *f, int reversed) {
+  if(f) {
+    atomic_store_explicit(&f->reversed, reversed ? 1 : 0, memory_order_release);
+  }
+}
+
+static void
+destructive_stream_recompute_budget(destructive_stream_ctx_t *ctx) {
+  if(!ctx) return;
+  uint64_t deleted_or_committed = 0;
+  uint64_t reverse_temp = 0;
+  for(size_t i = 0; i < ctx->file_count; i++) {
+    destructive_stream_file_t *f = &ctx->files[i];
+    uint64_t committed = f->committed > f->original_size ?
+                         f->original_size : f->committed;
+    if(UINT64_MAX - deleted_or_committed < committed) {
+      deleted_or_committed = UINT64_MAX;
+    } else {
+      deleted_or_committed += committed;
+    }
+    if(!f->deleted && !destructive_stream_file_reversed(f) &&
+       !destructive_stream_file_passthrough_delete(f)) {
+      if(UINT64_MAX - reverse_temp < f->reverse_pos) reverse_temp = UINT64_MAX;
+      else reverse_temp += f->reverse_pos;
+    }
+  }
+  uint64_t output = ctx->data_pos > ctx->pfsc_header_size ?
+                    ctx->data_pos - ctx->pfsc_header_size : 0;
+  uint64_t base = ctx->budget_bytes > ctx->reserve_bytes ?
+                  ctx->budget_bytes - ctx->reserve_bytes : ctx->budget_bytes;
+  uint64_t credit = base;
+  if(UINT64_MAX - credit < deleted_or_committed) credit = UINT64_MAX;
+  else credit += deleted_or_committed;
+  uint64_t used = output;
+  if(UINT64_MAX - used < reverse_temp) used = UINT64_MAX;
+  else used += reverse_temp;
+  ctx->actual_output_bytes = output;
+  ctx->actual_deleted_bytes = deleted_or_committed;
+  ctx->actual_reverse_temp_bytes = reverse_temp;
+  ctx->current_credit = credit > used ? credit - used : 0;
+}
+
+static void
+destructive_stream_publish_budget(const destructive_stream_ctx_t *ctx) {
+  if(!ctx) return;
+  atomic_store(&g_job.stream_budget_bytes,
+               ctx->budget_bytes > (uint64_t)LONG_MAX ? LONG_MAX :
+               (long)ctx->budget_bytes);
+  atomic_store(&g_job.stream_current_credit_bytes,
+               ctx->current_credit > (uint64_t)LONG_MAX ? LONG_MAX :
+               (long)ctx->current_credit);
+  atomic_store(&g_job.stream_deleted_bytes,
+               ctx->actual_deleted_bytes > (uint64_t)LONG_MAX ? LONG_MAX :
+               (long)ctx->actual_deleted_bytes);
+  atomic_store(&g_job.stream_reverse_temp_bytes,
+               ctx->actual_reverse_temp_bytes > (uint64_t)LONG_MAX ? LONG_MAX :
+               (long)ctx->actual_reverse_temp_bytes);
+  atomic_store(&g_job.stream_forward_files,
+               ctx->forward_file_count > (uint64_t)LONG_MAX ? LONG_MAX :
+               (long)ctx->forward_file_count);
+  atomic_store(&g_job.stream_reverse_files,
+               ctx->reverse_file_count > (uint64_t)LONG_MAX ? LONG_MAX :
+               (long)ctx->reverse_file_count);
+}
 
 static void
 set_err(char *err, size_t err_size, const char *fmt, ...) {
@@ -395,6 +632,23 @@ join_abs(char *out, size_t out_size, const char *dir, const char *name) {
 }
 
 static int
+join_abs_rel(char *out, size_t out_size, const char *root, const char *rel) {
+  size_t n = strlen(root ? root : "");
+  int rc;
+  if(!root || !root[0] || !rel) {
+    errno = EINVAL;
+    return -1;
+  }
+  rc = snprintf(out, out_size, "%s%s%s", root,
+                (n > 1 && root[n - 1] != '/') ? "/" : "", rel);
+  if(rc < 0 || (size_t)rc >= out_size) {
+    errno = ENAMETOOLONG;
+    return -1;
+  }
+  return 0;
+}
+
+static int
 remove_tree_local(const char *path) {
   struct stat st;
   if(lstat(path, &st) != 0) {
@@ -506,6 +760,13 @@ pwrite_all_local(int fd, const void *data, size_t size, off_t offset) {
 
 static uint64_t monotonic_us(void);
 static void virtual_reader_close_file(virtual_reader_t *vr);
+static int virtual_reader_open_path(virtual_reader_t *vr, const char *path,
+                                    ssize_t key, char *err,
+                                    size_t err_size);
+static int virtual_reader_file_read(virtual_reader_t *vr, ssize_t seg_index,
+                                    uint64_t file_size,
+                                    uint64_t file_offset,
+                                    unsigned char *out, size_t size);
 
 static void
 pfsc_output_buffer_init(pfsc_output_buffer_t *b) {
@@ -612,52 +873,6 @@ try_remove_empty_parent_dirs(const char *root, const char *path) {
 }
 
 static int
-delete_committed_source_files(const char *source_root, pfs_layout_t *nested,
-                              virtual_reader_t *vr, int fd,
-                              uint64_t file_start,
-                              pfsc_output_buffer_t *outbuf,
-                              uint64_t completed_blocks,
-                              size_t *next_delete_index,
-                              int *delete_started,
-                              char *err, size_t err_size) {
-  size_t i;
-  if(!source_root || !nested) return 0;
-  i = next_delete_index ? *next_delete_index : 0;
-  if(i >= nested->file_count) return 0;
-
-  if(nested->files[i].block_start + nested->files[i].blocks > completed_blocks) {
-    return 0;
-  }
-
-  if(pfsc_output_buffer_flush(fd, file_start, outbuf, err, err_size) != 0) {
-    return -1;
-  }
-  if(vr) virtual_reader_close_file(vr);
-
-  for(; i < nested->file_count; i++) {
-    pfs_file_node_t *f = &nested->files[i];
-    if(f->source_deleted) continue;
-    if(f->block_start + f->blocks > completed_blocks) break;
-
-    if(!path_is_child_of_root(source_root, f->abs)) {
-      set_err(err, err_size, "refusing to delete source outside app folder");
-      errno = EINVAL;
-      return -1;
-    }
-    if(unlink(f->abs) != 0 && errno != ENOENT) {
-      set_err(err, err_size, "delete source file: %s", strerror(errno));
-      return -1;
-    }
-    f->source_deleted = 1;
-    if(delete_started) *delete_started = 1;
-    try_remove_empty_parent_dirs(source_root, f->abs);
-  }
-  if(next_delete_index) *next_delete_index = i;
-
-  return 0;
-}
-
-static int
 read_exact_at(int fd, void *data, size_t size, off_t offset) {
   unsigned char *p = data;
   while(size > 0) {
@@ -674,6 +889,1976 @@ read_exact_at(int fd, void *data, size_t size, off_t offset) {
     size -= (size_t)n;
     offset += n;
   }
+  return 0;
+}
+
+static void
+reverse_bytes(unsigned char *data, size_t size) {
+  if(!data) return;
+  for(size_t i = 0, j = size ? size - 1 : 0; i < j; i++, j--) {
+    unsigned char tmp = data[i];
+    data[i] = data[j];
+    data[j] = tmp;
+  }
+}
+
+static uint64_t
+destructive_stream_file_record_offset(size_t index) {
+  return (uint64_t)sizeof(destructive_stream_header_disk_t) +
+         (uint64_t)index * (uint64_t)sizeof(destructive_stream_file_disk_t);
+}
+
+static uint64_t
+destructive_stream_offsets_offset(size_t file_count) {
+  return destructive_stream_file_record_offset(file_count);
+}
+
+static int
+destructive_stream_journal_path_from_tmp(const char *tmp_path, char *out,
+                                         size_t out_size) {
+  int n = snprintf(out, out_size, "%s.stream-journal", tmp_path ? tmp_path : "");
+  if(n < 0 || (size_t)n >= out_size || !tmp_path || !tmp_path[0]) {
+    errno = ENAMETOOLONG;
+    return -1;
+  }
+  return 0;
+}
+
+int
+pfs_compress_stream_journal_path(const char *output_path, char *out,
+                                 size_t out_size) {
+  char tmp_path[1024];
+  int n = snprintf(tmp_path, sizeof(tmp_path), "%s.tmp",
+                   output_path ? output_path : "");
+  if(n < 0 || (size_t)n >= sizeof(tmp_path) || !output_path || !output_path[0]) {
+    errno = ENAMETOOLONG;
+    return -1;
+  }
+  return destructive_stream_journal_path_from_tmp(tmp_path, out, out_size);
+}
+
+static void
+destructive_stream_init(destructive_stream_ctx_t *ctx) {
+  if(!ctx) return;
+  memset(ctx, 0, sizeof(*ctx));
+  ctx->journal_fd = -1;
+  ctx->reverse_cap = PFS_STREAM_REVERSE_CHUNK_MAX_SIZE;
+  ctx->reverse_ahead_demand_file = SIZE_MAX;
+}
+
+static void
+destructive_stream_close(destructive_stream_ctx_t *ctx) {
+  if(!ctx) return;
+  if(ctx->journal_fd >= 0) {
+    close(ctx->journal_fd);
+    ctx->journal_fd = -1;
+  }
+}
+
+static void
+destructive_stream_free(destructive_stream_ctx_t *ctx) {
+  if(!ctx) return;
+  destructive_stream_reverse_ahead_stop(ctx);
+  destructive_stream_close(ctx);
+  if(ctx->reverse_ahead_sync_initialized) {
+    pthread_cond_destroy(&ctx->reverse_ahead_cond);
+    pthread_mutex_destroy(&ctx->reverse_ahead_lock);
+    ctx->reverse_ahead_sync_initialized = 0;
+  }
+  free(ctx->files);
+  if(ctx->owns_offsets) free(ctx->offsets);
+  destructive_stream_init(ctx);
+}
+
+static void
+destructive_stream_fill_header(const destructive_stream_ctx_t *ctx,
+                               destructive_stream_header_disk_t *h) {
+  memset(h, 0, sizeof(*h));
+  memcpy(h->magic, PFS_STREAM_JOURNAL_MAGIC, strlen(PFS_STREAM_JOURNAL_MAGIC));
+  h->version = PFS_STREAM_JOURNAL_VERSION;
+  h->header_size = (uint32_t)sizeof(*h);
+  h->file_record_size = (uint32_t)sizeof(destructive_stream_file_disk_t);
+  h->file_count = ctx->file_count > UINT32_MAX ? UINT32_MAX :
+                  (uint32_t)ctx->file_count;
+  h->format = (uint32_t)ctx->format;
+  h->nested_type = (uint32_t)ctx->nested_type;
+  h->rollback_requested = 0;
+  h->mutation_started = ctx->mutation_started ? 1U : 0U;
+  h->compression_complete = ctx->compression_complete ? 1U : 0U;
+  h->output_finalized = ctx->output_finalized ? 1U : 0U;
+  h->block_count = ctx->block_count;
+  h->logical_size = ctx->logical_size;
+  h->nested_size = ctx->nested_size;
+  h->pfsc_header_size = ctx->pfsc_header_size;
+  h->completed_blocks = ctx->completed_blocks;
+  h->data_pos = ctx->data_pos;
+  h->budget_bytes = ctx->budget_bytes;
+  h->reserve_bytes = ctx->reserve_bytes;
+  h->current_credit = ctx->current_credit;
+  h->actual_output_bytes = ctx->actual_output_bytes;
+  h->actual_deleted_bytes = ctx->actual_deleted_bytes;
+  h->actual_reverse_temp_bytes = ctx->actual_reverse_temp_bytes;
+  h->forward_file_count = ctx->forward_file_count;
+  h->reverse_file_count = ctx->reverse_file_count;
+  snprintf(h->source_path, sizeof(h->source_path), "%s", ctx->source_path);
+  snprintf(h->output_path, sizeof(h->output_path), "%s", ctx->output_path);
+  snprintf(h->tmp_path, sizeof(h->tmp_path), "%s", ctx->tmp_path);
+  snprintf(h->vhash_tmp_path, sizeof(h->vhash_tmp_path), "%s",
+           ctx->vhash_tmp_path);
+  snprintf(h->vhash_output_path, sizeof(h->vhash_output_path), "%s",
+           ctx->vhash_output_path);
+  snprintf(h->nested_name, sizeof(h->nested_name), "%s", ctx->nested_name);
+}
+
+static int
+destructive_stream_write_header(destructive_stream_ctx_t *ctx,
+                                char *err, size_t err_size) {
+  destructive_stream_header_disk_t h;
+  if(!ctx || ctx->journal_fd < 0) return 0;
+  destructive_stream_recompute_budget(ctx);
+  destructive_stream_publish_budget(ctx);
+  destructive_stream_fill_header(ctx, &h);
+  if(pwrite_all_local(ctx->journal_fd, &h, sizeof(h), 0) != 0) {
+    set_err(err, err_size, "write stream journal: %s", strerror(errno));
+    return -1;
+  }
+  return 0;
+}
+
+static void
+destructive_stream_fill_file_record(const destructive_stream_file_t *src,
+                                    destructive_stream_file_disk_t *dst) {
+  memset(dst, 0, sizeof(*dst));
+  snprintf(dst->rel, sizeof(dst->rel), "%s", src->rel);
+  dst->original_size = src->original_size;
+  dst->virtual_offset = src->virtual_offset;
+  dst->committed = src->committed;
+  dst->reverse_pos = src->reverse_pos;
+  dst->predicted_stored = src->predicted_stored;
+  dst->schedule_order = src->schedule_order;
+  dst->predicted_gain_permille = src->predicted_gain_permille;
+  dst->reverse_required = src->reverse_required ? 1U : 0U;
+  dst->passthrough_delete = src->passthrough_delete ? 1U : 0U;
+  dst->reversed = destructive_stream_file_reversed(src) ? 1U : 0U;
+  dst->deleted = src->deleted ? 1U : 0U;
+}
+
+static int
+destructive_stream_write_file_record(destructive_stream_ctx_t *ctx,
+                                     size_t index,
+                                     char *err, size_t err_size) {
+  destructive_stream_file_disk_t rec;
+  if(!ctx || ctx->journal_fd < 0 || index >= ctx->file_count) return 0;
+  destructive_stream_fill_file_record(&ctx->files[index], &rec);
+  if(pwrite_all_local(ctx->journal_fd, &rec, sizeof(rec),
+                      (off_t)destructive_stream_file_record_offset(index)) != 0) {
+    set_err(err, err_size, "write stream journal file: %s", strerror(errno));
+    return -1;
+  }
+  return 0;
+}
+
+static int
+destructive_stream_write_offsets(destructive_stream_ctx_t *ctx, uint64_t first,
+                                 uint64_t count, char *err, size_t err_size) {
+  unsigned char raw[PFSC_OFFSET_ENTRY_SIZE * 256U];
+  uint64_t offset_base;
+  if(!ctx || ctx->journal_fd < 0 || !ctx->offsets || count == 0) return 0;
+  if(first + count > ctx->block_count + 1ULL) {
+    set_err(err, err_size, "bad stream journal offset range");
+    errno = EINVAL;
+    return -1;
+  }
+  offset_base = destructive_stream_offsets_offset(ctx->file_count);
+  while(count > 0) {
+    uint64_t n64 = count > 256U ? 256U : count;
+    size_t n = (size_t)n64;
+    for(size_t i = 0; i < n; i++) le64(raw + i * 8U, ctx->offsets[first + i]);
+    if(pwrite_all_local(ctx->journal_fd, raw, n * 8U,
+                        (off_t)(offset_base + first * 8ULL)) != 0) {
+      set_err(err, err_size, "write stream journal offsets: %s",
+              strerror(errno));
+      return -1;
+    }
+    first += n64;
+    count -= n64;
+  }
+  return 0;
+}
+
+static int
+destructive_stream_sync(destructive_stream_ctx_t *ctx,
+                        char *err, size_t err_size) {
+  if(!ctx || ctx->journal_fd < 0) return 0;
+  if(fsync(ctx->journal_fd) != 0) {
+    set_err(err, err_size, "sync stream journal: %s", strerror(errno));
+    return -1;
+  }
+  return 0;
+}
+
+static unsigned char *
+destructive_stream_alloc_reverse_buffer(const destructive_stream_ctx_t *ctx,
+                                        size_t *cap_out,
+                                        char *err, size_t err_size) {
+  size_t cap = ctx && ctx->reverse_cap ? ctx->reverse_cap :
+               PFS_STREAM_REVERSE_CHUNK_MAX_SIZE;
+  while(cap >= PFS_STREAM_REVERSE_CHUNK_MIN_SIZE) {
+    unsigned char *buf = malloc(cap);
+    if(buf) {
+      if(cap_out) *cap_out = cap;
+      return buf;
+    }
+    cap /= 2;
+  }
+  set_err(err, err_size, "out of memory");
+  return NULL;
+}
+
+static int
+destructive_stream_reverse_dir_path(const destructive_stream_ctx_t *ctx,
+                                    char *out, size_t out_size) {
+  int n = snprintf(out, out_size, "%s.reverse", ctx ? ctx->tmp_path : "");
+  if(n < 0 || (size_t)n >= out_size || !ctx || !ctx->tmp_path[0]) {
+    errno = ENAMETOOLONG;
+    return -1;
+  }
+  return 0;
+}
+
+static int
+destructive_stream_reverse_tmp_path(const destructive_stream_ctx_t *ctx,
+                                    size_t index, char *out,
+                                    size_t out_size) {
+  char dir[1024];
+  if(destructive_stream_reverse_dir_path(ctx, dir, sizeof(dir)) != 0) return -1;
+  int n = snprintf(out, out_size, "%s/%08zu.rev", dir, index);
+  if(n < 0 || (size_t)n >= out_size) {
+    errno = ENAMETOOLONG;
+    return -1;
+  }
+  return 0;
+}
+
+static int
+destructive_stream_ensure_reverse_dir(destructive_stream_ctx_t *ctx,
+                                      char *err, size_t err_size) {
+  char dir[1024];
+  if(destructive_stream_reverse_dir_path(ctx, dir, sizeof(dir)) != 0) {
+    set_err(err, err_size, "stream reverse directory path too long");
+    return -1;
+  }
+  if(mkdir(dir, 0777) != 0 && errno != EEXIST) {
+    set_err(err, err_size, "create stream reverse directory: %s",
+            strerror(errno));
+    return -1;
+  }
+  return 0;
+}
+
+static void
+destructive_stream_fsync_parent_best_effort(const char *path) {
+  char parent[1024], base[256];
+  if(path_parent_base(path, parent, sizeof(parent), base, sizeof(base)) != 0) {
+    return;
+  }
+#ifdef O_DIRECTORY
+  int fd = open(parent, O_RDONLY | O_DIRECTORY);
+#else
+  int fd = open(parent, O_RDONLY);
+#endif
+  if(fd >= 0) {
+    fsync(fd);
+    close(fd);
+  }
+}
+
+static int
+destructive_stream_stat_size(const char *path, int *exists,
+                             uint64_t *size_out, char *err,
+                             size_t err_size) {
+  struct stat st;
+  if(exists) *exists = 0;
+  if(size_out) *size_out = 0;
+  if(stat(path, &st) != 0) {
+    if(errno == ENOENT) return 0;
+    set_err(err, err_size, "stat stream reverse file: %s", strerror(errno));
+    return -1;
+  }
+  if(!S_ISREG(st.st_mode)) {
+    set_err(err, err_size, "stream reverse path is not a file");
+    errno = EINVAL;
+    return -1;
+  }
+  if(exists) *exists = 1;
+  if(size_out) *size_out = st.st_size < 0 ? 0 : (uint64_t)st.st_size;
+  return 0;
+}
+
+static int
+destructive_stream_truncate_path(const char *path, uint64_t size,
+                                 char *err, size_t err_size) {
+  int fd = open(path, O_RDWR);
+  if(fd < 0) {
+    set_err(err, err_size, "open stream reverse file: %s", strerror(errno));
+    return -1;
+  }
+  int rc = ftruncate(fd, (off_t)size);
+  if(rc == 0 && fsync(fd) != 0) rc = -1;
+  int saved = errno;
+  close(fd);
+  if(rc != 0) {
+    errno = saved;
+    set_err(err, err_size, "truncate stream reverse file: %s",
+            strerror(errno));
+    return -1;
+  }
+  return 0;
+}
+
+static int
+destructive_stream_finalize_reversed_file(destructive_stream_ctx_t *ctx,
+                                          destructive_stream_file_t *f,
+                                          size_t file_index,
+                                          const char *tmp_path,
+                                          char *err, size_t err_size) {
+  if(!ctx || !f || !tmp_path) return -1;
+  if(!path_is_child_of_root(ctx->source_path, f->abs)) {
+    set_err(err, err_size, "refusing to replace source outside app folder");
+    errno = EINVAL;
+    return -1;
+  }
+  if(rename(tmp_path, f->abs) != 0) {
+    set_err(err, err_size, "install reversed source file: %s",
+            strerror(errno));
+    return -1;
+  }
+  destructive_stream_fsync_parent_best_effort(f->abs);
+  f->reverse_pos = f->original_size;
+  destructive_stream_file_set_reversed(f, 1);
+  if(destructive_stream_write_file_record(ctx, file_index, err, err_size) != 0 ||
+     destructive_stream_sync(ctx, err, err_size) != 0) {
+    return -1;
+  }
+  destructive_stream_fsync_parent_best_effort(tmp_path);
+  return 0;
+}
+
+static int
+destructive_stream_reconcile_reverse_file(destructive_stream_ctx_t *ctx,
+                                          destructive_stream_file_t *f,
+                                          size_t file_index,
+                                          char *err, size_t err_size) {
+  char tmp_path[1024];
+  int src_exists = 0, tmp_exists = 0;
+  uint64_t src_size = 0, tmp_size = 0;
+  if(!ctx || !f) return -1;
+  if(destructive_stream_reverse_tmp_path(ctx, file_index, tmp_path,
+                                         sizeof(tmp_path)) != 0) {
+    set_err(err, err_size, "stream reverse temp path too long");
+    return -1;
+  }
+  if(f->deleted) {
+    unlink(tmp_path);
+    return 0;
+  }
+  if(destructive_stream_file_reversed(f)) {
+    unlink(tmp_path);
+    return 0;
+  }
+  if(destructive_stream_stat_size(f->abs, &src_exists, &src_size,
+                                  err, err_size) != 0 ||
+     destructive_stream_stat_size(tmp_path, &tmp_exists, &tmp_size,
+                                  err, err_size) != 0) {
+    return -1;
+  }
+  if(f->original_size <= 1) {
+    f->reverse_pos = f->original_size;
+    destructive_stream_file_set_reversed(f, 1);
+    unlink(tmp_path);
+    return destructive_stream_write_file_record(ctx, file_index, err,
+                                                err_size);
+  }
+
+  if(src_exists && tmp_exists) {
+    if(src_size > f->original_size || tmp_size > f->original_size) {
+      set_err(err, err_size, "bad stream reverse sizes");
+      errno = EIO;
+      return -1;
+    }
+    uint64_t expected_tmp = f->original_size - src_size;
+    if(tmp_size > expected_tmp) {
+      if(destructive_stream_truncate_path(tmp_path, expected_tmp,
+                                          err, err_size) != 0) {
+        return -1;
+      }
+      tmp_size = expected_tmp;
+    }
+    if(tmp_size < expected_tmp) {
+      set_err(err, err_size, "stream reverse temp is missing committed data");
+      errno = EIO;
+      return -1;
+    }
+    f->reverse_pos = expected_tmp;
+    if(expected_tmp == f->original_size) {
+      return destructive_stream_finalize_reversed_file(ctx, f, file_index,
+                                                       tmp_path, err, err_size);
+    }
+    return destructive_stream_write_file_record(ctx, file_index, err, err_size);
+  }
+
+  if(src_exists && !tmp_exists) {
+    if(src_size == f->original_size) {
+      if(f->reverse_pos >= f->original_size) {
+        f->reverse_pos = f->original_size;
+        destructive_stream_file_set_reversed(f, 1);
+      } else {
+        f->reverse_pos = 0;
+      }
+      return destructive_stream_write_file_record(ctx, file_index, err,
+                                                  err_size);
+    }
+    set_err(err, err_size, "stream reverse temp missing after source truncation");
+    errno = EIO;
+    return -1;
+  }
+
+  if(!src_exists && tmp_exists) {
+    if(tmp_size == f->original_size) {
+      return destructive_stream_finalize_reversed_file(ctx, f, file_index,
+                                                       tmp_path, err, err_size);
+    }
+    set_err(err, err_size, "stream source missing during partial reverse");
+    errno = EIO;
+    return -1;
+  }
+
+  if(f->original_size == 0) {
+    f->reverse_pos = 0;
+    destructive_stream_file_set_reversed(f, 1);
+    return destructive_stream_write_file_record(ctx, file_index, err, err_size);
+  }
+  set_err(err, err_size, "stream source and reverse temp are missing");
+  errno = ENOENT;
+  return -1;
+}
+
+static int
+destructive_stream_reconcile_all_reverse_files(destructive_stream_ctx_t *ctx,
+                                               char *err, size_t err_size) {
+  if(!ctx) return 0;
+  for(size_t i = 0; i < ctx->file_count; i++) {
+    destructive_stream_file_t *f = &ctx->files[i];
+    if(f->deleted || destructive_stream_file_reversed(f)) continue;
+    if(f->reverse_pos == 0 && f->original_size > 1) continue;
+    if(destructive_stream_reconcile_reverse_file(ctx, &ctx->files[i], i,
+                                                err, err_size) != 0) {
+      return -1;
+    }
+  }
+  return destructive_stream_sync(ctx, err, err_size);
+}
+
+static int
+destructive_stream_reconcile_committed_files(destructive_stream_ctx_t *ctx,
+                                             char *err, size_t err_size) {
+  if(!ctx) return 0;
+  for(size_t i = 0; i < ctx->file_count; i++) {
+    destructive_stream_file_t *f = &ctx->files[i];
+    int exists = 0;
+    uint64_t size = 0;
+    if(f->deleted && f->committed < f->original_size) {
+      set_err(err, err_size, "stream journal deleted a partial source file");
+      errno = EIO;
+      return -1;
+    }
+    if(f->committed == 0 && !f->deleted) continue;
+    if(f->committed > f->original_size) {
+      set_err(err, err_size, "bad stream committed size");
+      errno = EIO;
+      return -1;
+    }
+    if(!path_is_child_of_root(ctx->source_path, f->abs)) {
+      set_err(err, err_size, "refusing to recover source outside app folder");
+      errno = EINVAL;
+      return -1;
+    }
+    if(destructive_stream_stat_size(f->abs, &exists, &size, err, err_size) != 0) {
+      return -1;
+    }
+    if(f->committed >= f->original_size || f->deleted) {
+      if(exists && unlink(f->abs) != 0 && errno != ENOENT) {
+        set_err(err, err_size, "delete committed source file: %s",
+                strerror(errno));
+        return -1;
+      }
+      f->deleted = 1;
+      if(exists) destructive_stream_fsync_parent_best_effort(f->abs);
+      try_remove_empty_parent_dirs(ctx->source_path, f->abs);
+      if(destructive_stream_write_file_record(ctx, i, err, err_size) != 0) {
+        return -1;
+      }
+      continue;
+    }
+    if(!destructive_stream_file_reversed(f)) {
+      set_err(err, err_size, "stream committed source is not reversed");
+      errno = EIO;
+      return -1;
+    }
+    uint64_t expected = f->original_size - f->committed;
+    if(!exists) {
+      set_err(err, err_size, "stream committed source is missing");
+      errno = ENOENT;
+      return -1;
+    }
+    if(size < expected) {
+      set_err(err, err_size, "stream committed source is shorter than journal");
+      errno = EIO;
+      return -1;
+    }
+    if(size > expected) {
+      if(destructive_stream_truncate_path(f->abs, expected, err, err_size) != 0) {
+        return -1;
+      }
+      if(destructive_stream_write_file_record(ctx, i, err, err_size) != 0) {
+        return -1;
+      }
+    }
+  }
+  return destructive_stream_sync(ctx, err, err_size);
+}
+
+static void
+destructive_stream_publish_resume_progress(const destructive_stream_ctx_t *ctx) {
+  if(!ctx) return;
+  destructive_stream_publish_budget(ctx);
+  uint64_t copied = ctx->compression_complete
+      ? ctx->nested_size
+      : ctx->completed_blocks * PFS_BLOCK_SIZE;
+  if(copied > ctx->nested_size) copied = ctx->nested_size;
+  atomic_store(&g_job.total_bytes,
+               ctx->nested_size > (uint64_t)LONG_MAX ? LONG_MAX :
+               (long)ctx->nested_size);
+  atomic_store(&g_job.copied_bytes,
+               copied > (uint64_t)LONG_MAX ? LONG_MAX : (long)copied);
+  uint64_t output_pos = ctx->data_pos;
+  if(ctx->offsets && ctx->completed_blocks <= ctx->block_count &&
+     ctx->offsets[ctx->completed_blocks] != 0) {
+    output_pos = ctx->offsets[ctx->completed_blocks];
+  }
+  uint64_t compressed_output =
+      output_pos > ctx->pfsc_header_size ? output_pos - ctx->pfsc_header_size : 0;
+  atomic_store(&g_job.compressed_output_bytes,
+               compressed_output > (uint64_t)LONG_MAX ? LONG_MAX :
+               (long)compressed_output);
+  atomic_store(&g_job.total_blocks,
+               ctx->block_count > (uint64_t)LONG_MAX ? LONG_MAX :
+               (long)ctx->block_count);
+  atomic_store(&g_job.done_files,
+               ctx->completed_blocks > (uint64_t)INT_MAX ? INT_MAX :
+               (int)ctx->completed_blocks);
+  atomic_store(&g_job.total_files,
+               ctx->block_count > (uint64_t)INT_MAX ? INT_MAX :
+               (int)ctx->block_count);
+  atomic_store(&g_job.destructive_stream_active,
+               ctx->mutation_started ? 1 : 0);
+}
+
+static void
+destructive_stream_remove_reverse_dir(destructive_stream_ctx_t *ctx) {
+  char dir[1024];
+  if(destructive_stream_reverse_dir_path(ctx, dir, sizeof(dir)) == 0) {
+    remove_tree_local(dir);
+  }
+}
+
+static int
+destructive_stream_load(const char *journal_path, destructive_stream_ctx_t *ctx,
+                        char *err, size_t err_size) {
+  destructive_stream_header_disk_t h;
+  int fd = -1;
+  destructive_stream_init(ctx);
+  fd = open(journal_path, O_RDWR);
+  if(fd < 0) {
+    set_err(err, err_size, "open stream journal: %s", strerror(errno));
+    return -1;
+  }
+  ctx->journal_fd = fd;
+  snprintf(ctx->journal_path, sizeof(ctx->journal_path), "%s", journal_path);
+  if(read_exact_at(fd, &h, sizeof(h), 0) != 0) {
+    set_err(err, err_size, "read stream journal: %s", strerror(errno));
+    goto fail;
+  }
+  if(memcmp(h.magic, PFS_STREAM_JOURNAL_MAGIC,
+            strlen(PFS_STREAM_JOURNAL_MAGIC)) != 0 ||
+     h.version != PFS_STREAM_JOURNAL_VERSION ||
+     h.header_size != sizeof(h) ||
+     h.file_record_size != sizeof(destructive_stream_file_disk_t) ||
+     h.file_count == 0 || h.block_count == 0) {
+    set_err(err, err_size, "invalid stream journal");
+    errno = EINVAL;
+    goto fail;
+  }
+
+  ctx->file_count = h.file_count;
+  ctx->files = calloc(ctx->file_count, sizeof(*ctx->files));
+  ctx->offsets = calloc((size_t)(h.block_count + 1ULL), sizeof(*ctx->offsets));
+  ctx->owns_offsets = 1;
+  if(!ctx->files || !ctx->offsets) {
+    set_err(err, err_size, "out of memory");
+    goto fail;
+  }
+  ctx->format = (int)h.format;
+  ctx->nested_type = (int)h.nested_type;
+  ctx->rollback_requested = 0;
+  ctx->mutation_started = h.mutation_started != 0;
+  ctx->compression_complete = h.compression_complete != 0;
+  ctx->output_finalized = h.output_finalized != 0;
+  ctx->block_count = h.block_count;
+  ctx->logical_size = h.logical_size;
+  ctx->nested_size = h.nested_size;
+  ctx->pfsc_header_size = h.pfsc_header_size;
+  ctx->completed_blocks = h.completed_blocks;
+  ctx->journaled_blocks = h.completed_blocks;
+  ctx->data_pos = h.data_pos;
+  ctx->budget_bytes = h.budget_bytes;
+  ctx->reserve_bytes = h.reserve_bytes;
+  ctx->current_credit = h.current_credit;
+  ctx->actual_output_bytes = h.actual_output_bytes;
+  ctx->actual_deleted_bytes = h.actual_deleted_bytes;
+  ctx->actual_reverse_temp_bytes = h.actual_reverse_temp_bytes;
+  ctx->forward_file_count = h.forward_file_count;
+  ctx->reverse_file_count = h.reverse_file_count;
+  snprintf(ctx->source_path, sizeof(ctx->source_path), "%s", h.source_path);
+  snprintf(ctx->output_path, sizeof(ctx->output_path), "%s", h.output_path);
+  snprintf(ctx->tmp_path, sizeof(ctx->tmp_path), "%s", h.tmp_path);
+  snprintf(ctx->vhash_tmp_path, sizeof(ctx->vhash_tmp_path), "%s",
+           h.vhash_tmp_path);
+  snprintf(ctx->vhash_output_path, sizeof(ctx->vhash_output_path), "%s",
+           h.vhash_output_path);
+  snprintf(ctx->nested_name, sizeof(ctx->nested_name), "%s", h.nested_name);
+
+  for(size_t i = 0; i < ctx->file_count; i++) {
+    destructive_stream_file_disk_t rec;
+    if(read_exact_at(fd, &rec, sizeof(rec),
+                     (off_t)destructive_stream_file_record_offset(i)) != 0) {
+      set_err(err, err_size, "read stream journal file: %s", strerror(errno));
+      goto fail;
+    }
+    snprintf(ctx->files[i].rel, sizeof(ctx->files[i].rel), "%s", rec.rel);
+    if(join_abs_rel(ctx->files[i].abs, sizeof(ctx->files[i].abs),
+                    ctx->source_path, rec.rel) != 0) {
+      set_err(err, err_size, "bad stream journal source path");
+      goto fail;
+    }
+    ctx->files[i].original_size = rec.original_size;
+    ctx->files[i].virtual_offset = rec.virtual_offset;
+    ctx->files[i].committed = rec.committed;
+    ctx->files[i].reverse_pos = rec.reverse_pos;
+    ctx->files[i].reverse_claim = rec.reverse_pos;
+    ctx->files[i].predicted_stored = rec.predicted_stored;
+    ctx->files[i].schedule_order = rec.schedule_order;
+    ctx->files[i].predicted_gain_permille = rec.predicted_gain_permille;
+    ctx->files[i].reverse_required = rec.reverse_required != 0;
+    ctx->files[i].passthrough_delete = rec.passthrough_delete != 0;
+    destructive_stream_file_set_reversed(&ctx->files[i], rec.reversed != 0);
+    ctx->files[i].deleted = rec.deleted != 0;
+  }
+
+  uint64_t offsets_base = destructive_stream_offsets_offset(ctx->file_count);
+  unsigned char raw[PFSC_OFFSET_ENTRY_SIZE * 256U];
+  uint64_t index = 0;
+  while(index <= ctx->block_count) {
+    uint64_t remaining = ctx->block_count + 1ULL - index;
+    uint64_t n64 = remaining > 256U ? 256U : remaining;
+    size_t n = (size_t)n64;
+    if(read_exact_at(fd, raw, n * 8U,
+                     (off_t)(offsets_base + index * 8ULL)) != 0) {
+      set_err(err, err_size, "read stream journal offsets: %s", strerror(errno));
+      goto fail;
+    }
+    for(size_t i = 0; i < n; i++) ctx->offsets[index + i] = rd64(raw + i * 8U);
+    index += n64;
+  }
+
+  destructive_stream_publish_resume_progress(ctx);
+  job_set_current("Checking stream source files");
+  if(destructive_stream_reconcile_all_reverse_files(ctx, err, err_size) != 0) {
+    goto fail;
+  }
+  if(destructive_stream_reconcile_committed_files(ctx, err, err_size) != 0) {
+    goto fail;
+  }
+  return 0;
+
+fail:
+  destructive_stream_free(ctx);
+  return -1;
+}
+
+static int
+destructive_stream_create(const char *journal_path, const pfs_app_info_t *info,
+                          const char *tmp_path, const char *vhash_tmp_path,
+                          const char *vhash_output_path, int format,
+                          const pfs_layout_t *nested, uint64_t block_count,
+                          uint64_t logical_size, uint64_t pfsc_header_size,
+                          uint64_t *offsets, destructive_stream_ctx_t *ctx,
+                          char *err, size_t err_size) {
+  destructive_stream_init(ctx);
+  snprintf(ctx->journal_path, sizeof(ctx->journal_path), "%s", journal_path);
+  snprintf(ctx->source_path, sizeof(ctx->source_path), "%s", info->source_path);
+  snprintf(ctx->output_path, sizeof(ctx->output_path), "%s", info->output_path);
+  snprintf(ctx->tmp_path, sizeof(ctx->tmp_path), "%s", tmp_path);
+  snprintf(ctx->vhash_tmp_path, sizeof(ctx->vhash_tmp_path), "%s",
+           vhash_tmp_path);
+  snprintf(ctx->vhash_output_path, sizeof(ctx->vhash_output_path), "%s",
+           vhash_output_path);
+  snprintf(ctx->nested_name, sizeof(ctx->nested_name), "%s", info->nested_name);
+  ctx->format = format;
+  ctx->nested_type = info->nested_type;
+  ctx->block_count = block_count;
+  ctx->logical_size = logical_size;
+  ctx->nested_size = nested->image_size;
+  ctx->pfsc_header_size = pfsc_header_size;
+  ctx->completed_blocks = 0;
+  ctx->journaled_blocks = 0;
+  ctx->data_pos = pfsc_header_size;
+  ctx->budget_bytes = info->stream_budget_bytes ?
+      info->stream_budget_bytes : PFS_STREAM_DEFAULT_BUDGET_BYTES;
+  ctx->reserve_bytes = info->stream_reserve_bytes;
+  if(ctx->reserve_bytes >= ctx->budget_bytes) ctx->reserve_bytes = 0;
+  ctx->current_credit = ctx->budget_bytes - ctx->reserve_bytes;
+  ctx->actual_output_bytes = 0;
+  ctx->actual_deleted_bytes = 0;
+  ctx->actual_reverse_temp_bytes = 0;
+  ctx->forward_file_count = info->stream_forward_files;
+  ctx->reverse_file_count = info->stream_reverse_files;
+  ctx->file_count = nested->file_count;
+  ctx->offsets = offsets;
+  ctx->owns_offsets = 0;
+  ctx->files = calloc(ctx->file_count, sizeof(*ctx->files));
+  if(!ctx->files) {
+    set_err(err, err_size, "out of memory");
+    return -1;
+  }
+  for(size_t i = 0; i < nested->file_count; i++) {
+    destructive_stream_file_t *dst = &ctx->files[i];
+    const pfs_file_node_t *src = &nested->files[i];
+    snprintf(dst->rel, sizeof(dst->rel), "%s", src->rel);
+    snprintf(dst->abs, sizeof(dst->abs), "%s", src->abs);
+    dst->original_size = src->raw_size;
+    dst->virtual_offset = src->block_start * PFS_BLOCK_SIZE;
+    dst->reverse_claim = 0;
+    dst->predicted_stored = src->stream_predicted_stored;
+    dst->schedule_order = src->stream_schedule_order;
+    dst->predicted_gain_permille = src->stream_predicted_gain_permille;
+    dst->reverse_required = src->stream_reverse_required;
+    dst->passthrough_delete = src->stream_passthrough_delete;
+    destructive_stream_file_set_reversed(dst, src->raw_size <= 1);
+  }
+
+  ctx->journal_fd = open(journal_path, O_RDWR | O_CREAT | O_TRUNC, 0666);
+  if(ctx->journal_fd < 0) {
+    set_err(err, err_size, "create stream journal: %s", strerror(errno));
+    return -1;
+  }
+  uint64_t final_size = destructive_stream_offsets_offset(ctx->file_count) +
+                        (ctx->block_count + 1ULL) * PFSC_OFFSET_ENTRY_SIZE;
+  if(ftruncate(ctx->journal_fd, (off_t)final_size) != 0) {
+    set_err(err, err_size, "size stream journal: %s", strerror(errno));
+    return -1;
+  }
+  if(destructive_stream_write_header(ctx, err, err_size) != 0) return -1;
+  for(size_t i = 0; i < ctx->file_count; i++) {
+    if(destructive_stream_write_file_record(ctx, i, err, err_size) != 0) {
+      return -1;
+    }
+  }
+  if(destructive_stream_write_offsets(ctx, 0, ctx->block_count + 1ULL,
+                                      err, err_size) != 0 ||
+     destructive_stream_sync(ctx, err, err_size) != 0) {
+    return -1;
+  }
+  return 0;
+}
+
+static destructive_stream_file_t *
+destructive_stream_find_file(destructive_stream_ctx_t *ctx, const char *path,
+                             size_t *index_out) {
+  if(!ctx || !path) return NULL;
+  for(size_t i = 0; i < ctx->file_count; i++) {
+    if(!strcmp(ctx->files[i].abs, path)) {
+      if(index_out) *index_out = i;
+      return &ctx->files[i];
+    }
+  }
+  return NULL;
+}
+
+static int
+destructive_stream_mark_mutation_started(destructive_stream_ctx_t *ctx,
+                                         char *err, size_t err_size) {
+  if(!ctx || ctx->mutation_started) return 0;
+  ctx->mutation_started = 1;
+  atomic_store(&g_job.destructive_stream_active, 1);
+  atomic_store(&g_job.cancel, 0);
+  atomic_store(&g_job.rollback_requested, 0);
+  if(destructive_stream_write_header(ctx, err, err_size) != 0 ||
+     destructive_stream_sync(ctx, err, err_size) != 0) {
+    return -1;
+  }
+  return 0;
+}
+
+typedef enum reverse_chunk_state {
+  REVERSE_CHUNK_FREE = 0,
+  REVERSE_CHUNK_FILLING,
+  REVERSE_CHUNK_READY,
+} reverse_chunk_state_t;
+
+typedef struct reverse_chunk_slot {
+  unsigned char *buf;
+  size_t cap;
+  size_t len;
+  uint64_t out_off;
+  reverse_chunk_state_t state;
+} reverse_chunk_slot_t;
+
+typedef struct reverse_chunk_pool {
+  int src_fd;
+  uint64_t original_size;
+  uint64_t next_out;
+  size_t chunk_size;
+  reverse_chunk_slot_t *slots;
+  int slot_count;
+  pthread_mutex_t lock;
+  pthread_cond_t cond;
+  int stop;
+  int error;
+  char err[256];
+} reverse_chunk_pool_t;
+
+static void
+reverse_chunk_pool_set_error(reverse_chunk_pool_t *pool, int saved,
+                             const char *fmt, ...) {
+  if(!pool) return;
+  pthread_mutex_lock(&pool->lock);
+  if(!pool->error) {
+    pool->error = saved ? saved : EIO;
+    if(fmt && fmt[0]) {
+      va_list ap;
+      va_start(ap, fmt);
+      vsnprintf(pool->err, sizeof(pool->err), fmt, ap);
+      va_end(ap);
+    } else {
+      snprintf(pool->err, sizeof(pool->err), "%s", strerror(pool->error));
+    }
+  }
+  pthread_cond_broadcast(&pool->cond);
+  pthread_mutex_unlock(&pool->lock);
+}
+
+static void *
+destructive_stream_reverse_chunk_worker(void *arg) {
+  reverse_chunk_pool_t *pool = (reverse_chunk_pool_t *)arg;
+  if(!pool) return NULL;
+  for(;;) {
+    reverse_chunk_slot_t *slot = NULL;
+    pthread_mutex_lock(&pool->lock);
+    while(!pool->stop && !pool->error && pool->next_out < pool->original_size) {
+      for(int i = 0; i < pool->slot_count; i++) {
+        if(pool->slots[i].state == REVERSE_CHUNK_FREE) {
+          slot = &pool->slots[i];
+          break;
+        }
+      }
+      if(slot) break;
+      pthread_cond_wait(&pool->cond, &pool->lock);
+    }
+    if(pool->stop || pool->error || pool->next_out >= pool->original_size) {
+      pthread_mutex_unlock(&pool->lock);
+      break;
+    }
+    uint64_t remaining = pool->original_size - pool->next_out;
+    size_t n = remaining > (uint64_t)pool->chunk_size ?
+               pool->chunk_size : (size_t)remaining;
+    slot->out_off = pool->next_out;
+    slot->len = n;
+    slot->state = REVERSE_CHUNK_FILLING;
+    pool->next_out += (uint64_t)n;
+    pthread_mutex_unlock(&pool->lock);
+
+    uint64_t read_off = pool->original_size - slot->out_off - (uint64_t)n;
+    if(read_exact_at(pool->src_fd, slot->buf, n, (off_t)read_off) != 0) {
+      int saved = errno ? errno : EIO;
+      reverse_chunk_pool_set_error(pool, saved, "read source for reverse: %s",
+                                   strerror(saved));
+      break;
+    }
+    reverse_bytes(slot->buf, n);
+
+    pthread_mutex_lock(&pool->lock);
+    slot->state = REVERSE_CHUNK_READY;
+    pthread_cond_broadcast(&pool->cond);
+    pthread_mutex_unlock(&pool->lock);
+  }
+  return NULL;
+}
+
+static int
+destructive_stream_reverse_file(destructive_stream_ctx_t *ctx,
+                                destructive_stream_file_t *f,
+                                size_t file_index,
+                                char *err, size_t err_size) {
+  if(!ctx || !f || destructive_stream_file_reversed(f) || f->original_size <= 1) {
+    if(f && !destructive_stream_file_reversed(f)) {
+      f->reverse_pos = f->original_size;
+      destructive_stream_file_set_reversed(f, 1);
+      return destructive_stream_write_file_record(ctx, file_index, err,
+                                                  err_size);
+    }
+    return 0;
+  }
+  if(destructive_stream_mark_mutation_started(ctx, err, err_size) != 0) {
+    return -1;
+  }
+  if(destructive_stream_ensure_reverse_dir(ctx, err, err_size) != 0 ||
+     destructive_stream_reconcile_reverse_file(ctx, f, file_index,
+                                               err, err_size) != 0) {
+    return -1;
+  }
+  if(destructive_stream_file_reversed(f)) return 0;
+
+  char tmp_path[1024];
+  if(destructive_stream_reverse_tmp_path(ctx, file_index, tmp_path,
+                                         sizeof(tmp_path)) != 0) {
+    set_err(err, err_size, "stream reverse temp path too long");
+    return -1;
+  }
+
+  int src_fd = open(f->abs, O_RDWR);
+  if(src_fd < 0) {
+    set_err(err, err_size, "open source file: %s", strerror(errno));
+    return -1;
+  }
+  int tmp_fd = open(tmp_path, O_RDWR | O_CREAT, 0666);
+  if(tmp_fd < 0) {
+    int saved = errno;
+    close(src_fd);
+    errno = saved;
+    set_err(err, err_size, "open stream reverse temp: %s", strerror(errno));
+    return -1;
+  }
+  struct stat src_meta;
+  if(fstat(src_fd, &src_meta) == 0) {
+    fchmod(tmp_fd, src_meta.st_mode & 07777);
+  }
+
+  reverse_chunk_pool_t pool;
+  memset(&pool, 0, sizeof(pool));
+  pool.src_fd = src_fd;
+  pool.original_size = f->original_size;
+  pool.next_out = f->reverse_pos;
+  int worker_count = PFS_STREAM_REVERSE_WORKERS;
+  uint64_t remaining_chunks = f->original_size > f->reverse_pos ?
+      ceil_div_u64(f->original_size - f->reverse_pos,
+                   PFS_STREAM_REVERSE_CHUNK_MIN_SIZE) : 0;
+  if(remaining_chunks > 0 && remaining_chunks < (uint64_t)worker_count) {
+    worker_count = (int)remaining_chunks;
+  }
+  if(worker_count < 1) worker_count = 1;
+  pool.slot_count = worker_count;
+  pool.slots = calloc((size_t)pool.slot_count, sizeof(*pool.slots));
+  pthread_t *threads = calloc((size_t)worker_count, sizeof(*threads));
+  int workers_started = 0;
+  int pool_sync_initialized = 0;
+  int rc = -1;
+  if(!pool.slots || !threads) {
+    set_err(err, err_size, "out of memory");
+    free(pool.slots);
+    free(threads);
+    close(src_fd);
+    close(tmp_fd);
+    return -1;
+  }
+  for(int i = 0; i < pool.slot_count; i++) {
+    pool.slots[i].buf = destructive_stream_alloc_reverse_buffer(
+        ctx, &pool.slots[i].cap, err, err_size);
+    if(!pool.slots[i].buf) {
+      for(int j = 0; j < i; j++) free(pool.slots[j].buf);
+      free(pool.slots);
+      free(threads);
+      close(src_fd);
+      close(tmp_fd);
+      return -1;
+    }
+    if(i == 0 || pool.slots[i].cap < pool.chunk_size) {
+      pool.chunk_size = pool.slots[i].cap;
+    }
+  }
+  if(pool.chunk_size == 0) pool.chunk_size = PFS_STREAM_REVERSE_CHUNK_MIN_SIZE;
+  if(pthread_mutex_init(&pool.lock, NULL) != 0 ||
+     pthread_cond_init(&pool.cond, NULL) != 0) {
+    set_err(err, err_size, "init reverse chunk workers failed");
+    goto done;
+  }
+  pool_sync_initialized = 1;
+
+  if(!ctx->reverse_ahead_started) job_set_current(f->rel[0] ? f->rel : f->abs);
+
+  struct stat st;
+  if(fstat(src_fd, &st) != 0 || st.st_size < 0) {
+    set_err(err, err_size, "stat source for reverse: %s", strerror(errno));
+    goto done;
+  }
+  uint64_t src_size = (uint64_t)st.st_size;
+  if(src_size > f->original_size) {
+    set_err(err, err_size, "bad source size during reverse");
+    errno = EIO;
+    goto done;
+  }
+  uint64_t moved = f->original_size - src_size;
+  if(moved != f->reverse_pos) {
+    f->reverse_pos = moved;
+    pool.next_out = moved;
+    if(destructive_stream_write_file_record(ctx, file_index, err,
+                                            err_size) != 0 ||
+       destructive_stream_sync(ctx, err, err_size) != 0) {
+      goto done;
+    }
+  }
+
+  for(int i = 0; i < worker_count; i++) {
+    int trc = pthread_create(&threads[i], NULL,
+                             destructive_stream_reverse_chunk_worker, &pool);
+    if(trc != 0) {
+      set_err(err, err_size, "start reverse chunk worker: %s", strerror(trc));
+      goto done;
+    }
+    workers_started++;
+  }
+
+  while(f->reverse_pos < f->original_size) {
+    if(job_cancelled()) atomic_store(&g_job.cancel, 0);
+
+    reverse_chunk_slot_t *slot = NULL;
+    pthread_mutex_lock(&pool.lock);
+    while(!pool.error) {
+      for(int i = 0; i < pool.slot_count; i++) {
+        if(pool.slots[i].state == REVERSE_CHUNK_READY &&
+           pool.slots[i].out_off == f->reverse_pos) {
+          slot = &pool.slots[i];
+          break;
+        }
+      }
+      if(slot) break;
+      pthread_cond_wait(&pool.cond, &pool.lock);
+    }
+    int pool_error = pool.error;
+    char pool_err[256];
+    snprintf(pool_err, sizeof(pool_err), "%s", pool.err);
+    pthread_mutex_unlock(&pool.lock);
+    if(pool_error) {
+      errno = pool_error;
+      set_err(err, err_size, "%s", pool_err[0] ? pool_err : strerror(pool_error));
+      goto done;
+    }
+
+    uint64_t out_off = slot->out_off;
+    size_t n = slot->len;
+    if(out_off != f->reverse_pos || n == 0 ||
+       out_off + (uint64_t)n > f->original_size) {
+      set_err(err, err_size, "bad reverse chunk order");
+      errno = EIO;
+      goto done;
+    }
+    if(pwrite_all_local(tmp_fd, slot->buf, n, (off_t)out_off) != 0 ||
+       fsync(tmp_fd) != 0) {
+      set_err(err, err_size, "write stream reverse temp: %s", strerror(errno));
+      goto done;
+    }
+    uint64_t new_src_size = f->original_size - out_off - (uint64_t)n;
+    if(ftruncate(src_fd, (off_t)new_src_size) != 0 || fsync(src_fd) != 0) {
+      set_err(err, err_size, "truncate source after reverse: %s",
+              strerror(errno));
+      goto done;
+    }
+
+    f->reverse_pos += (uint64_t)n;
+    if(destructive_stream_write_file_record(ctx, file_index, err, err_size) != 0 ||
+       destructive_stream_sync(ctx, err, err_size) != 0) {
+      goto done;
+    }
+    if(ctx->reverse_ahead_sync_initialized) {
+      pthread_mutex_lock(&ctx->reverse_ahead_lock);
+      pthread_cond_broadcast(&ctx->reverse_ahead_cond);
+      pthread_mutex_unlock(&ctx->reverse_ahead_lock);
+    }
+    pthread_mutex_lock(&pool.lock);
+    slot->state = REVERSE_CHUNK_FREE;
+    slot->len = 0;
+    pthread_cond_broadcast(&pool.cond);
+    pthread_mutex_unlock(&pool.lock);
+  }
+  pthread_mutex_lock(&pool.lock);
+  pool.stop = 1;
+  pthread_cond_broadcast(&pool.cond);
+  pthread_mutex_unlock(&pool.lock);
+  for(int i = 0; i < workers_started; i++) pthread_join(threads[i], NULL);
+  workers_started = 0;
+  close(src_fd);
+  src_fd = -1;
+  close(tmp_fd);
+  tmp_fd = -1;
+
+  if(f->reverse_pos >= f->original_size) {
+    if(destructive_stream_finalize_reversed_file(ctx, f, file_index, tmp_path,
+                                                 err, err_size) != 0) {
+      goto done;
+    }
+  }
+  rc = 0;
+
+done:
+  if(pool_sync_initialized) {
+    pthread_mutex_lock(&pool.lock);
+    pool.stop = 1;
+    pthread_cond_broadcast(&pool.cond);
+    pthread_mutex_unlock(&pool.lock);
+  }
+  for(int i = 0; i < workers_started; i++) pthread_join(threads[i], NULL);
+  if(pool_sync_initialized) {
+    pthread_cond_destroy(&pool.cond);
+    pthread_mutex_destroy(&pool.lock);
+  }
+  for(int i = 0; i < pool.slot_count; i++) free(pool.slots[i].buf);
+  free(pool.slots);
+  free(threads);
+  if(src_fd >= 0) close(src_fd);
+  if(tmp_fd >= 0) close(tmp_fd);
+  return rc;
+}
+
+typedef struct reverse_ahead_claim {
+  size_t file_index;
+  uint64_t out_off;
+  size_t len;
+  uint64_t original_size;
+  char source_path[1024];
+  char tmp_path[1024];
+} reverse_ahead_claim_t;
+
+static uint64_t
+destructive_stream_file_virtual_end(const destructive_stream_file_t *f);
+static size_t
+destructive_stream_focus_file_index(const destructive_stream_ctx_t *ctx,
+                                    uint64_t focus_bytes);
+static int
+destructive_stream_file_passthrough_delete(const destructive_stream_file_t *f);
+
+static int
+destructive_stream_prepare_reverse_ahead(destructive_stream_ctx_t *ctx,
+                                         char *err, size_t err_size) {
+  if(!ctx) return 0;
+  if(destructive_stream_mark_mutation_started(ctx, err, err_size) != 0 ||
+     destructive_stream_ensure_reverse_dir(ctx, err, err_size) != 0) {
+    return -1;
+  }
+  for(size_t i = 0; i < ctx->file_count; i++) {
+    destructive_stream_file_t *f = &ctx->files[i];
+    if(f->deleted || destructive_stream_file_reversed(f)) {
+      f->reverse_claim = f->reverse_pos;
+      continue;
+    }
+    if(destructive_stream_file_passthrough_delete(f)) {
+      int exists = 0;
+      uint64_t size = 0;
+      if(destructive_stream_stat_size(f->abs, &exists, &size,
+                                      err, err_size) != 0) {
+        return -1;
+      }
+      if(!exists || size != f->original_size) {
+        set_err(err, err_size,
+                "stream passthrough source changed before compression");
+        errno = EIO;
+        return -1;
+      }
+      char tmp_path[1024];
+      if(destructive_stream_reverse_tmp_path(ctx, i, tmp_path,
+                                             sizeof(tmp_path)) == 0) {
+        unlink(tmp_path);
+      }
+      f->reverse_claim = f->reverse_pos;
+      continue;
+    }
+    if(f->original_size <= 1) {
+      f->reverse_pos = f->original_size;
+      f->reverse_claim = f->original_size;
+      destructive_stream_file_set_reversed(f, 1);
+      if(destructive_stream_write_file_record(ctx, i, err, err_size) != 0) {
+        return -1;
+      }
+      continue;
+    }
+    if(destructive_stream_reconcile_reverse_file(ctx, f, i, err,
+                                                 err_size) != 0) {
+      return -1;
+    }
+    f->reverse_claim = f->reverse_pos;
+  }
+  return destructive_stream_sync(ctx, err, err_size);
+}
+
+static int
+destructive_stream_reverse_ahead_claim(destructive_stream_ctx_t *ctx,
+                                       reverse_ahead_claim_t *claim,
+                                       size_t max_len) {
+  if(!ctx || !claim) return 0;
+  memset(claim, 0, sizeof(*claim));
+  if(max_len > PFS_STREAM_REVERSE_CHUNK_MAX_SIZE) {
+    max_len = PFS_STREAM_REVERSE_CHUNK_MAX_SIZE;
+  }
+  if(max_len < PFS_STREAM_REVERSE_CHUNK_MIN_SIZE) {
+    max_len = PFS_STREAM_REVERSE_CHUNK_MIN_SIZE;
+  }
+  pthread_mutex_lock(&ctx->reverse_ahead_lock);
+  for(;;) {
+    if(ctx->reverse_ahead_stop || ctx->reverse_ahead_error) {
+      pthread_mutex_unlock(&ctx->reverse_ahead_lock);
+      return 0;
+    }
+
+    if(ctx->reverse_ahead_demand_file < ctx->file_count) {
+      size_t i = ctx->reverse_ahead_demand_file;
+      destructive_stream_file_t *f = &ctx->files[i];
+      if(f->deleted || destructive_stream_file_reversed(f) ||
+         destructive_stream_file_passthrough_delete(f) ||
+         f->reverse_pos >= ctx->reverse_ahead_demand_pos) {
+        ctx->reverse_ahead_demand_file = SIZE_MAX;
+        ctx->reverse_ahead_demand_pos = 0;
+      } else {
+        if(f->reverse_claim < f->reverse_pos) f->reverse_claim = f->reverse_pos;
+        if(f->reverse_claim < f->original_size &&
+           f->reverse_claim < ctx->reverse_ahead_demand_pos) {
+          uint64_t out_off = f->reverse_claim;
+          uint64_t remaining = f->original_size - out_off;
+          size_t len = remaining > (uint64_t)max_len ? max_len :
+                       (size_t)remaining;
+          if(out_off + (uint64_t)len > ctx->reverse_ahead_demand_pos) {
+            uint64_t demand_remaining =
+                ctx->reverse_ahead_demand_pos - out_off;
+            if(demand_remaining < (uint64_t)len) len = (size_t)demand_remaining;
+          }
+          if(len > 0) {
+            f->reverse_claim += (uint64_t)len;
+            ctx->reverse_ahead_inflight++;
+            claim->file_index = i;
+            claim->out_off = out_off;
+            claim->len = len;
+            claim->original_size = f->original_size;
+            snprintf(claim->source_path, sizeof(claim->source_path), "%s",
+                     f->abs);
+            if(destructive_stream_reverse_tmp_path(ctx, i, claim->tmp_path,
+                                                   sizeof(claim->tmp_path)) != 0) {
+              ctx->reverse_ahead_inflight--;
+              ctx->reverse_ahead_error = ENAMETOOLONG;
+              snprintf(ctx->reverse_ahead_err, sizeof(ctx->reverse_ahead_err),
+                       "%s", "stream reverse temp path too long");
+              pthread_cond_broadcast(&ctx->reverse_ahead_cond);
+              pthread_mutex_unlock(&ctx->reverse_ahead_lock);
+              return 0;
+            }
+            pthread_mutex_unlock(&ctx->reverse_ahead_lock);
+            return 1;
+          }
+        }
+      }
+    }
+
+    uint64_t focus_bytes = ctx->completed_blocks * PFS_BLOCK_SIZE;
+    if(focus_bytes > ctx->nested_size) focus_bytes = ctx->nested_size;
+    uint64_t window_end = UINT64_MAX - focus_bytes <
+                          PFS_STREAM_REVERSE_LOOKAHEAD_BYTES ?
+                          UINT64_MAX :
+                          focus_bytes + PFS_STREAM_REVERSE_LOOKAHEAD_BYTES;
+    size_t start = destructive_stream_focus_file_index(ctx, focus_bytes);
+    int expanded = 0;
+retry_scan:
+    for(size_t n = 0; n < ctx->file_count; n++) {
+      size_t i = start + n;
+      if(i >= ctx->file_count) i -= ctx->file_count;
+      destructive_stream_file_t *f = &ctx->files[i];
+      if(f->deleted || destructive_stream_file_reversed(f)) continue;
+      if(destructive_stream_file_passthrough_delete(f)) continue;
+      if(!expanded && f->virtual_offset >= window_end) continue;
+      if(f->reverse_claim < f->reverse_pos) f->reverse_claim = f->reverse_pos;
+      if(f->reverse_claim >= f->original_size) continue;
+
+      uint64_t out_off = f->reverse_claim;
+      uint64_t remaining = f->original_size - out_off;
+      size_t len = remaining > (uint64_t)max_len ? max_len :
+                   (size_t)remaining;
+      if(len == 0) continue;
+
+      f->reverse_claim += (uint64_t)len;
+      ctx->reverse_ahead_next_file =
+          f->reverse_claim < f->original_size ? i : i + 1;
+      ctx->reverse_ahead_inflight++;
+      claim->file_index = i;
+      claim->out_off = out_off;
+      claim->len = len;
+      claim->original_size = f->original_size;
+      snprintf(claim->source_path, sizeof(claim->source_path), "%s", f->abs);
+      if(destructive_stream_reverse_tmp_path(ctx, i, claim->tmp_path,
+                                             sizeof(claim->tmp_path)) != 0) {
+        ctx->reverse_ahead_inflight--;
+        ctx->reverse_ahead_error = ENAMETOOLONG;
+        snprintf(ctx->reverse_ahead_err, sizeof(ctx->reverse_ahead_err),
+                 "%s", "stream reverse temp path too long");
+        pthread_cond_broadcast(&ctx->reverse_ahead_cond);
+        pthread_mutex_unlock(&ctx->reverse_ahead_lock);
+        return 0;
+      }
+      pthread_mutex_unlock(&ctx->reverse_ahead_lock);
+      return 1;
+    }
+
+    if(!expanded && ctx->reverse_ahead_inflight == 0) {
+      expanded = 1;
+      goto retry_scan;
+    }
+    if(ctx->reverse_ahead_inflight == 0) {
+      pthread_mutex_unlock(&ctx->reverse_ahead_lock);
+      return 0;
+    }
+    pthread_cond_wait(&ctx->reverse_ahead_cond, &ctx->reverse_ahead_lock);
+  }
+}
+
+static int
+destructive_stream_reverse_ahead_finish_claim(destructive_stream_ctx_t *ctx,
+                                              size_t file_index, int ok,
+                                              int saved,
+                                              const char *msg) {
+  if(!ctx) return -1;
+  pthread_mutex_lock(&ctx->reverse_ahead_lock);
+  if(ctx->reverse_ahead_inflight > 0) ctx->reverse_ahead_inflight--;
+  if(!ok && !ctx->reverse_ahead_error) {
+    ctx->reverse_ahead_error = saved ? saved : EIO;
+    snprintf(ctx->reverse_ahead_err, sizeof(ctx->reverse_ahead_err), "%s",
+             msg && msg[0] ? msg : strerror(ctx->reverse_ahead_error));
+    if(file_index < ctx->file_count) {
+      destructive_stream_file_t *f = &ctx->files[file_index];
+      if(f->reverse_claim > f->reverse_pos) f->reverse_claim = f->reverse_pos;
+    }
+  }
+  pthread_cond_broadcast(&ctx->reverse_ahead_cond);
+  pthread_mutex_unlock(&ctx->reverse_ahead_lock);
+  return ok ? 0 : -1;
+}
+
+static uint64_t
+destructive_stream_file_virtual_end(const destructive_stream_file_t *f) {
+  if(!f) return 0;
+  if(UINT64_MAX - f->virtual_offset < f->original_size) return UINT64_MAX;
+  return f->virtual_offset + f->original_size;
+}
+
+static int
+destructive_stream_file_passthrough_delete(const destructive_stream_file_t *f) {
+  return f && !f->deleted &&
+         !destructive_stream_file_reversed(f) &&
+         f->passthrough_delete;
+}
+
+static size_t
+destructive_stream_focus_file_index(const destructive_stream_ctx_t *ctx,
+                                    uint64_t focus_bytes) {
+  if(!ctx || ctx->file_count == 0) return 0;
+  for(size_t i = 0; i < ctx->file_count; i++) {
+    const destructive_stream_file_t *f = &ctx->files[i];
+    if(f->deleted || destructive_stream_file_reversed(f)) continue;
+    if(destructive_stream_file_virtual_end(f) > focus_bytes) return i;
+  }
+  return 0;
+}
+
+static int
+destructive_stream_commit_reverse_chunk(destructive_stream_ctx_t *ctx,
+                                        const reverse_ahead_claim_t *claim,
+                                        char *err, size_t err_size) {
+  destructive_stream_file_t *f;
+  int tmp_fd = -1;
+  int src_fd = -1;
+  int rc = -1;
+  if(!ctx || !claim || claim->file_index >= ctx->file_count) {
+    set_err(err, err_size, "bad reverse chunk claim");
+    errno = EINVAL;
+    return -1;
+  }
+
+  f = &ctx->files[claim->file_index];
+  pthread_mutex_lock(&ctx->reverse_ahead_lock);
+  while(!ctx->reverse_ahead_stop && !ctx->reverse_ahead_error &&
+        f->reverse_pos != claim->out_off) {
+    pthread_cond_wait(&ctx->reverse_ahead_cond, &ctx->reverse_ahead_lock);
+  }
+  if(ctx->reverse_ahead_stop || ctx->reverse_ahead_error) {
+    int saved = ctx->reverse_ahead_error ? ctx->reverse_ahead_error : EINTR;
+    pthread_mutex_unlock(&ctx->reverse_ahead_lock);
+    errno = saved;
+    set_err(err, err_size, "%s",
+            ctx->reverse_ahead_err[0] ? ctx->reverse_ahead_err :
+            strerror(saved));
+    return -1;
+  }
+  f->reverse_committing = 1;
+  pthread_mutex_unlock(&ctx->reverse_ahead_lock);
+
+  tmp_fd = open(claim->tmp_path, O_RDWR);
+  if(tmp_fd < 0) {
+    set_err(err, err_size, "open stream reverse temp: %s", strerror(errno));
+    goto done;
+  }
+  if(fsync(tmp_fd) != 0) {
+    set_err(err, err_size, "sync stream reverse temp: %s", strerror(errno));
+    goto done;
+  }
+  src_fd = open(claim->source_path, O_RDWR);
+  if(src_fd < 0) {
+    set_err(err, err_size, "open source file for truncate: %s",
+            strerror(errno));
+    goto done;
+  }
+  uint64_t new_src_size =
+      claim->original_size - claim->out_off - (uint64_t)claim->len;
+  if(ftruncate(src_fd, (off_t)new_src_size) != 0 || fsync(src_fd) != 0) {
+    set_err(err, err_size, "truncate source after reverse: %s",
+            strerror(errno));
+    goto done;
+  }
+  close(src_fd);
+  src_fd = -1;
+  close(tmp_fd);
+  tmp_fd = -1;
+
+  pthread_mutex_lock(&ctx->reverse_ahead_lock);
+  f->reverse_pos += (uint64_t)claim->len;
+  f->reverse_committing = 0;
+  pthread_cond_broadcast(&ctx->reverse_ahead_cond);
+  pthread_mutex_unlock(&ctx->reverse_ahead_lock);
+
+  if(destructive_stream_write_file_record(ctx, claim->file_index,
+                                          err, err_size) != 0 ||
+     destructive_stream_sync(ctx, err, err_size) != 0) {
+    goto done;
+  }
+  if(f->reverse_pos >= f->original_size) {
+    if(destructive_stream_finalize_reversed_file(ctx, f, claim->file_index,
+                                                 claim->tmp_path,
+                                                 err, err_size) != 0) {
+      goto done;
+    }
+  }
+  rc = 0;
+
+done:
+  if(src_fd >= 0) close(src_fd);
+  if(tmp_fd >= 0) close(tmp_fd);
+  pthread_mutex_lock(&ctx->reverse_ahead_lock);
+  f->reverse_committing = 0;
+  pthread_cond_broadcast(&ctx->reverse_ahead_cond);
+  pthread_mutex_unlock(&ctx->reverse_ahead_lock);
+  return rc;
+}
+
+static void *
+destructive_stream_reverse_ahead_main(void *arg) {
+  destructive_stream_ctx_t *ctx = (destructive_stream_ctx_t *)arg;
+  if(!ctx) return NULL;
+  char local_err[256] = {0};
+  size_t cap = 0;
+  unsigned char *buf = destructive_stream_alloc_reverse_buffer(
+      ctx, &cap, local_err, sizeof(local_err));
+  if(!buf) {
+    destructive_stream_reverse_ahead_finish_claim(
+        ctx, 0, 0, errno ? errno : ENOMEM,
+        local_err[0] ? local_err : "out of memory");
+    goto finished;
+  }
+  for(;;) {
+    reverse_ahead_claim_t claim;
+    local_err[0] = '\0';
+    if(!destructive_stream_reverse_ahead_claim(ctx, &claim, cap)) break;
+
+    int src_fd = open(claim.source_path, O_RDONLY);
+    if(src_fd < 0) {
+      snprintf(local_err, sizeof(local_err), "open source file: %s",
+               strerror(errno));
+      int saved = errno ? errno : EIO;
+      destructive_stream_reverse_ahead_finish_claim(
+          ctx, claim.file_index, 0, saved, local_err);
+      break;
+    }
+    struct stat src_meta;
+    mode_t src_mode = 0666;
+    if(fstat(src_fd, &src_meta) == 0) src_mode = src_meta.st_mode & 07777;
+
+    int tmp_fd = open(claim.tmp_path, O_RDWR | O_CREAT, 0666);
+    if(tmp_fd < 0) {
+      int saved = errno ? errno : EIO;
+      snprintf(local_err, sizeof(local_err), "open stream reverse temp: %s",
+               strerror(saved));
+      close(src_fd);
+      destructive_stream_reverse_ahead_finish_claim(
+          ctx, claim.file_index, 0, saved, local_err);
+      break;
+    }
+    fchmod(tmp_fd, src_mode);
+
+    uint64_t done = 0;
+    int claim_failed = 0;
+    while(done < (uint64_t)claim.len) {
+      uint64_t left = (uint64_t)claim.len - done;
+      size_t n = left > (uint64_t)cap ? cap : (size_t)left;
+      uint64_t out_off = claim.out_off + done;
+      uint64_t read_off = claim.original_size - out_off - (uint64_t)n;
+      if(read_exact_at(src_fd, buf, n, (off_t)read_off) != 0) {
+        int saved = errno ? errno : EIO;
+        snprintf(local_err, sizeof(local_err), "read source for reverse: %s",
+                 strerror(saved));
+        close(src_fd);
+        src_fd = -1;
+        close(tmp_fd);
+        tmp_fd = -1;
+        destructive_stream_reverse_ahead_finish_claim(
+            ctx, claim.file_index, 0, saved, local_err);
+        claim_failed = 1;
+        break;
+      }
+      reverse_bytes(buf, n);
+      if(pwrite_all_local(tmp_fd, buf, n, (off_t)out_off) != 0) {
+        int saved = errno ? errno : EIO;
+        snprintf(local_err, sizeof(local_err), "write stream reverse temp: %s",
+                 strerror(saved));
+        close(src_fd);
+        src_fd = -1;
+        close(tmp_fd);
+        tmp_fd = -1;
+        destructive_stream_reverse_ahead_finish_claim(
+            ctx, claim.file_index, 0, saved, local_err);
+        claim_failed = 1;
+        break;
+      }
+      done += (uint64_t)n;
+    }
+    if(src_fd >= 0) close(src_fd);
+    if(tmp_fd >= 0) close(tmp_fd);
+    if(claim_failed) break;
+
+    if(done != (uint64_t)claim.len) {
+      int saved = errno ? errno : EIO;
+      destructive_stream_reverse_ahead_finish_claim(
+          ctx, claim.file_index, 0, saved, local_err);
+      break;
+    }
+
+    if(destructive_stream_commit_reverse_chunk(ctx, &claim, local_err,
+                                               sizeof(local_err)) != 0) {
+      int saved = errno ? errno : EIO;
+      destructive_stream_reverse_ahead_finish_claim(
+          ctx, claim.file_index, 0, saved,
+          local_err[0] ? local_err : strerror(saved));
+      break;
+    }
+    destructive_stream_reverse_ahead_finish_claim(ctx, claim.file_index, 1,
+                                                  0, NULL);
+  }
+  free(buf);
+
+finished:
+  pthread_mutex_lock(&ctx->reverse_ahead_lock);
+  if(ctx->reverse_ahead_active > 0) ctx->reverse_ahead_active--;
+  if(ctx->reverse_ahead_active == 0) ctx->reverse_ahead_done = 1;
+  pthread_cond_broadcast(&ctx->reverse_ahead_cond);
+  pthread_mutex_unlock(&ctx->reverse_ahead_lock);
+  return NULL;
+}
+
+static int
+destructive_stream_reverse_ahead_worker_count(const destructive_stream_ctx_t *ctx) {
+  if(!ctx || ctx->file_count == 0) return 0;
+  for(size_t i = 0; i < ctx->file_count; i++) {
+    const destructive_stream_file_t *f = &ctx->files[i];
+    if(!f->deleted && !destructive_stream_file_reversed(f) &&
+       !destructive_stream_file_passthrough_delete(f)) {
+      return PFS_STREAM_REVERSE_WORKERS;
+    }
+  }
+  return 0;
+}
+
+static int
+destructive_stream_reverse_ahead_start(destructive_stream_ctx_t *ctx,
+                                       char *err, size_t err_size) {
+  if(!ctx || ctx->reverse_ahead_started || ctx->file_count == 0) return 0;
+  if(!ctx->reverse_ahead_sync_initialized) {
+    int rc = pthread_mutex_init(&ctx->reverse_ahead_lock, NULL);
+    if(rc != 0) {
+      set_err(err, err_size, "init reverse-ahead lock: %s", strerror(rc));
+      errno = rc;
+      return -1;
+    }
+    rc = pthread_cond_init(&ctx->reverse_ahead_cond, NULL);
+    if(rc != 0) {
+      pthread_mutex_destroy(&ctx->reverse_ahead_lock);
+      set_err(err, err_size, "init reverse-ahead condition: %s", strerror(rc));
+      errno = rc;
+      return -1;
+    }
+    ctx->reverse_ahead_sync_initialized = 1;
+  }
+  ctx->reverse_ahead_stop = 0;
+  ctx->reverse_ahead_done = 0;
+  ctx->reverse_ahead_error = 0;
+  ctx->reverse_ahead_err[0] = '\0';
+  ctx->reverse_ahead_next_file = 0;
+  ctx->reverse_ahead_thread_count = 0;
+  ctx->reverse_ahead_active = 0;
+  ctx->reverse_ahead_inflight = 0;
+  if(destructive_stream_prepare_reverse_ahead(ctx, err, err_size) != 0) {
+    return -1;
+  }
+  ctx->reverse_ahead_started = 1;
+  int target_workers = destructive_stream_reverse_ahead_worker_count(ctx);
+  for(int i = 0; i < target_workers; i++) {
+    pthread_mutex_lock(&ctx->reverse_ahead_lock);
+    ctx->reverse_ahead_active++;
+    pthread_mutex_unlock(&ctx->reverse_ahead_lock);
+    int rc = pthread_create(&ctx->reverse_ahead_threads[i], NULL,
+                            destructive_stream_reverse_ahead_main, ctx);
+    if(rc != 0) {
+      pthread_mutex_lock(&ctx->reverse_ahead_lock);
+      ctx->reverse_ahead_active--;
+      ctx->reverse_ahead_stop = 1;
+      pthread_cond_broadcast(&ctx->reverse_ahead_cond);
+      pthread_mutex_unlock(&ctx->reverse_ahead_lock);
+      for(int j = 0; j < ctx->reverse_ahead_thread_count; j++) {
+        pthread_join(ctx->reverse_ahead_threads[j], NULL);
+      }
+      ctx->reverse_ahead_thread_count = 0;
+      ctx->reverse_ahead_active = 0;
+      ctx->reverse_ahead_done = 1;
+      ctx->reverse_ahead_started = 0;
+      set_err(err, err_size, "start reverse-ahead worker: %s", strerror(rc));
+      errno = rc;
+      return -1;
+    }
+    ctx->reverse_ahead_thread_count++;
+  }
+  if(ctx->reverse_ahead_thread_count == 0) {
+    ctx->reverse_ahead_done = 1;
+    ctx->reverse_ahead_started = 0;
+  }
+  return 0;
+}
+
+static void
+destructive_stream_reverse_ahead_stop(destructive_stream_ctx_t *ctx) {
+  if(!ctx || !ctx->reverse_ahead_started) return;
+  if(ctx->reverse_ahead_sync_initialized) {
+    pthread_mutex_lock(&ctx->reverse_ahead_lock);
+    ctx->reverse_ahead_stop = 1;
+    pthread_cond_broadcast(&ctx->reverse_ahead_cond);
+    pthread_mutex_unlock(&ctx->reverse_ahead_lock);
+  }
+  for(int i = 0; i < ctx->reverse_ahead_thread_count; i++) {
+    pthread_join(ctx->reverse_ahead_threads[i], NULL);
+  }
+  ctx->reverse_ahead_thread_count = 0;
+  ctx->reverse_ahead_active = 0;
+  ctx->reverse_ahead_started = 0;
+}
+
+static int
+destructive_stream_wait_reverse_pos(destructive_stream_ctx_t *ctx,
+                                    destructive_stream_file_t *f,
+                                    size_t file_index,
+                                    uint64_t needed,
+                                    char *err, size_t err_size) {
+  if(!ctx || !f) {
+    set_err(err, err_size, "bad stream reverse state");
+    errno = EINVAL;
+    return -1;
+  }
+  if(needed > f->original_size) needed = f->original_size;
+  if(destructive_stream_file_reversed(f) || f->reverse_pos >= needed) return 0;
+  if(!ctx->reverse_ahead_started) {
+    return destructive_stream_reverse_file(ctx, f, file_index, err, err_size);
+  }
+  pthread_mutex_lock(&ctx->reverse_ahead_lock);
+  if(!destructive_stream_file_reversed(f) && f->reverse_pos < needed) {
+    ctx->reverse_ahead_demand_file = file_index;
+    if(ctx->reverse_ahead_demand_pos < needed) {
+      ctx->reverse_ahead_demand_pos = needed;
+    }
+    pthread_cond_broadcast(&ctx->reverse_ahead_cond);
+  }
+  while(!destructive_stream_file_reversed(f) && f->reverse_pos < needed &&
+        !ctx->reverse_ahead_error && !ctx->reverse_ahead_done) {
+    pthread_cond_wait(&ctx->reverse_ahead_cond, &ctx->reverse_ahead_lock);
+  }
+  int reverse_error = ctx->reverse_ahead_error;
+  char reverse_err[256];
+  snprintf(reverse_err, sizeof(reverse_err), "%s", ctx->reverse_ahead_err);
+  int ready = destructive_stream_file_reversed(f) || f->reverse_pos >= needed;
+  if(ready && ctx->reverse_ahead_demand_file == file_index &&
+     f->reverse_pos >= ctx->reverse_ahead_demand_pos) {
+    ctx->reverse_ahead_demand_file = SIZE_MAX;
+    ctx->reverse_ahead_demand_pos = 0;
+  }
+  pthread_mutex_unlock(&ctx->reverse_ahead_lock);
+  if(ready) return 0;
+  if(reverse_error) {
+    errno = reverse_error;
+    set_err(err, err_size, "%s",
+            reverse_err[0] ? reverse_err : strerror(reverse_error));
+  } else {
+    errno = EIO;
+    set_err(err, err_size, "reverse-ahead finished before source range was ready");
+  }
+  return -1;
+}
+
+static int
+destructive_stream_read_reversed(destructive_stream_ctx_t *ctx,
+                                 virtual_reader_t *vr, const char *path,
+                                 uint64_t file_offset,
+                                 unsigned char *out, size_t size,
+                                 char *err, size_t err_size) {
+  size_t index = 0;
+  destructive_stream_file_t *f = destructive_stream_find_file(ctx, path, &index);
+  if(!f) {
+    set_err(err, err_size, "source file is missing from stream journal");
+    errno = EINVAL;
+    return -1;
+  }
+  if(size == 0) return 0;
+  if(file_offset < f->committed ||
+     file_offset > f->original_size ||
+     (uint64_t)size > f->original_size - file_offset) {
+    set_err(err, err_size, "read source outside committed stream window");
+    errno = EIO;
+    return -1;
+  }
+  while(size > 0) {
+    if(destructive_stream_file_reversed(f)) {
+      uint64_t disk_start = f->original_size - file_offset - (uint64_t)size;
+      ssize_t key = -((ssize_t)index * 3 + 3);
+      if(virtual_reader_open_path(vr, f->abs, key, err, err_size) != 0) {
+        return -1;
+      }
+      if(read_exact_at(vr->fd, out, size, (off_t)disk_start) != 0) {
+        set_err(err, err_size, "read reversed source file: %s", strerror(errno));
+        return -1;
+      }
+      reverse_bytes(out, size);
+      return 0;
+    }
+
+    uint64_t reversed_bytes = f->reverse_pos;
+    uint64_t source_end = f->original_size > reversed_bytes ?
+                          f->original_size - reversed_bytes : 0;
+    if(file_offset < source_end) {
+      size_t n = size;
+      uint64_t available = source_end - file_offset;
+      if((uint64_t)n > available) n = (size_t)available;
+      ssize_t key = -((ssize_t)index * 3 + 1);
+      if(virtual_reader_open_path(vr, f->abs, key, err, err_size) != 0) {
+        return -1;
+      }
+      if(virtual_reader_file_read(vr, key, source_end, file_offset,
+                                  out, n) != 0) {
+        uint64_t latest_reversed = f->reverse_pos;
+        uint64_t latest_source_end = f->original_size > latest_reversed ?
+                                     f->original_size - latest_reversed : 0;
+        if((errno == EIO || errno == ENOENT) && file_offset >= latest_source_end) {
+          virtual_reader_close_file(vr);
+          continue;
+        }
+        set_err(err, err_size, "read source file: %s", strerror(errno));
+        return -1;
+      }
+      out += n;
+      file_offset += (uint64_t)n;
+      size -= n;
+      continue;
+    }
+
+    char tmp_path[1024];
+    if(destructive_stream_reverse_tmp_path(ctx, index, tmp_path,
+                                           sizeof(tmp_path)) != 0) {
+      set_err(err, err_size, "stream reverse temp path too long");
+      return -1;
+    }
+    size_t n = size;
+    uint64_t disk_start = f->original_size - file_offset - (uint64_t)n;
+    if(disk_start + (uint64_t)n > reversed_bytes) {
+      uint64_t available = reversed_bytes > disk_start ?
+                           reversed_bytes - disk_start : 0;
+      if(available == 0) {
+        uint64_t needed = disk_start + (uint64_t)n;
+        if(destructive_stream_wait_reverse_pos(ctx, f, index, needed,
+                                               err, err_size) != 0) {
+          return -1;
+        }
+        continue;
+      }
+      n = (size_t)available;
+    }
+    if(access(tmp_path, F_OK) != 0) {
+      if(errno == ENOENT &&
+         destructive_stream_wait_reverse_pos(ctx, f, index,
+                                             disk_start + (uint64_t)n,
+                                             err, err_size) == 0) {
+        continue;
+      }
+      set_err(err, err_size, "open stream reverse temp: %s", strerror(errno));
+      return -1;
+    }
+    ssize_t key = -((ssize_t)index * 3 + 2);
+    if(virtual_reader_open_path(vr, tmp_path, key, err, err_size) != 0) {
+      return -1;
+    }
+    if(read_exact_at(vr->fd, out, n, (off_t)disk_start) != 0) {
+      set_err(err, err_size, "read stream reverse temp: %s", strerror(errno));
+      return -1;
+    }
+    reverse_bytes(out, n);
+    out += n;
+    file_offset += (uint64_t)n;
+    size -= n;
+  }
+  return 0;
+}
+
+static uint64_t
+destructive_stream_target_commit(const destructive_stream_file_t *f,
+                                 uint64_t completed_bytes) {
+  if(!f || completed_bytes <= f->virtual_offset) return 0;
+  uint64_t rel = completed_bytes - f->virtual_offset;
+  return rel > f->original_size ? f->original_size : rel;
+}
+
+static int
+destructive_stream_truncate_committed(int fd, uint64_t file_start,
+                                      destructive_stream_ctx_t *ctx,
+                                      virtual_reader_t *vr,
+                                      pfsc_output_buffer_t *outbuf,
+                                      pfs_vhash_writer_t *vhash,
+                                      uint64_t completed_blocks,
+                                      uint64_t data_pos,
+                                      int force,
+                                      char *err, size_t err_size) {
+  if(!ctx) return 0;
+  if(job_cancelled()) {
+    atomic_store(&g_job.cancel, 0);
+  }
+  if(completed_blocks > ctx->block_count) completed_blocks = ctx->block_count;
+  uint64_t completed_bytes = completed_blocks * PFS_BLOCK_SIZE;
+  if(completed_bytes > ctx->nested_size) completed_bytes = ctx->nested_size;
+
+  int should_commit = force || completed_blocks == ctx->block_count;
+  uint64_t journal_block_step = PFS_STREAM_TRUNCATE_GRANULARITY / PFS_BLOCK_SIZE;
+  if(journal_block_step == 0) journal_block_step = 1;
+  if(!should_commit && completed_blocks > ctx->journaled_blocks &&
+     completed_blocks - ctx->journaled_blocks >= journal_block_step) {
+    should_commit = 1;
+  }
+  for(size_t i = 0; !should_commit && i < ctx->file_count; i++) {
+    destructive_stream_file_t *f = &ctx->files[i];
+    int pass_through = destructive_stream_file_passthrough_delete(f);
+    if(!destructive_stream_file_reversed(f) && !pass_through) continue;
+    uint64_t target = destructive_stream_target_commit(f, completed_bytes);
+    if(pass_through && target < f->original_size) continue;
+    if(target > f->committed &&
+       (target == f->original_size ||
+        target - f->committed >= PFS_STREAM_TRUNCATE_GRANULARITY)) {
+      should_commit = 1;
+      break;
+    }
+  }
+  if(!should_commit) return 0;
+
+  if(pfsc_output_buffer_flush(fd, file_start, outbuf, err, err_size) != 0) {
+    return -1;
+  }
+  if(fsync(fd) != 0) {
+    set_err(err, err_size, "sync compressed payload: %s", strerror(errno));
+    return -1;
+  }
+  if(vhash && vhash->fd >= 0 && fsync(vhash->fd) != 0) {
+    set_err(err, err_size, "sync validation hash: %s", strerror(errno));
+    return -1;
+  }
+
+  uint64_t prev_journaled = ctx->journaled_blocks;
+  ctx->completed_blocks = completed_blocks;
+  ctx->data_pos = data_pos;
+  if(destructive_stream_write_offsets(
+         ctx, prev_journaled + 1ULL,
+         completed_blocks > prev_journaled ? completed_blocks - prev_journaled : 0,
+         err, err_size) != 0) {
+    return -1;
+  }
+  ctx->journaled_blocks = completed_blocks;
+
+  for(size_t i = 0; i < ctx->file_count; i++) {
+    destructive_stream_file_t *f = &ctx->files[i];
+    int pass_through = destructive_stream_file_passthrough_delete(f);
+    if(!destructive_stream_file_reversed(f) && !pass_through) continue;
+    uint64_t target = destructive_stream_target_commit(f, completed_bytes);
+    if(pass_through && target < f->original_size) continue;
+    if(target > f->committed) {
+      f->committed = target;
+      if(destructive_stream_write_file_record(ctx, i, err, err_size) != 0) {
+        return -1;
+      }
+    }
+  }
+  if(destructive_stream_write_header(ctx, err, err_size) != 0 ||
+     destructive_stream_sync(ctx, err, err_size) != 0) {
+    return -1;
+  }
+
+  if(vr) virtual_reader_close_file(vr);
+  for(size_t i = 0; i < ctx->file_count; i++) {
+    destructive_stream_file_t *f = &ctx->files[i];
+    if(f->deleted || f->committed == 0) continue;
+    if(!path_is_child_of_root(ctx->source_path, f->abs)) {
+      set_err(err, err_size, "refusing to truncate source outside app folder");
+      errno = EINVAL;
+      return -1;
+    }
+    if(f->committed >= f->original_size) {
+      if(unlink(f->abs) != 0 && errno != ENOENT) {
+        set_err(err, err_size, "delete committed source file: %s",
+                strerror(errno));
+        return -1;
+      }
+      f->deleted = 1;
+      try_remove_empty_parent_dirs(ctx->source_path, f->abs);
+      if(destructive_stream_write_file_record(ctx, i, err, err_size) != 0) {
+        return -1;
+      }
+    } else {
+      uint64_t new_size = f->original_size - f->committed;
+      if(destructive_stream_truncate_path(f->abs, new_size, err, err_size) != 0) {
+        return -1;
+      }
+    }
+  }
+  if(destructive_stream_sync(ctx, err, err_size) != 0) return -1;
   return 0;
 }
 
@@ -706,6 +2891,7 @@ scan_push(scan_list_t *list, const char *abs, const char *rel, uint64_t size) {
     list->cap = next;
   }
   scan_file_t *it = &list->items[list->count++];
+  memset(it, 0, sizeof(*it));
   snprintf(it->abs, sizeof(it->abs), "%s", abs);
   snprintf(it->rel, sizeof(it->rel), "%s", rel);
   it->size = size;
@@ -791,6 +2977,194 @@ scan_file_cmp(const void *a, const void *b) {
 }
 
 static int
+stream_ext_matches(const char *rel, const char *ext) {
+  size_t rel_len = strlen(rel ? rel : "");
+  size_t ext_len = strlen(ext ? ext : "");
+  if(ext_len == 0 || rel_len < ext_len) return 0;
+  return !strcasecmp(rel + rel_len - ext_len, ext);
+}
+
+static uint32_t
+stream_predicted_ratio_permille(const char *rel) {
+  static const char *const high_entropy[] = {
+    ".pkg", ".pak", ".ucas", ".utoc", ".mp4", ".m4v", ".bik", ".bk2",
+    ".wem", ".opus", ".ogg", ".mp3", ".jpg", ".jpeg", ".png", ".zip",
+    ".rar", ".7z", ".gz", ".zst", ".lz4", ".xz"
+  };
+  static const char *const text_like[] = {
+    ".json", ".xml", ".txt", ".ini", ".cfg", ".lua", ".js", ".css",
+    ".ush", ".usf", ".shader", ".hlsl", ".glsl", ".csv", ".tsv"
+  };
+  static const char *const executable_like[] = {
+    ".bin", ".prx", ".sprx", ".self", ".elf", ".dll", ".so"
+  };
+  for(size_t i = 0; i < sizeof(high_entropy) / sizeof(high_entropy[0]); i++) {
+    if(stream_ext_matches(rel, high_entropy[i])) return 950;
+  }
+  for(size_t i = 0; i < sizeof(text_like) / sizeof(text_like[0]); i++) {
+    if(stream_ext_matches(rel, text_like[i])) return 500;
+  }
+  for(size_t i = 0; i < sizeof(executable_like) / sizeof(executable_like[0]); i++) {
+    if(stream_ext_matches(rel, executable_like[i])) return 850;
+  }
+  return 700;
+}
+
+static uint64_t
+stream_predicted_stored_bytes(const scan_file_t *f) {
+  if(!f || f->size == 0) return 0;
+  uint64_t ratio = stream_predicted_ratio_permille(f->rel);
+  if(f->size > UINT64_MAX / ratio) return f->size;
+  uint64_t predicted = (f->size * ratio + 999ULL) / 1000ULL;
+  if(predicted > f->size) predicted = f->size;
+  if(predicted == 0) predicted = 1;
+  return predicted;
+}
+
+static int
+stream_schedule_better_fit(const scan_file_t *items, size_t a, size_t b) {
+  const scan_file_t *fa = &items[a];
+  const scan_file_t *fb = &items[b];
+  uint64_t gain_a = fa->size > fa->stream_predicted_stored ?
+                    fa->size - fa->stream_predicted_stored : 0;
+  uint64_t gain_b = fb->size > fb->stream_predicted_stored ?
+                    fb->size - fb->stream_predicted_stored : 0;
+  int useful_a = gain_a > 0;
+  int useful_b = gain_b > 0;
+  if(useful_a != useful_b) return useful_a;
+  if(fa->size != fb->size) return fa->size > fb->size;
+  if(gain_a != gain_b) return gain_a > gain_b;
+  return ascii_casecmp(fa->rel, fb->rel) < 0;
+}
+
+static int
+stream_schedule_better_oversize(const scan_file_t *items, size_t a, size_t b) {
+  const scan_file_t *fa = &items[a];
+  const scan_file_t *fb = &items[b];
+  if(fa->size != fb->size) return fa->size > fb->size;
+  return ascii_casecmp(fa->rel, fb->rel) < 0;
+}
+
+static uint64_t
+stream_default_reserve_for_budget(uint64_t budget_bytes) {
+  if(budget_bytes == 0) return 0;
+  if(budget_bytes <= PFS_STREAM_DEFAULT_RESERVE_BYTES * 2ULL) {
+    return budget_bytes / 8ULL;
+  }
+  return PFS_STREAM_DEFAULT_RESERVE_BYTES;
+}
+
+static void
+stream_options_normalize(const pfs_stream_options_t *in,
+                         pfs_stream_options_t *out) {
+  memset(out, 0, sizeof(*out));
+  out->budget_bytes = in && in->budget_bytes ?
+      in->budget_bytes : PFS_STREAM_DEFAULT_BUDGET_BYTES;
+  out->reserve_bytes = in && in->reserve_bytes ?
+      in->reserve_bytes : stream_default_reserve_for_budget(out->budget_bytes);
+  if(out->reserve_bytes >= out->budget_bytes) out->reserve_bytes = 0;
+  out->order = in ? in->order : PFS_STREAM_ORDER_BUDGETED_GAIN;
+  if(out->order != PFS_STREAM_ORDER_PATH &&
+     out->order != PFS_STREAM_ORDER_BUDGETED_GAIN) {
+    out->order = PFS_STREAM_ORDER_BUDGETED_GAIN;
+  }
+}
+
+static int
+stream_schedule_budgeted_gain(scan_list_t *scans,
+                              const pfs_stream_options_t *opts,
+                              uint64_t *forward_files,
+                              uint64_t *reverse_files) {
+  if(forward_files) *forward_files = 0;
+  if(reverse_files) *reverse_files = 0;
+  if(!scans || scans->count == 0) return 0;
+  pfs_stream_options_t normalized;
+  stream_options_normalize(opts, &normalized);
+  if(normalized.order == PFS_STREAM_ORDER_PATH) {
+    uint64_t credit = normalized.budget_bytes - normalized.reserve_bytes;
+    for(size_t i = 0; i < scans->count; i++) {
+      scan_file_t *f = &scans->items[i];
+      f->stream_predicted_stored = stream_predicted_stored_bytes(f);
+      f->stream_schedule_order = (uint32_t)i;
+      f->stream_predicted_gain_permille = f->size > 0 ?
+          (uint32_t)(((f->size - f->stream_predicted_stored) * 1000ULL) /
+                     f->size) : 0;
+      f->stream_reverse_required = f->stream_predicted_stored > credit;
+      f->stream_passthrough_delete = !f->stream_reverse_required;
+      if(f->stream_reverse_required) {
+        if(reverse_files) (*reverse_files)++;
+      } else if(forward_files) {
+        (*forward_files)++;
+      }
+      uint64_t gain = f->size > f->stream_predicted_stored ?
+                      f->size - f->stream_predicted_stored : 0;
+      if(UINT64_MAX - credit < gain) credit = UINT64_MAX;
+      else credit += gain;
+    }
+    return 0;
+  }
+
+  scan_file_t *ordered = calloc(scans->count, sizeof(*ordered));
+  unsigned char *used = calloc(scans->count, 1);
+  if(!ordered || !used) {
+    free(ordered);
+    free(used);
+    return -1;
+  }
+  for(size_t i = 0; i < scans->count; i++) {
+    scans->items[i].stream_predicted_stored =
+        stream_predicted_stored_bytes(&scans->items[i]);
+    scans->items[i].stream_predicted_gain_permille = scans->items[i].size > 0 ?
+        (uint32_t)(((scans->items[i].size -
+                     scans->items[i].stream_predicted_stored) * 1000ULL) /
+                   scans->items[i].size) : 0;
+  }
+
+  uint64_t credit = normalized.budget_bytes - normalized.reserve_bytes;
+  for(size_t out = 0; out < scans->count; out++) {
+    size_t best = SIZE_MAX;
+    for(size_t i = 0; i < scans->count; i++) {
+      if(used[i]) continue;
+      if(scans->items[i].stream_predicted_stored > credit) continue;
+      if(best == SIZE_MAX ||
+         stream_schedule_better_fit(scans->items, i, best)) {
+        best = i;
+      }
+    }
+    int reverse_required = 0;
+    if(best == SIZE_MAX) {
+      reverse_required = 1;
+      for(size_t i = 0; i < scans->count; i++) {
+        if(used[i]) continue;
+        if(best == SIZE_MAX ||
+           stream_schedule_better_oversize(scans->items, i, best)) {
+          best = i;
+        }
+      }
+    }
+    if(best == SIZE_MAX) break;
+    used[best] = 1;
+    ordered[out] = scans->items[best];
+    ordered[out].stream_schedule_order = (uint32_t)out;
+    ordered[out].stream_reverse_required = reverse_required;
+    ordered[out].stream_passthrough_delete = !reverse_required;
+    if(reverse_required) {
+      if(reverse_files) (*reverse_files)++;
+    } else if(forward_files) {
+      (*forward_files)++;
+    }
+    uint64_t gain = ordered[out].size > ordered[out].stream_predicted_stored ?
+                    ordered[out].size - ordered[out].stream_predicted_stored : 0;
+    if(UINT64_MAX - credit < gain) credit = UINT64_MAX;
+    else credit += gain;
+  }
+  memcpy(scans->items, ordered, scans->count * sizeof(*ordered));
+  free(ordered);
+  free(used);
+  return 0;
+}
+
+static int
 int_list_push(int_list_t *list, int value) {
   if(list->count == list->cap) {
     size_t next = list->cap ? list->cap * 2 : 8;
@@ -847,6 +3221,12 @@ layout_add_file(pfs_layout_t *l, const scan_file_t *src, int parent) {
            base ? base + 1 : src->rel);
   l->files[idx].parent = parent;
   l->files[idx].raw_size = src->size;
+  l->files[idx].stream_predicted_stored = src->stream_predicted_stored;
+  l->files[idx].stream_schedule_order = src->stream_schedule_order;
+  l->files[idx].stream_predicted_gain_permille =
+      src->stream_predicted_gain_permille;
+  l->files[idx].stream_reverse_required = src->stream_reverse_required;
+  l->files[idx].stream_passthrough_delete = src->stream_passthrough_delete;
   return idx;
 }
 
@@ -883,6 +3263,47 @@ ensure_parent_dirs(pfs_layout_t *l, const char *file_rel, int *parent_out) {
   }
   *parent_out = parent;
   return 0;
+}
+
+static int
+layout_child_dir_cmp(const pfs_layout_t *l, int a, int b) {
+  const char *ra = (a >= 0 && (size_t)a < l->dir_count) ? l->dirs[a].rel : "";
+  const char *rb = (b >= 0 && (size_t)b < l->dir_count) ? l->dirs[b].rel : "";
+  return ascii_casecmp(ra, rb);
+}
+
+static int
+layout_child_file_cmp(const pfs_layout_t *l, int a, int b) {
+  const char *ra = (a >= 0 && (size_t)a < l->file_count) ? l->files[a].rel : "";
+  const char *rb = (b >= 0 && (size_t)b < l->file_count) ? l->files[b].rel : "";
+  return ascii_casecmp(ra, rb);
+}
+
+static void
+layout_sort_child_lists(pfs_layout_t *l) {
+  if(!l) return;
+  for(size_t d = 0; d < l->dir_count; d++) {
+    int_list_t *dirs = &l->dirs[d].child_dirs;
+    for(size_t i = 1; i < dirs->count; i++) {
+      int value = dirs->items[i];
+      size_t j = i;
+      while(j > 0 && layout_child_dir_cmp(l, value, dirs->items[j - 1]) < 0) {
+        dirs->items[j] = dirs->items[j - 1];
+        j--;
+      }
+      dirs->items[j] = value;
+    }
+    int_list_t *files = &l->dirs[d].child_files;
+    for(size_t i = 1; i < files->count; i++) {
+      int value = files->items[i];
+      size_t j = i;
+      while(j > 0 && layout_child_file_cmp(l, value, files->items[j - 1]) < 0) {
+        files->items[j] = files->items[j - 1];
+        j--;
+      }
+      files->items[j] = value;
+    }
+  }
 }
 
 static uint32_t
@@ -1250,38 +3671,35 @@ layout_add_segment(pfs_layout_t *l, uint64_t offset, uint64_t size,
 }
 
 static int
-build_layout_from_files(const char *root, pfs_layout_t *l,
-                        char *err, size_t err_size) {
-  scan_list_t scans = {0};
+build_pfs_layout_from_scans(const scan_list_t *scans, pfs_layout_t *l,
+                            char *err, size_t err_size) {
   int rc = -1;
   time_t now = time(NULL);
 
-  job_set_current("Scanning app folder");
-  if(scan_collect(root, "", &scans, err, err_size) != 0) goto done;
-  if(scans.count == 0) {
+  if(!scans || scans->count == 0) {
     set_err(err, err_size, "app folder contains no files");
-    goto done;
+    return -1;
   }
-  qsort(scans.items, scans.count, sizeof(scans.items[0]), scan_file_cmp);
 
   if(layout_add_dir(l, "", "uroot", -1) != 0) {
     set_err(err, err_size, "out of memory");
     goto done;
   }
 
-  for(size_t i = 0; i < scans.count; i++) {
+  for(size_t i = 0; i < scans->count; i++) {
     int parent = 0;
-    if(ensure_parent_dirs(l, scans.items[i].rel, &parent) != 0) {
+    if(ensure_parent_dirs(l, scans->items[i].rel, &parent) != 0) {
       set_err(err, err_size, "path too long");
       goto done;
     }
-    int file_idx = layout_add_file(l, &scans.items[i], parent);
+    int file_idx = layout_add_file(l, &scans->items[i], parent);
     if(file_idx < 0 || int_list_push(&l->dirs[parent].child_files,
                                      file_idx) != 0) {
       set_err(err, err_size, "out of memory");
       goto done;
     }
   }
+  layout_sort_child_lists(l);
 
   int collision = layout_detect_fpt_collision(l, err, err_size);
   if(collision < 0) goto done;
@@ -1420,6 +3838,62 @@ build_layout_from_files(const char *root, pfs_layout_t *l,
   }
 
   rc = 0;
+
+done:
+  return rc;
+}
+
+static int
+build_layout_from_files(const char *root, pfs_layout_t *l,
+                        char *err, size_t err_size) {
+  scan_list_t scans = {0};
+  int rc = -1;
+
+  job_set_current("Scanning app folder");
+  if(scan_collect(root, "", &scans, err, err_size) != 0) goto done;
+  if(scans.count == 0) {
+    set_err(err, err_size, "app folder contains no files");
+    goto done;
+  }
+  qsort(scans.items, scans.count, sizeof(scans.items[0]), scan_file_cmp);
+  rc = build_pfs_layout_from_scans(&scans, l, err, err_size);
+
+done:
+  free(scans.items);
+  return rc;
+}
+
+static int
+build_layout_from_files_stream(const char *root, pfs_layout_t *l,
+                               const pfs_stream_options_t *stream_opts,
+                               pfs_app_info_t *info,
+                               char *err, size_t err_size) {
+  scan_list_t scans = {0};
+  int rc = -1;
+  uint64_t forward_files = 0;
+  uint64_t reverse_files = 0;
+  pfs_stream_options_t normalized;
+
+  stream_options_normalize(stream_opts, &normalized);
+  job_set_current("Scheduling budgeted stream");
+  if(scan_collect(root, "", &scans, err, err_size) != 0) goto done;
+  if(scans.count == 0) {
+    set_err(err, err_size, "app folder contains no files");
+    goto done;
+  }
+  qsort(scans.items, scans.count, sizeof(scans.items[0]), scan_file_cmp);
+  if(stream_schedule_budgeted_gain(&scans, &normalized,
+                                   &forward_files, &reverse_files) != 0) {
+    set_err(err, err_size, "out of memory");
+    goto done;
+  }
+  if(info) {
+    info->stream_budget_bytes = normalized.budget_bytes;
+    info->stream_reserve_bytes = normalized.reserve_bytes;
+    info->stream_forward_files = forward_files;
+    info->stream_reverse_files = reverse_files;
+  }
+  rc = build_pfs_layout_from_scans(&scans, l, err, err_size);
 
 done:
   free(scans.items);
@@ -1723,40 +4197,37 @@ exfat_make_boot_blob(pfs_layout_t *l, uint64_t volume_sectors,
 }
 
 static int
-build_exfat_layout_from_files(const char *root, const char *title_id,
+build_exfat_layout_from_scans(const scan_list_t *scans, const char *title_id,
                               pfs_layout_t *l,
                               char *err, size_t err_size) {
-  scan_list_t scans = {0};
   exfat_allocation_t *dir_allocs = NULL;
   exfat_allocation_t *file_allocs = NULL;
   int rc = -1;
   uint32_t upcase_checksum = 0;
 
-  job_set_current("Scanning app folder");
-  if(scan_collect(root, "", &scans, err, err_size) != 0) goto done;
-  if(scans.count == 0) {
+  if(!scans || scans->count == 0) {
     set_err(err, err_size, "app folder contains no files");
-    goto done;
+    return -1;
   }
-  qsort(scans.items, scans.count, sizeof(scans.items[0]), scan_file_cmp);
 
   if(layout_add_dir(l, "", title_id ? title_id : "root", -1) != 0) {
     set_err(err, err_size, "out of memory");
     goto done;
   }
-  for(size_t i = 0; i < scans.count; i++) {
+  for(size_t i = 0; i < scans->count; i++) {
     int parent = 0;
-    if(ensure_parent_dirs(l, scans.items[i].rel, &parent) != 0) {
+    if(ensure_parent_dirs(l, scans->items[i].rel, &parent) != 0) {
       set_err(err, err_size, "path too long");
       goto done;
     }
-    int file_idx = layout_add_file(l, &scans.items[i], parent);
+    int file_idx = layout_add_file(l, &scans->items[i], parent);
     if(file_idx < 0 ||
        int_list_push(&l->dirs[parent].child_files, file_idx) != 0) {
       set_err(err, err_size, "out of memory");
       goto done;
     }
   }
+  layout_sort_child_lists(l);
 
   dir_allocs = calloc(l->dir_count ? l->dir_count : 1, sizeof(*dir_allocs));
   file_allocs = calloc(l->file_count ? l->file_count : 1, sizeof(*file_allocs));
@@ -1968,9 +4439,110 @@ build_exfat_layout_from_files(const char *root, const char *title_id,
   rc = 0;
 
 done:
-  free(scans.items);
   free(dir_allocs);
   free(file_allocs);
+  return rc;
+}
+
+static int
+build_exfat_layout_from_files(const char *root, const char *title_id,
+                              pfs_layout_t *l,
+                              char *err, size_t err_size) {
+  scan_list_t scans = {0};
+  int rc = -1;
+
+  job_set_current("Scanning app folder");
+  if(scan_collect(root, "", &scans, err, err_size) != 0) goto done;
+  if(scans.count == 0) {
+    set_err(err, err_size, "app folder contains no files");
+    goto done;
+  }
+  qsort(scans.items, scans.count, sizeof(scans.items[0]), scan_file_cmp);
+  rc = build_exfat_layout_from_scans(&scans, title_id, l, err, err_size);
+
+done:
+  free(scans.items);
+  return rc;
+}
+
+static int
+build_exfat_layout_from_files_stream(const char *root, const char *title_id,
+                                     pfs_layout_t *l,
+                                     const pfs_stream_options_t *stream_opts,
+                                     pfs_app_info_t *info,
+                                     char *err, size_t err_size) {
+  scan_list_t scans = {0};
+  int rc = -1;
+  uint64_t forward_files = 0;
+  uint64_t reverse_files = 0;
+  pfs_stream_options_t normalized;
+
+  stream_options_normalize(stream_opts, &normalized);
+  job_set_current("Scheduling budgeted stream");
+  if(scan_collect(root, "", &scans, err, err_size) != 0) goto done;
+  if(scans.count == 0) {
+    set_err(err, err_size, "app folder contains no files");
+    goto done;
+  }
+  qsort(scans.items, scans.count, sizeof(scans.items[0]), scan_file_cmp);
+  if(stream_schedule_budgeted_gain(&scans, &normalized,
+                                   &forward_files, &reverse_files) != 0) {
+    set_err(err, err_size, "out of memory");
+    goto done;
+  }
+  if(info) {
+    info->stream_budget_bytes = normalized.budget_bytes;
+    info->stream_reserve_bytes = normalized.reserve_bytes;
+    info->stream_forward_files = forward_files;
+    info->stream_reverse_files = reverse_files;
+  }
+  rc = build_exfat_layout_from_scans(&scans, title_id, l, err, err_size);
+
+done:
+  free(scans.items);
+  return rc;
+}
+
+static int
+destructive_stream_build_scan_list(const destructive_stream_ctx_t *ctx,
+                                   scan_list_t *scans,
+                                   char *err, size_t err_size) {
+  memset(scans, 0, sizeof(*scans));
+  for(size_t i = 0; i < ctx->file_count; i++) {
+    if(scan_push(scans, ctx->files[i].abs, ctx->files[i].rel,
+                 ctx->files[i].original_size) != 0) {
+      set_err(err, err_size, "out of memory");
+      return -1;
+    }
+    scans->items[i].stream_predicted_stored = ctx->files[i].predicted_stored;
+    scans->items[i].stream_schedule_order = ctx->files[i].schedule_order;
+    scans->items[i].stream_predicted_gain_permille =
+        ctx->files[i].predicted_gain_permille;
+    scans->items[i].stream_reverse_required =
+        ctx->files[i].reverse_required;
+    scans->items[i].stream_passthrough_delete =
+        ctx->files[i].passthrough_delete;
+  }
+  return 0;
+}
+
+static int
+destructive_stream_build_layout(const destructive_stream_ctx_t *ctx,
+                                pfs_layout_t *nested,
+                                char *err, size_t err_size) {
+  scan_list_t scans = {0};
+  int rc = -1;
+  if(destructive_stream_build_scan_list(ctx, &scans, err, err_size) != 0) {
+    goto done;
+  }
+  if(ctx->format == PFS_COMPRESS_FORMAT_EXFAT) {
+    rc = build_exfat_layout_from_scans(&scans, ctx->nested_name, nested,
+                                       err, err_size);
+  } else {
+    rc = build_pfs_layout_from_scans(&scans, nested, err, err_size);
+  }
+done:
+  free(scans.items);
   return rc;
 }
 
@@ -2035,6 +4607,25 @@ virtual_reader_free(virtual_reader_t *vr) {
   vr->fd = -1;
   vr->open_seg = -1;
   vr->cache_seg = -1;
+}
+
+static int
+virtual_reader_open_path(virtual_reader_t *vr, const char *path,
+                         ssize_t key, char *err, size_t err_size) {
+  if(!vr || !path) {
+    set_err(err, err_size, "bad source reader");
+    errno = EINVAL;
+    return -1;
+  }
+  if(vr->fd >= 0 && vr->open_seg == key) return 0;
+  virtual_reader_close_file(vr);
+  vr->fd = open(path, O_RDONLY);
+  if(vr->fd < 0) {
+    set_err(err, err_size, "open source file: %s", strerror(errno));
+    return -1;
+  }
+  vr->open_seg = key;
+  return 0;
 }
 
 static int
@@ -2104,14 +4695,19 @@ virtual_reader_read(pfs_layout_t *l, virtual_reader_t *vr, uint64_t offset,
     if(s->type == PFS_SEG_MEM) {
       memcpy(out + dst_off, s->mem + src_off, n);
     } else if(s->type == PFS_SEG_FILE) {
-      if(vr->open_seg != (ssize_t)i) {
-        virtual_reader_close_file(vr);
-        vr->fd = open(s->path, O_RDONLY);
-        if(vr->fd < 0) {
-          set_err(err, err_size, "open source file: %s", strerror(errno));
+      if(vr->stream) {
+        if(destructive_stream_read_reversed(vr->stream, vr, s->path, src_off,
+                                            out + dst_off, n,
+                                            err, err_size) != 0) {
           return -1;
         }
-        vr->open_seg = (ssize_t)i;
+        continue;
+      }
+      if(vr->open_seg != (ssize_t)i) {
+        if(virtual_reader_open_path(vr, s->path, (ssize_t)i,
+                                    err, err_size) != 0) {
+          return -1;
+        }
       }
       if(virtual_reader_file_read(vr, (ssize_t)i, s->size, src_off,
                                   out + dst_off, n) != 0) {
@@ -2173,20 +4769,82 @@ write_pfsc_header(int fd, uint64_t file_start, uint64_t header_size,
   return rc;
 }
 
+static int
+pfs_vhash_writer_resume_local(pfs_vhash_writer_t *w, const char *path,
+                              uint64_t block_count,
+                              char *err, size_t err_size) {
+  unsigned char hdr[PFS_VHASH_HEADER_SIZE];
+  if(!w || !path || !path[0]) {
+    set_err(err, err_size, "bad validation hash path");
+    errno = EINVAL;
+    return -1;
+  }
+  memset(w, 0, sizeof(*w));
+  w->fd = -1;
+  int fd = open(path, O_RDWR);
+  if(fd < 0) {
+    set_err(err, err_size, "open validation hash: %s", strerror(errno));
+    return -1;
+  }
+  if(read_exact_at(fd, hdr, sizeof(hdr), 0) != 0 ||
+     memcmp(hdr, "PFSCVHS1", 8) != 0 ||
+     rd64(hdr + 40) != block_count) {
+    close(fd);
+    set_err(err, err_size, "validation hash cannot resume");
+    errno = EINVAL;
+    return -1;
+  }
+  w->fd = fd;
+  w->block_count = block_count;
+  snprintf(w->path, sizeof(w->path), "%s", path);
+  return 0;
+}
+
+static int
+pfs_compress_profile_normalize(int profile) {
+  return profile == PFS_COMPRESS_PROFILE_FAST ?
+      PFS_COMPRESS_PROFILE_FAST : PFS_COMPRESS_PROFILE_SPACE;
+}
+
+static int
+pfsc_compressed_block_meets_gain(size_t comp_len, int threshold_gain) {
+  if(comp_len >= (size_t)PFS_BLOCK_SIZE) return 0;
+  if(threshold_gain <= 0) return 1;
+  return ((uint64_t)((size_t)PFS_BLOCK_SIZE - comp_len) * 100ULL) >=
+         ((uint64_t)PFS_BLOCK_SIZE * (uint64_t)threshold_gain);
+}
+
 static size_t
 pfsc_compress_block_smaller(const unsigned char *raw, unsigned char *out,
-                            mz_uint flags, tdefl_compressor *comp) {
-  size_t in_size = (size_t)PFS_BLOCK_SIZE;
-  size_t out_size = (size_t)PFS_BLOCK_SIZE - 1;
-  if(tdefl_init(comp, NULL, NULL, (int)flags) != TDEFL_STATUS_OKAY) {
+                            const pfsc_comp_config_t *config,
+                            pfsc_comp_state_t *comp) {
+  if(config && config->profile == PFS_COMPRESS_PROFILE_FAST) {
+    size_t in_size = (size_t)PFS_BLOCK_SIZE;
+    size_t out_size = (size_t)PFS_BLOCK_SIZE - 1;
+    if(!comp ||
+       tdefl_init(comp, NULL, NULL, (int)config->miniz_flags) !=
+           TDEFL_STATUS_OKAY) {
+      return 0;
+    }
+    tdefl_status st = tdefl_compress(comp, raw, &in_size, out, &out_size,
+                                     TDEFL_FINISH);
+    if(st == TDEFL_STATUS_DONE &&
+       in_size == (size_t)PFS_BLOCK_SIZE &&
+       pfsc_compressed_block_meets_gain(out_size, config->threshold_gain)) {
+      return out_size;
+    }
     return 0;
   }
-  tdefl_status st = tdefl_compress(comp, raw, &in_size, out, &out_size,
-                                   TDEFL_FINISH);
-  if(st == TDEFL_STATUS_DONE &&
-     in_size == (size_t)PFS_BLOCK_SIZE &&
-     out_size < (size_t)PFS_BLOCK_SIZE) {
-    return out_size;
+
+  size_t out_size = (size_t)PFS_BLOCK_SIZE - 1;
+  uLongf z_out_size = (uLongf)out_size;
+  int zlib_level = config ? config->zlib_level : GC_PFSC_ZLIB_LEVEL;
+  int threshold_gain = config ? config->threshold_gain : GC_PFSC_THRESHOLD_GAIN;
+  int zrc = compress2(out, &z_out_size, raw, (uLong)PFS_BLOCK_SIZE,
+                      zlib_level);
+  if(zrc == Z_OK &&
+     pfsc_compressed_block_meets_gain((size_t)z_out_size, threshold_gain)) {
+    return (size_t)z_out_size;
   }
   return 0;
 }
@@ -2211,10 +4869,13 @@ pfsc_pool_set_error(pfsc_pool_t *pool, int err) {
 static void *
 pfsc_worker_main(void *arg) {
   pfsc_pool_t *pool = arg;
-  tdefl_compressor *comp = malloc(sizeof(*comp));
-  if(!comp) {
-    pfsc_pool_set_error(pool, ENOMEM);
-    return NULL;
+  pfsc_comp_state_t *comp = NULL;
+  if(pool->comp_config.profile == PFS_COMPRESS_PROFILE_FAST) {
+    comp = malloc(sizeof(*comp));
+    if(!comp) {
+      pfsc_pool_set_error(pool, ENOMEM);
+      return NULL;
+    }
   }
 
   for(;;) {
@@ -2238,7 +4899,7 @@ pfsc_worker_main(void *arg) {
       atomic_fetch_add(&g_job.skipped_zlib_blocks, 1);
     } else {
       slot->comp_len = pfsc_compress_block_smaller(slot->raw, slot->comp,
-                                                   pool->flags, comp);
+                                                   &pool->comp_config, comp);
     }
     pfs_sha256(slot->raw, slot->raw_len, slot->hash);
 
@@ -2275,8 +4936,11 @@ compress_nested_to_pfsc(int fd, uint64_t file_start, pfs_layout_t *nested,
                         int requested_workers, int delete_stream,
                         const char *nested_name,
                         int nested_type, const char *vhash_path,
+                        const char *vhash_output_path, const char *tmp_path,
+                        const pfs_app_info_t *stream_info, int format,
+                        destructive_stream_ctx_t *stream,
                         const char *source_root, int *delete_started,
-                        uint64_t *stored_size,
+                        uint64_t *stored_size, int compression_profile,
                         char *err, size_t err_size) {
   uint64_t block_count = ceil_div_u64(nested->image_size, PFS_BLOCK_SIZE);
   uint64_t logical_size = block_count * PFS_BLOCK_SIZE;
@@ -2295,15 +4959,34 @@ compress_nested_to_pfsc(int fd, uint64_t file_start, pfs_layout_t *nested,
   int vhash_open = 0;
   int rc = -1;
   uint64_t data_pos = header_size;
-  size_t next_delete_file = 0;
-  mz_uint flags = tdefl_create_comp_flags_from_zip_params(PFSC_ZLIB_LEVEL, 15,
-                                                          MZ_DEFAULT_STRATEGY);
+  int offsets_owned = 1;
+  int profile = pfs_compress_profile_normalize(compression_profile);
+  if(delete_stream) profile = PFS_COMPRESS_PROFILE_FAST;
+  pfsc_comp_config_t comp_config = {
+    .profile = profile,
+    .zlib_level = GC_PFSC_ZLIB_LEVEL,
+    .threshold_gain = profile == PFS_COMPRESS_PROFILE_FAST ?
+        0 : GC_PFSC_THRESHOLD_GAIN,
+    .force_raw_exec = profile == PFS_COMPRESS_PROFILE_FAST ?
+        1 : GC_PFSC_FORCE_RAW_EXEC,
+    .miniz_flags = tdefl_create_comp_flags_from_zip_params(
+        PFSC_FAST_ZLIB_LEVEL, 15, MZ_DEFAULT_STRATEGY),
+  };
 
   memset(&pool, 0, sizeof(pool));
   memset(&vhash, 0, sizeof(vhash));
   vhash.fd = -1;
   pfsc_output_buffer_init(&outbuf);
   virtual_reader_init(&vr);
+
+  if(delete_stream && !stream) {
+    set_err(err, err_size, "stream delete requires destructive stream journal");
+    errno = EINVAL;
+    goto done;
+  }
+  if(delete_stream && worker_count > PFS_STREAM_COMPRESS_WORKERS) {
+    worker_count = PFS_STREAM_COMPRESS_WORKERS;
+  }
 
   if(block_count < (uint64_t)worker_count) worker_count = (int)block_count;
   if(worker_count < 1) worker_count = 1;
@@ -2316,6 +4999,23 @@ compress_nested_to_pfsc(int fd, uint64_t file_start, pfs_layout_t *nested,
   if(!offsets || !slots || !threads) {
     set_err(err, err_size, "out of memory");
     goto done;
+  }
+  if(stream && stream->offsets && stream->completed_blocks > 0) {
+    if(stream->block_count != block_count ||
+       stream->pfsc_header_size != header_size ||
+       stream->nested_size != nested->image_size) {
+      set_err(err, err_size, "stream journal does not match layout");
+      goto done;
+    }
+    memcpy(offsets, stream->offsets,
+           (size_t)(block_count + 1ULL) * sizeof(*offsets));
+    if(stream->owns_offsets) {
+      free(stream->offsets);
+      stream->owns_offsets = 0;
+    }
+    stream->offsets = offsets;
+    data_pos = offsets[stream->completed_blocks] ?
+               offsets[stream->completed_blocks] : stream->data_pos;
   }
   for(int i = 0; i < slot_count; i++) {
     slots[i].raw = malloc((size_t)PFS_BLOCK_SIZE);
@@ -2333,7 +5033,7 @@ compress_nested_to_pfsc(int fd, uint64_t file_start, pfs_layout_t *nested,
   pool_initialized = 1;
   pool.slots = slots;
   pool.slot_count = slot_count;
-  pool.flags = flags;
+  pool.comp_config = comp_config;
 
   for(int i = 0; i < worker_count; i++) {
     int trc = pthread_create(&threads[i], NULL, pfsc_worker_main, &pool);
@@ -2345,17 +5045,49 @@ compress_nested_to_pfsc(int fd, uint64_t file_start, pfs_layout_t *nested,
   }
 
   offsets[0] = header_size;
-  if(pfs_vhash_writer_open(&vhash, vhash_path, logical_size,
-                           nested->image_size, block_count, nested_name,
-                           nested_type, err, err_size) != 0) {
-    goto done;
+  if(stream && stream->journal_fd < 0) {
+    char journal_path[1024];
+    if(!stream_info || !tmp_path || !vhash_output_path ||
+       destructive_stream_journal_path_from_tmp(tmp_path, journal_path,
+                                                sizeof(journal_path)) != 0 ||
+       destructive_stream_create(journal_path, stream_info, tmp_path,
+                                 vhash_path, vhash_output_path, format,
+                                 nested, block_count, logical_size,
+                                 header_size, offsets, stream,
+                                 err, err_size) != 0) {
+      goto done;
+    }
+  }
+  if(stream) {
+    vr.stream = stream;
+  }
+  if(stream && stream->completed_blocks > 0) {
+    if(pfs_vhash_writer_resume_local(&vhash, vhash_path, block_count,
+                                     err, err_size) != 0) {
+      goto done;
+    }
+  } else {
+    if(pfs_vhash_writer_open(&vhash, vhash_path, logical_size,
+                             nested->image_size, block_count, nested_name,
+                             nested_type, err, err_size) != 0) {
+      goto done;
+    }
   }
   vhash_open = 1;
   atomic_store(&g_job.total_bytes,
                nested->image_size > (uint64_t)LONG_MAX ? LONG_MAX :
                (long)nested->image_size);
-  atomic_store(&g_job.copied_bytes, 0);
-  atomic_store(&g_job.compressed_output_bytes, 0);
+  uint64_t start_block = stream ? stream->completed_blocks : 0;
+  uint64_t start_copied = start_block * PFS_BLOCK_SIZE;
+  if(start_copied > nested->image_size) start_copied = nested->image_size;
+  atomic_store(&g_job.copied_bytes,
+               start_copied > (uint64_t)LONG_MAX ? LONG_MAX :
+               (long)start_copied);
+  uint64_t start_compressed_output =
+      data_pos > header_size ? data_pos - header_size : 0;
+  atomic_store(&g_job.compressed_output_bytes,
+               start_compressed_output > (uint64_t)LONG_MAX ? LONG_MAX :
+               (long)start_compressed_output);
   atomic_store(&g_job.raw_blocks, 0);
   atomic_store(&g_job.compressed_blocks, 0);
   atomic_store(&g_job.skipped_zlib_blocks, 0);
@@ -2366,14 +5098,26 @@ compress_nested_to_pfsc(int fd, uint64_t file_start, pfs_layout_t *nested,
   atomic_store(&g_job.worker_wait_us, 0);
   atomic_store(&g_job.total_files,
                block_count > (uint64_t)INT_MAX ? INT_MAX : (int)block_count);
-  atomic_store(&g_job.done_files, 0);
+  atomic_store(&g_job.done_files,
+               start_block > (uint64_t)INT_MAX ? INT_MAX : (int)start_block);
   char label[320];
   snprintf(label, sizeof(label), "Compressing %s",
            nested_name && nested_name[0] ? nested_name : "nested image");
   job_set_current(label);
+  if(stream && job_cancelled() && !stream->mutation_started) {
+    set_err(err, err_size, "cancelled");
+    errno = EINTR;
+    goto done;
+  }
+  if(stream && destructive_stream_mark_mutation_started(stream, err, err_size) != 0) {
+    goto done;
+  }
+  if(stream && destructive_stream_reverse_ahead_start(stream, err, err_size) != 0) {
+    goto done;
+  }
 
-  uint64_t next_read = 0;
-  uint64_t next_write = 0;
+  uint64_t next_read = start_block;
+  uint64_t next_write = start_block;
   while(next_write < block_count) {
     while(next_read < block_count &&
           next_read - next_write < (uint64_t)slot_count) {
@@ -2401,7 +5145,7 @@ compress_nested_to_pfsc(int fd, uint64_t file_start, pfs_layout_t *nested,
       slot->force_raw = 0;
       pthread_mutex_unlock(&pool.lock);
 
-      if(job_cancelled()) {
+      if(job_cancelled() && (!stream || !stream->mutation_started)) {
         pthread_mutex_lock(&pool.lock);
         slot->state = PFSC_SLOT_FREE;
         pthread_cond_broadcast(&pool.cond);
@@ -2409,6 +5153,8 @@ compress_nested_to_pfsc(int fd, uint64_t file_start, pfs_layout_t *nested,
         set_err(err, err_size, "cancelled");
         errno = EINTR;
         goto done;
+      } else if(job_cancelled() && stream) {
+        atomic_store(&g_job.cancel, 0);
       }
 
       if(virtual_reader_read(nested, &vr, next_read * PFS_BLOCK_SIZE,
@@ -2420,8 +5166,10 @@ compress_nested_to_pfsc(int fd, uint64_t file_start, pfs_layout_t *nested,
         pthread_mutex_unlock(&pool.lock);
         goto done;
       }
-      slot->force_raw = layout_block_overlaps_executable_file(
-          nested, next_read * PFS_BLOCK_SIZE);
+      slot->force_raw = comp_config.force_raw_exec ?
+          layout_block_overlaps_executable_file(nested,
+                                                next_read * PFS_BLOCK_SIZE) :
+          0;
       pthread_mutex_lock(&pool.lock);
       slot->state = PFSC_SLOT_READY;
       pthread_cond_broadcast(&pool.cond);
@@ -2483,12 +5231,15 @@ compress_nested_to_pfsc(int fd, uint64_t file_start, pfs_layout_t *nested,
     atomic_store(&g_job.done_files,
                  next_write + 1 > (uint64_t)INT_MAX ? INT_MAX :
                  (int)(next_write + 1));
-    if(delete_stream &&
-       delete_committed_source_files(source_root, nested, &vr, fd, file_start,
-                                     &outbuf, next_write + 1,
-                                     &next_delete_file,
-                                     delete_started, err, err_size) != 0) {
-      goto done;
+    if(stream) {
+      stream->completed_blocks = next_write + 1;
+      if(destructive_stream_truncate_committed(fd, file_start, stream, &vr,
+                                               &outbuf, &vhash,
+                                               next_write + 1, data_pos, 0,
+                                               err, err_size) != 0) {
+        goto done;
+      }
+      if(delete_started && stream->mutation_started) *delete_started = 1;
     }
     next_write++;
   }
@@ -2498,6 +5249,12 @@ compress_nested_to_pfsc(int fd, uint64_t file_start, pfs_layout_t *nested,
   workers_started = 0;
 
   job_set_current("Writing PFSC header");
+  if(stream &&
+     destructive_stream_truncate_committed(fd, file_start, stream, &vr,
+                                          &outbuf, &vhash, block_count,
+                                          data_pos, 1, err, err_size) != 0) {
+    goto done;
+  }
   if(pfsc_output_buffer_flush(fd, file_start, &outbuf, err, err_size) != 0) {
     goto done;
   }
@@ -2509,11 +5266,27 @@ compress_nested_to_pfsc(int fd, uint64_t file_start, pfs_layout_t *nested,
     goto done;
   }
   vhash_open = 0;
+  if(stream) {
+    stream->compression_complete = 1;
+    stream->data_pos = data_pos;
+    if(destructive_stream_write_header(stream, err, err_size) != 0 ||
+       destructive_stream_sync(stream, err, err_size) != 0) {
+      goto done;
+    }
+  }
   *stored_size = data_pos;
   rc = 0;
 
 done:
-  if(vhash_open) pfs_vhash_writer_abort(&vhash);
+  if(stream) destructive_stream_reverse_ahead_stop(stream);
+  if(vhash_open) {
+    if(stream && stream->mutation_started) {
+      close(vhash.fd);
+      vhash.fd = -1;
+    } else {
+      pfs_vhash_writer_abort(&vhash);
+    }
+  }
   if(pool_initialized) pfsc_pool_stop(&pool);
   for(int i = 0; i < workers_started; i++) pthread_join(threads[i], NULL);
   if(pool_initialized) {
@@ -2522,7 +5295,7 @@ done:
   }
   virtual_reader_free(&vr);
   pfsc_output_buffer_free(&outbuf);
-  free(offsets);
+  if(offsets_owned) free(offsets);
   free(threads);
   pfsc_free_slots(slots, slot_count);
   return rc;
@@ -3029,6 +5802,8 @@ static int
 pfs_compress_probed_to_ffpfsc_opts(pfs_app_info_t *info, int overwrite,
                                    int workers, int format,
                                    int delete_policy,
+                                   int compression_profile,
+                                   const pfs_stream_options_t *stream_opts,
                                    char *err, size_t err_size) {
   pfs_layout_t nested = {0};
   char tmp_path[1024];
@@ -3040,6 +5815,9 @@ pfs_compress_probed_to_ffpfsc_opts(pfs_app_info_t *info, int overwrite,
   uint64_t stored_size = 0;
   const uint64_t outer_file_start = 6 * PFS_BLOCK_SIZE;
   int worker_count = clamp_worker_count(workers);
+  destructive_stream_ctx_t stream_ctx;
+  int stream_ctx_initialized = 0;
+  int destructive_stream = 0;
 
   if(!info || !info->source_path[0]) {
     set_err(err, err_size, "bad compression source");
@@ -3076,6 +5854,16 @@ pfs_compress_probed_to_ffpfsc_opts(pfs_app_info_t *info, int overwrite,
   }
   info->format = format;
   info->delete_policy = delete_policy;
+  info->compression_profile =
+      pfs_compress_profile_normalize(compression_profile);
+  if(info->source_type == PFS_COMPRESS_SOURCE_APP &&
+     delete_policy == PFS_DELETE_STREAM) {
+    info->compression_profile = PFS_COMPRESS_PROFILE_FAST;
+    pfs_stream_options_t normalized;
+    stream_options_normalize(stream_opts, &normalized);
+    info->stream_budget_bytes = normalized.budget_bytes;
+    info->stream_reserve_bytes = normalized.reserve_bytes;
+  }
   if(info->source_type == PFS_COMPRESS_SOURCE_APP) {
     info->nested_type = format == PFS_COMPRESS_FORMAT_EXFAT ?
                         PFS_NESTED_EXFAT : PFS_NESTED_PFS;
@@ -3118,16 +5906,34 @@ pfs_compress_probed_to_ffpfsc_opts(pfs_app_info_t *info, int overwrite,
     }
   } else if(format == PFS_COMPRESS_FORMAT_EXFAT) {
     job_set_current("Building nested exFAT layout");
-    if(build_exfat_layout_from_files(info->source_path, info->title_id,
-                                     &nested, err, err_size) != 0) {
+    if(delete_policy == PFS_DELETE_STREAM) {
+      if(build_exfat_layout_from_files_stream(
+             info->source_path, info->title_id, &nested, stream_opts, info,
+             err, err_size) != 0) {
+        goto done;
+      }
+    } else if(build_exfat_layout_from_files(info->source_path, info->title_id,
+                                            &nested, err, err_size) != 0) {
       goto done;
     }
   } else {
     job_set_current("Building nested PFS layout");
-    if(build_layout_from_files(info->source_path, &nested,
-                               err, err_size) != 0) {
+    if(delete_policy == PFS_DELETE_STREAM) {
+      if(build_layout_from_files_stream(info->source_path, &nested,
+                                        stream_opts, info,
+                                        err, err_size) != 0) {
+        goto done;
+      }
+    } else if(build_layout_from_files(info->source_path, &nested,
+                                      err, err_size) != 0) {
       goto done;
     }
+  }
+  destructive_stream = info->source_type == PFS_COMPRESS_SOURCE_APP &&
+                       delete_policy == PFS_DELETE_STREAM;
+  if(destructive_stream) {
+    destructive_stream_init(&stream_ctx);
+    stream_ctx_initialized = 1;
   }
 
   fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
@@ -3141,21 +5947,26 @@ pfs_compress_probed_to_ffpfsc_opts(pfs_app_info_t *info, int overwrite,
   }
 
   if(compress_nested_to_pfsc(fd, outer_file_start, &nested, worker_count,
-                             info->source_type == PFS_COMPRESS_SOURCE_APP &&
-                               delete_policy == PFS_DELETE_STREAM,
+                             destructive_stream,
                              info->nested_name, info->nested_type,
-                             vhash_tmp_path, info->source_path,
+                             vhash_tmp_path, vhash_output_path, tmp_path,
+                             info, format,
+                             destructive_stream ? &stream_ctx : NULL,
+                             info->source_path,
                              &delete_started, &stored_size,
+                             info->compression_profile,
                              err, err_size) != 0) {
     goto done;
   }
   info->nested_size = nested.image_size;
   info->stored_size = stored_size;
 
-  if(job_cancelled()) {
+  if(job_cancelled() && (!destructive_stream || !stream_ctx.mutation_started)) {
     set_err(err, err_size, "cancelled");
     errno = EINTR;
     goto done;
+  } else if(job_cancelled() && destructive_stream) {
+    atomic_store(&g_job.cancel, 0);
   }
 
   job_set_current("Finalizing .ffpfsc");
@@ -3176,18 +5987,25 @@ pfs_compress_probed_to_ffpfsc_opts(pfs_app_info_t *info, int overwrite,
     unlink(vhash_output_path);
     goto done;
   }
+  if(destructive_stream) {
+    stream_ctx.output_finalized = 1;
+    if(destructive_stream_write_header(&stream_ctx, err, err_size) != 0 ||
+       destructive_stream_sync(&stream_ctx, err, err_size) != 0) {
+      goto done;
+    }
+  }
 
   if(info->source_type == PFS_COMPRESS_SOURCE_APP &&
      delete_policy == PFS_DELETE_STREAM) {
     job_set_current("Removing source app folder");
-    if(rmdir(info->source_path) != 0 && errno != ENOENT) {
+    if(remove_tree_local(info->source_path) != 0 && errno != ENOENT) {
       set_err(err, err_size, "remove source app folder: %s", strerror(errno));
       goto done;
     }
   } else if(info->source_type == PFS_COMPRESS_SOURCE_APP &&
             delete_policy == PFS_DELETE_AFTER) {
     job_set_current("Removing source app folder");
-    if(remove_tree_local(info->source_path) != 0) {
+    if(remove_tree_local(info->source_path) != 0 && errno != ENOENT) {
       set_err(err, err_size, "remove source app folder: %s", strerror(errno));
       goto done;
     }
@@ -3199,17 +6017,187 @@ pfs_compress_probed_to_ffpfsc_opts(pfs_app_info_t *info, int overwrite,
       goto done;
     }
   }
+  if(destructive_stream && stream_ctx.journal_path[0]) {
+    destructive_stream_remove_reverse_dir(&stream_ctx);
+    unlink(stream_ctx.journal_path);
+  }
   rc = 0;
 
 done:
   if(fd >= 0) close(fd);
+  int destructive_started = stream_ctx_initialized && stream_ctx.mutation_started;
   if(rc != 0 &&
-     (delete_policy != PFS_DELETE_STREAM || !delete_started)) {
+     (delete_policy != PFS_DELETE_STREAM ||
+      (!delete_started && !destructive_started))) {
     unlink(tmp_path);
     unlink(vhash_tmp_path);
+    if(stream_ctx_initialized && stream_ctx.journal_path[0]) {
+      destructive_stream_remove_reverse_dir(&stream_ctx);
+      unlink(stream_ctx.journal_path);
+    }
   }
+  if(stream_ctx_initialized) destructive_stream_free(&stream_ctx);
   layout_free(&nested);
   return rc;
+}
+
+int
+pfs_compress_resume_stream_journal_profile(const char *journal_path,
+                                           int workers,
+                                           int compression_profile,
+                                           pfs_app_info_t *info,
+                                           char *err, size_t err_size) {
+  destructive_stream_ctx_t stream_ctx;
+  pfs_layout_t nested = {0};
+  int fd = -1;
+  int rc = -1;
+  int delete_started = 1;
+  uint64_t stored_size = 0;
+  const uint64_t outer_file_start = 6 * PFS_BLOCK_SIZE;
+  int worker_count = clamp_worker_count(workers);
+  pfs_app_info_t local_info;
+  if(!info) info = &local_info;
+  memset(info, 0, sizeof(*info));
+  destructive_stream_init(&stream_ctx);
+
+  job_set_current("Loading stream journal");
+  if(destructive_stream_load(journal_path, &stream_ctx, err, err_size) != 0) {
+    return -1;
+  }
+  atomic_store(&g_job.destructive_stream_active,
+               stream_ctx.mutation_started ? 1 : 0);
+  atomic_store(&g_job.rollback_requested, 0);
+  snprintf(info->source_path, sizeof(info->source_path), "%s",
+           stream_ctx.source_path);
+  snprintf(info->output_path, sizeof(info->output_path), "%s",
+           stream_ctx.output_path);
+  snprintf(info->nested_name, sizeof(info->nested_name), "%s",
+           stream_ctx.nested_name);
+  info->format = stream_ctx.format;
+  info->nested_type = stream_ctx.nested_type;
+  info->source_type = PFS_COMPRESS_SOURCE_APP;
+  info->delete_policy = PFS_DELETE_STREAM;
+  info->compression_profile = PFS_COMPRESS_PROFILE_FAST;
+
+  job_set_current("Rebuilding stream layout");
+  if(destructive_stream_build_layout(&stream_ctx, &nested, err, err_size) != 0) {
+    goto done;
+  }
+  info->nested_size = nested.image_size;
+  if(stream_ctx.completed_blocks > 0 || stream_ctx.compression_complete) {
+    uint64_t copied = stream_ctx.compression_complete
+        ? nested.image_size
+        : stream_ctx.completed_blocks * PFS_BLOCK_SIZE;
+    if(copied > nested.image_size) copied = nested.image_size;
+    atomic_store(&g_job.total_bytes,
+                 nested.image_size > (uint64_t)LONG_MAX ? LONG_MAX :
+                 (long)nested.image_size);
+    atomic_store(&g_job.copied_bytes,
+                 copied > (uint64_t)LONG_MAX ? LONG_MAX : (long)copied);
+  }
+
+  if(!stream_ctx.compression_complete) {
+    job_set_current("Restarting stream compression");
+    fd = open(stream_ctx.tmp_path, O_RDWR);
+    if(fd < 0) {
+      set_err(err, err_size, "open stream temp output: %s", strerror(errno));
+      goto done;
+    }
+    if(compress_nested_to_pfsc(fd, outer_file_start, &nested, worker_count,
+                               1, stream_ctx.nested_name,
+                               stream_ctx.nested_type,
+                               stream_ctx.vhash_tmp_path,
+                               stream_ctx.vhash_output_path,
+                               stream_ctx.tmp_path, info,
+                               stream_ctx.format, &stream_ctx,
+                               stream_ctx.source_path, &delete_started,
+                               &stored_size, info->compression_profile,
+                               err, err_size) != 0) {
+      goto done;
+    }
+  } else {
+    stored_size = stream_ctx.data_pos;
+    fd = open(stream_ctx.tmp_path, O_RDWR);
+    if(fd < 0) {
+      int open_errno = errno;
+      if(!stream_ctx.output_finalized) {
+        if(open_errno == ENOENT &&
+           access(stream_ctx.output_path, F_OK) == 0) {
+          fd = -1;
+        } else {
+          set_err(err, err_size, "open stream temp output: %s",
+                  strerror(open_errno));
+          goto done;
+        }
+      }
+    }
+  }
+  info->stored_size = stored_size;
+
+  if(!stream_ctx.output_finalized) {
+    job_set_current("Finalizing .ffpfsc");
+    if(fd >= 0) {
+      if(write_outer_pfs_metadata(fd, nested.image_size, stored_size,
+                                  stream_ctx.nested_name, err,
+                                  err_size) != 0) {
+        goto done;
+      }
+      close(fd);
+      fd = -1;
+      if(rename(stream_ctx.tmp_path, stream_ctx.output_path) != 0) {
+        int rename_errno = errno;
+        if(rename_errno != ENOENT ||
+           access(stream_ctx.output_path, F_OK) != 0) {
+          set_err(err, err_size, "rename output: %s",
+                  strerror(rename_errno));
+          goto done;
+        }
+      }
+    } else if(access(stream_ctx.output_path, F_OK) != 0) {
+      set_err(err, err_size, "stream final output is missing");
+      goto done;
+    }
+    if(rename(stream_ctx.vhash_tmp_path, stream_ctx.vhash_output_path) != 0) {
+      int rename_errno = errno;
+      if(rename_errno != ENOENT ||
+         access(stream_ctx.vhash_output_path, F_OK) != 0) {
+        set_err(err, err_size, "rename validation hash: %s",
+                strerror(rename_errno));
+        goto done;
+      }
+    }
+    stream_ctx.output_finalized = 1;
+    if(destructive_stream_write_header(&stream_ctx, err, err_size) != 0 ||
+       destructive_stream_sync(&stream_ctx, err, err_size) != 0) {
+      goto done;
+    }
+  } else if(fd >= 0) {
+    close(fd);
+    fd = -1;
+  }
+
+  job_set_current("Removing source app folder");
+  if(remove_tree_local(stream_ctx.source_path) != 0 && errno != ENOENT) {
+    set_err(err, err_size, "remove source app folder: %s", strerror(errno));
+    goto done;
+  }
+  destructive_stream_remove_reverse_dir(&stream_ctx);
+  unlink(stream_ctx.journal_path);
+  rc = 0;
+
+done:
+  if(fd >= 0) close(fd);
+  layout_free(&nested);
+  destructive_stream_free(&stream_ctx);
+  return rc;
+}
+
+int
+pfs_compress_resume_stream_journal(const char *journal_path, int workers,
+                                   pfs_app_info_t *info,
+                                   char *err, size_t err_size) {
+  return pfs_compress_resume_stream_journal_profile(
+      journal_path, workers, PFS_COMPRESS_PROFILE_SPACE, info, err, err_size);
 }
 
 int
@@ -3223,7 +6211,66 @@ pfs_compress_app_to_ffpfsc_opts(const char *path, int overwrite,
   if(pfs_app_probe(path, info, err, err_size) != 0) return -1;
   return pfs_compress_probed_to_ffpfsc_opts(info, overwrite, workers,
                                             format, delete_policy,
+                                            PFS_COMPRESS_PROFILE_SPACE,
+                                            NULL,
                                             err, err_size);
+}
+
+int
+pfs_compress_source_to_ffpfsc_opts_profile_output_ex(
+                                           const char *path, int overwrite,
+                                           int workers, int format,
+                                           int delete_policy,
+                                           int compression_profile,
+                                           const char *output_path,
+                                           const pfs_stream_options_t *stream_opts,
+                                           pfs_app_info_t *info,
+                                           char *err, size_t err_size) {
+  pfs_app_info_t local_info;
+  struct stat st;
+  if(!info) info = &local_info;
+  if(pfs_compress_probe(path, info, err, err_size) != 0) return -1;
+  if(output_path && output_path[0]) {
+    if(normalize_app_path(output_path, info->output_path,
+                          sizeof(info->output_path)) != 0 ||
+       !ends_with_ci(info->output_path, ".ffpfsc")) {
+      set_err(err, err_size, "bad compression output path");
+      errno = EINVAL;
+      return -1;
+    }
+    info->output_exists = stat(info->output_path, &st) == 0;
+  }
+  return pfs_compress_probed_to_ffpfsc_opts(info, overwrite, workers,
+                                            format, delete_policy,
+                                            compression_profile,
+                                            stream_opts,
+                                            err, err_size);
+}
+
+int
+pfs_compress_source_to_ffpfsc_opts_profile_output(
+                                           const char *path, int overwrite,
+                                           int workers, int format,
+                                           int delete_policy,
+                                           int compression_profile,
+                                           const char *output_path,
+                                           pfs_app_info_t *info,
+                                           char *err, size_t err_size) {
+  return pfs_compress_source_to_ffpfsc_opts_profile_output_ex(
+      path, overwrite, workers, format, delete_policy, compression_profile,
+      output_path, NULL, info, err, err_size);
+}
+
+int
+pfs_compress_source_to_ffpfsc_opts_profile(const char *path, int overwrite,
+                                           int workers, int format,
+                                           int delete_policy,
+                                           int compression_profile,
+                                           pfs_app_info_t *info,
+                                           char *err, size_t err_size) {
+  return pfs_compress_source_to_ffpfsc_opts_profile_output(
+      path, overwrite, workers, format, delete_policy, compression_profile,
+      NULL, info, err, err_size);
 }
 
 int
@@ -3232,12 +6279,9 @@ pfs_compress_source_to_ffpfsc_opts(const char *path, int overwrite,
                                    int delete_policy,
                                    pfs_app_info_t *info,
                                    char *err, size_t err_size) {
-  pfs_app_info_t local_info;
-  if(!info) info = &local_info;
-  if(pfs_compress_probe(path, info, err, err_size) != 0) return -1;
-  return pfs_compress_probed_to_ffpfsc_opts(info, overwrite, workers,
-                                            format, delete_policy,
-                                            err, err_size);
+  return pfs_compress_source_to_ffpfsc_opts_profile(
+      path, overwrite, workers, format, delete_policy,
+      PFS_COMPRESS_PROFILE_SPACE, info, err, err_size);
 }
 
 int

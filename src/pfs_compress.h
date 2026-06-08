@@ -18,7 +18,12 @@ typedef struct pfs_app_info {
   int  nested_type;
   int  source_type;
   int  delete_policy;
+  int  compression_profile;
   int  output_exists;
+  uint64_t stream_budget_bytes;
+  uint64_t stream_reserve_bytes;
+  uint64_t stream_forward_files;
+  uint64_t stream_reverse_files;
 } pfs_app_info_t;
 
 typedef struct pfs_decompress_info {
@@ -40,6 +45,19 @@ typedef struct pfs_decompress_info {
 #define PFS_DELETE_KEEP   0
 #define PFS_DELETE_AFTER  1
 #define PFS_DELETE_STREAM 2
+
+#define PFS_COMPRESS_PROFILE_SPACE 1
+#define PFS_COMPRESS_PROFILE_FAST  2
+
+#define PFS_STREAM_DEFAULT_BUDGET_BYTES 1073741824ULL
+#define PFS_STREAM_ORDER_PATH          0
+#define PFS_STREAM_ORDER_BUDGETED_GAIN 1
+
+typedef struct pfs_stream_options {
+  uint64_t budget_bytes;
+  uint64_t reserve_bytes;
+  int order;
+} pfs_stream_options_t;
 
 #define PFS_NESTED_UNKNOWN 0
 #define PFS_NESTED_PFS     1
@@ -77,6 +95,39 @@ int pfs_compress_source_to_ffpfsc_opts(const char *path, int overwrite,
                                        int delete_policy,
                                        pfs_app_info_t *info,
                                        char *err, size_t err_size);
+int pfs_compress_source_to_ffpfsc_opts_profile(const char *path, int overwrite,
+                                               int workers, int format,
+                                               int delete_policy,
+                                               int compression_profile,
+                                               pfs_app_info_t *info,
+                                               char *err, size_t err_size);
+int pfs_compress_source_to_ffpfsc_opts_profile_output(
+                                      const char *path, int overwrite,
+                                      int workers, int format,
+                                      int delete_policy,
+                                      int compression_profile,
+                                      const char *output_path,
+                                      pfs_app_info_t *info,
+                                      char *err, size_t err_size);
+int pfs_compress_source_to_ffpfsc_opts_profile_output_ex(
+                                      const char *path, int overwrite,
+                                      int workers, int format,
+                                      int delete_policy,
+                                      int compression_profile,
+                                      const char *output_path,
+                                      const pfs_stream_options_t *stream_opts,
+                                      pfs_app_info_t *info,
+                                      char *err, size_t err_size);
+int pfs_compress_stream_journal_path(const char *output_path, char *out,
+                                     size_t out_size);
+int pfs_compress_resume_stream_journal(const char *journal_path, int workers,
+                                       pfs_app_info_t *info,
+                                       char *err, size_t err_size);
+int pfs_compress_resume_stream_journal_profile(const char *journal_path,
+                                               int workers,
+                                               int compression_profile,
+                                               pfs_app_info_t *info,
+                                               char *err, size_t err_size);
 
 int pfs_decompress_probe(const char *path, pfs_decompress_info_t *info,
                          char *err, size_t err_size);

@@ -308,6 +308,16 @@ job_add_wait_us(atomic_long *counter, uint64_t started_at) {
   atomic_fetch_add(counter, delta > (uint64_t)LONG_MAX ? LONG_MAX : (long)delta);
 }
 
+static long
+job_long_from_u64(uint64_t v) {
+  return v > (uint64_t)LONG_MAX ? LONG_MAX : (long)v;
+}
+
+static uint64_t
+saturating_add_u64(uint64_t a, uint64_t b) {
+  return UINT64_MAX - a < b ? UINT64_MAX : a + b;
+}
+
 static void
 parse_inode_info(const unsigned char *data, pfs_inode_info_t *ino) {
   memset(ino, 0, sizeof(*ino));
@@ -968,13 +978,110 @@ pfsc_truncate_source_after_block(pfsc_reader_t *r, uint64_t first_block,
 }
 
 static int
+pfsc_stream_group_consumed(const pfsc_reader_t *r, uint64_t first_block,
+                           int *consumed, char *err, size_t err_size) {
+  struct stat st;
+  if(consumed) *consumed = 0;
+  if(!r || first_block >= r->block_count) return 0;
+  if(fstat(r->fd, &st) != 0) {
+    set_err(err, err_size, "stat compressed image: %s", strerror(errno));
+    return -1;
+  }
+  uint64_t source_size = st.st_size < 0 ? 0 : (uint64_t)st.st_size;
+  uint64_t committed_size = r->file_start + r->offsets[first_block];
+  if(consumed) *consumed = source_size <= committed_size;
+  return 0;
+}
+
+static int
+extract_output_complete(const pfs_extract_entry_t *e) {
+  struct stat st;
+  if(!e || stat(e->out_path, &st) != 0 || !S_ISREG(st.st_mode)) return 0;
+  return st.st_size >= 0 && (uint64_t)st.st_size == e->size;
+}
+
+static int
+extract_group_outputs_complete(const pfs_extract_plan_t *plan, size_t first,
+                               size_t last) {
+  if(!plan || first >= last || last > plan->count) return 0;
+  for(size_t i = first; i < last; i++) {
+    if(!extract_output_complete(&plan->items[i])) return 0;
+  }
+  return 1;
+}
+
+static int
+require_extract_group_outputs_complete(const pfs_extract_plan_t *plan,
+                                       size_t first, size_t last,
+                                       char *err, size_t err_size) {
+  if(!plan || first >= last || last > plan->count) {
+    errno = EINVAL;
+    return -1;
+  }
+  for(size_t i = first; i < last; i++) {
+    if(!extract_output_complete(&plan->items[i])) {
+      set_err(err, err_size,
+              "stream restore output missing after source truncation: %s",
+              plan->items[i].rel[0] ? plan->items[i].rel :
+                                      plan->items[i].out_path);
+      errno = EIO;
+      return -1;
+    }
+  }
+  return 0;
+}
+
+static void
+account_skipped_extract_group(const pfs_extract_plan_t *plan, size_t first,
+                              size_t last) {
+  if(!plan || first >= last || last > plan->count) return;
+  for(size_t i = first; i < last; i++) {
+    uint64_t size = plan->items[i].size;
+    atomic_fetch_add(&g_job.copied_bytes,
+                     size > (uint64_t)LONG_MAX ? LONG_MAX : (long)size);
+    atomic_fetch_add(&g_job.done_files, 1);
+  }
+}
+
+static int
 pfs_extract_reverse_plan(pfs_nested_reader_t *nr, pfs_extract_plan_t *plan,
                          int workers, char *err, size_t err_size) {
   qsort(plan->items, plan->count, sizeof(plan->items[0]),
         pfs_extract_entry_cmp_desc);
   for(size_t i = 0; i < plan->count;) {
+    size_t group_start = i;
     uint64_t group_first_block = plan->items[i].first_block;
     int truncate_group = 0;
+    int group_consumed = 0;
+    size_t group_end = i;
+    while(group_end < plan->count &&
+          plan->items[group_end].first_block == group_first_block) {
+      if(plan->items[group_end].block_count > 0) truncate_group = 1;
+      group_end++;
+    }
+    if(pfsc_stream_group_consumed(&nr->pfsc, group_first_block,
+                                  &group_consumed, err, err_size) != 0) {
+      return -1;
+    }
+    if(group_consumed) {
+      if(require_extract_group_outputs_complete(plan, group_start, group_end,
+                                                err, err_size) != 0) {
+        return -1;
+      }
+      account_skipped_extract_group(plan, group_start, group_end);
+      i = group_end;
+      continue;
+    }
+    if(extract_group_outputs_complete(plan, group_start, group_end)) {
+      account_skipped_extract_group(plan, group_start, group_end);
+      if(truncate_group &&
+         pfsc_truncate_source_after_block(&nr->pfsc, group_first_block,
+                                          err, err_size) != 0) {
+        return -1;
+      }
+      i = group_end;
+      continue;
+    }
     do {
       pfs_extract_entry_t *e = &plan->items[i];
       if(job_cancelled()) {
@@ -1382,6 +1489,10 @@ pfs_extract_file(pfs_nested_reader_t *nr, uint32_t inode_num,
     goto done;
   }
   chmod(out_path, 0777);
+  if(fsync(out) != 0) {
+    set_err(err, err_size, "sync output file: %s", strerror(errno));
+    goto done;
+  }
   atomic_fetch_add(&g_job.done_files, 1);
   rc = 0;
 
@@ -1859,6 +1970,10 @@ exfat_extract_file(exfat_reader_t *er, const pfs_extract_entry_t *e,
     goto done;
   }
   chmod(e->out_path, 0777);
+  if(fsync(out) != 0) {
+    set_err(err, err_size, "sync output file: %s", strerror(errno));
+    goto done;
+  }
   atomic_fetch_add(&g_job.done_files, 1);
   rc = 0;
 
@@ -1880,6 +1995,41 @@ exfat_extract_plan(exfat_reader_t *er, pfs_extract_plan_t *plan,
   for(size_t i = 0; i < plan->count;) {
     uint64_t group_first_block = plan->items[i].first_block;
     int truncate_group = 0;
+    size_t group_start = i;
+    size_t group_end = i + 1;
+    if(delete_stream) {
+      int group_consumed = 0;
+      while(group_end < plan->count &&
+            plan->items[group_end].first_block == group_first_block) {
+        group_end++;
+      }
+      for(size_t j = group_start; j < group_end; j++) {
+        if(plan->items[j].block_count > 0) truncate_group = 1;
+      }
+      if(pfsc_stream_group_consumed(&er->pfsc, group_first_block,
+                                    &group_consumed, err, err_size) != 0) {
+        return -1;
+      }
+      if(group_consumed) {
+        if(require_extract_group_outputs_complete(plan, group_start, group_end,
+                                                  err, err_size) != 0) {
+          return -1;
+        }
+        account_skipped_extract_group(plan, group_start, group_end);
+        i = group_end;
+        continue;
+      }
+      if(extract_group_outputs_complete(plan, group_start, group_end)) {
+        account_skipped_extract_group(plan, group_start, group_end);
+        if(truncate_group &&
+           pfsc_truncate_source_after_block(&er->pfsc, group_first_block,
+                                            err, err_size) != 0) {
+          return -1;
+        }
+        i = group_end;
+        continue;
+      }
+    }
     do {
       if(job_cancelled()) {
         set_err(err, err_size, "cancelled");
@@ -2048,7 +2198,9 @@ pfs_decompress_ffpfsc_to_app_opts(const char *path, int overwrite, int workers,
 
   job_set_target(info->output_path);
   job_set_current("Opening compressed image");
-  if(remove_tree_local(tmp_path) != 0) {
+  int preserve_stream_tmp = stream_delete &&
+      atomic_load(&g_job.rollback_requested);
+  if(!preserve_stream_tmp && remove_tree_local(tmp_path) != 0) {
     set_err(err, err_size, "remove old temp output: %s", strerror(errno));
     goto done;
   }
@@ -2109,9 +2261,15 @@ pfs_decompress_ffpfsc_to_app_opts(const char *path, int overwrite, int workers,
     goto done;
   }
 
+  uint64_t progress_base = 0;
+  if(preserve_stream_tmp) {
+    long copied_now = atomic_load(&g_job.copied_bytes);
+    if(copied_now > 0) progress_base = (uint64_t)copied_now;
+  }
   atomic_store(&g_job.total_bytes,
-               data_bytes > (uint64_t)LONG_MAX ? LONG_MAX : (long)data_bytes);
-  atomic_store(&g_job.copied_bytes, 0);
+               job_long_from_u64(saturating_add_u64(progress_base,
+                                                    data_bytes)));
+  atomic_store(&g_job.copied_bytes, job_long_from_u64(progress_base));
   atomic_store(&g_job.compressed_output_bytes, 0);
   atomic_store(&g_job.raw_blocks, 0);
   atomic_store(&g_job.compressed_blocks, 0);

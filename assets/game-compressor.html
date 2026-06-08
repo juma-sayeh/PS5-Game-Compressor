@@ -188,6 +188,7 @@
     .chip {
       display: inline-flex;
       align-items: center;
+      justify-content: center;
       height: 24px;
       padding: 0 9px;
       border-radius: 999px;
@@ -196,7 +197,14 @@
       color: var(--muted);
       font-size: 11px;
       font-weight: 500;
+      font-variant-numeric: tabular-nums;
+      font-feature-settings: "tnum" 1;
       white-space: nowrap;
+    }
+
+    .chip.metric {
+      min-width: 78px;
+      text-align: center;
     }
 
     .chip.ok { color: #14895b; border-color: rgba(20,137,91,.20); background: #eaf8f1; }
@@ -209,7 +217,26 @@
     .chip.validating { color: #0f766e; border-color: rgba(15,118,110,.22); background: #e7f7f4; }
     .chip.repacking { color: #8a5b0d; border-color: rgba(168,112,12,.22); background: #fff4d8; }
     .chip.moving { color: #386176; border-color: rgba(56,97,118,.22); background: #e9f4f8; }
+    .chip.finalizing { color: #59616d; border-color: rgba(89,97,109,.22); background: #eef1f5; }
+    .chip.restoring { color: #6b4ba1; border-color: rgba(107,75,161,.22); background: #f0ebff; }
     .chip.unpacking { color: #6b4ba1; border-color: rgba(107,75,161,.22); background: #f0ebff; }
+	    .chip.size-pending { gap: 6px; color: #386176; border-color: rgba(56,97,118,.18); background: #edf7fa; }
+	    button.chip { font-family: inherit; cursor: pointer; }
+	    button.chip:hover { filter: brightness(.98); }
+
+    .mini-spinner {
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      border: 2px solid rgba(56,97,118,.22);
+      border-top-color: #386176;
+      animation: spin .85s linear infinite;
+      flex: 0 0 auto;
+    }
+
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
 
     .content {
       min-width: 0;
@@ -231,6 +258,26 @@
       gap: 8px;
       padding: 12px 18px;
       border-bottom: 1px solid var(--line);
+    }
+
+    .free-space-label {
+      min-height: 38px;
+      display: inline-flex;
+      align-items: center;
+      padding: 0 12px;
+      border-radius: 14px;
+      border: 1px solid var(--line);
+      background: rgba(255,255,255,.64);
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 680;
+      white-space: nowrap;
+      box-shadow: 0 8px 20px rgba(37, 51, 81, .08);
+    }
+
+    .free-space-label span {
+      margin-left: 6px;
+      color: var(--text);
     }
 
     .icon-btn {
@@ -274,7 +321,7 @@
       height: 168px;
       font-size: 36px;
       font-weight: 780;
-      border-radius: 34px;
+      border-radius: 46px;
       box-shadow: 0 24px 60px rgba(37, 51, 81, .18);
     }
 
@@ -389,6 +436,13 @@
     }
 
     .more-btn:active { transform: scale(.985); }
+    .more-btn:disabled {
+      cursor: default;
+      opacity: .48;
+      transform: none;
+      color: var(--muted);
+      box-shadow: none;
+    }
 
     .more-btn svg {
       width: 22px;
@@ -401,11 +455,13 @@
     }
 
     .secondary-menu {
-      position: absolute;
-      right: 0;
-      top: calc(100% + 10px);
-      z-index: 6;
+      position: fixed;
+      left: 0;
+      top: 0;
+      z-index: 20;
       width: min(260px, calc(100vw - 52px));
+      max-height: calc(100vh - 24px);
+      overflow: auto;
       padding: 8px;
       border-radius: 18px;
       border: 1px solid var(--line);
@@ -453,7 +509,8 @@
     }
 
     .progress-heading {
-      display: flex;
+      display: grid;
+      grid-template-columns: minmax(0, auto) 44px;
       align-items: baseline;
       justify-content: center;
       gap: 7px;
@@ -470,44 +527,64 @@
     }
 
     .progress-percent {
+      display: inline-block;
+      width: 44px;
       font-size: 16px;
       line-height: 1;
       font-weight: 400;
       color: #4b5563;
+      text-align: left;
+      font-variant-numeric: tabular-nums;
+      font-feature-settings: "tnum" 1;
     }
 
-    .progress-repair-count {
-      justify-self: center;
-      display: inline-flex;
-      align-items: center;
-      min-width: 0;
-      padding: 4px 9px;
-      border-radius: 999px;
-      background: rgba(255,255,255,.72);
-      border: 1px solid rgba(168,112,12,.18);
-      color: #8a5b0d;
-      font-size: 12px;
-      font-weight: 600;
-      line-height: 1.1;
-      text-align: center;
+    .progress-percent.is-empty {
+      color: #6b7280;
     }
 
     .progress-times {
       display: flex;
-      flex-wrap: wrap;
+      flex-wrap: nowrap;
       justify-content: space-between;
-      gap: 12px;
+      gap: 8px;
       color: var(--muted);
-      font-size: 12px;
+      font-size: 11px;
       font-weight: 500;
+      font-variant-numeric: tabular-nums;
+      font-feature-settings: "tnum" 1;
     }
 
     .progress-time {
       display: inline-flex;
       align-items: center;
-      gap: 5px;
+      gap: 4px;
       min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
       white-space: nowrap;
+    }
+
+    .progress-elapsed-value,
+    .progress-speed-value,
+    .progress-remaining-value {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .progress-elapsed {
+      flex: 0 0 52px;
+    }
+
+    .progress-speed {
+      flex: 1 1 136px;
+      color: var(--accent);
+    }
+
+    .progress-remaining {
+      flex: 1 1 126px;
+      justify-content: flex-end;
     }
 
     .progress-time svg {
@@ -519,10 +596,6 @@
       stroke-linecap: round;
       stroke-linejoin: round;
       flex: 0 0 auto;
-    }
-
-    .progress-speed {
-      color: var(--accent);
     }
 
     .progress-box.is-compressing .progress-fill {
@@ -549,7 +622,15 @@
       background: linear-gradient(90deg, #386176, #79b6cb);
     }
 
+    .progress-box.is-finalizing .progress-fill {
+      background: linear-gradient(90deg, #59616d, #aab1ba);
+    }
+
     .progress-box.is-unpacking .progress-fill {
+      background: linear-gradient(90deg, #6b4ba1, #a995df);
+    }
+
+    .progress-box.is-restoring .progress-fill {
       background: linear-gradient(90deg, #6b4ba1, #a995df);
     }
 
@@ -612,6 +693,10 @@
       align-items: center;
     }
 
+    .path-row.has-remount {
+      grid-template-columns: minmax(0, 1fr) auto 38px;
+    }
+
     .path-line {
       padding: 10px 12px;
       border: 1px solid var(--line);
@@ -622,7 +707,8 @@
       white-space: nowrap;
     }
 
-    .copy-path {
+    .copy-path,
+    .remount-path {
       width: 38px;
       height: 38px;
       display: grid;
@@ -636,16 +722,25 @@
       transition: transform .18s ease, border-color .18s ease, color .18s ease, box-shadow .18s ease;
     }
 
-    .copy-path:hover {
+    .copy-path:hover,
+    .remount-path:hover {
       transform: translateY(-1px);
       border-color: rgba(19,102,255,.28);
       color: var(--accent);
       box-shadow: 0 12px 26px rgba(37, 51, 81, .11);
     }
 
-    .copy-path:active { transform: scale(.96); }
+    .copy-path:active,
+    .remount-path:active { transform: scale(.96); }
 
-    .copy-path svg {
+    .remount-path:disabled {
+      cursor: default;
+      opacity: .55;
+      transform: none;
+    }
+
+    .copy-path svg,
+    .remount-path svg {
       width: 17px;
       height: 17px;
       stroke: currentColor;
@@ -653,6 +748,19 @@
       fill: none;
       stroke-linecap: round;
       stroke-linejoin: round;
+    }
+
+    .remount-path {
+      width: auto;
+      min-width: 116px;
+      padding: 0 12px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      white-space: nowrap;
+      font-size: 12px;
+      font-weight: 720;
     }
 
     .empty {
@@ -806,6 +914,93 @@
       border-color: var(--accent);
     }
 
+    .format-section-title {
+      margin: 2px 0 8px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 760;
+      text-transform: uppercase;
+    }
+
+    .format-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+
+    .format-grid .format-row {
+      margin-bottom: 0;
+    }
+
+    .compress-usb-panel {
+      margin: -4px 0 14px;
+      padding: 10px;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: rgba(255,255,255,.48);
+    }
+
+    .compress-usb-panel.hidden { display: none; }
+
+    .compress-usb-select {
+      width: 100%;
+      min-height: 42px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: rgba(255,255,255,.78);
+      color: var(--text);
+      font: inherit;
+      font-size: 14px;
+      font-weight: 680;
+      padding: 0 12px;
+      outline: none;
+    }
+
+    .compress-usb-select:focus {
+      border-color: rgba(23,105,255,.5);
+      box-shadow: 0 0 0 3px rgba(23,105,255,.12);
+    }
+
+    .compress-usb-meta {
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.35;
+    }
+
+    .format-row.is-selected {
+      border-color: rgba(23,105,255,.48);
+      background: #eef4ff;
+    }
+
+    .format-row:disabled,
+    .format-row.is-disabled {
+      cursor: default;
+      opacity: .58;
+      filter: saturate(.72);
+    }
+
+    .format-row:disabled:hover,
+    .format-row.is-disabled:hover {
+      border-color: var(--line);
+    }
+
+    .small-action.is-primary {
+      min-width: 128px;
+      color: #fff;
+      border-color: transparent;
+      background: linear-gradient(135deg, var(--accent), var(--accent-2));
+      box-shadow: var(--button-shadow);
+    }
+
+    .small-action:disabled {
+      cursor: default;
+      opacity: .55;
+      transform: none;
+      box-shadow: none;
+    }
+
     .modal-actions {
       display: flex;
       justify-content: flex-end;
@@ -885,6 +1080,12 @@
         padding: 6px 10px;
       }
 
+      .free-space-label {
+        min-height: 36px;
+        padding: 0 10px;
+        font-size: 12px;
+      }
+
       .info-launcher {
         left: 14px;
         bottom: 14px;
@@ -900,16 +1101,36 @@
       .hero-icon {
         width: 128px;
         height: 128px;
+        border-radius: 36px;
       }
 
       .game-title { font-size: 25px; }
 
-      .primary-btn,
-      .pending-box,
-      .progress-box {
-        min-height: 64px;
-        font-size: 18px;
-      }
+	      .primary-btn,
+	      .pending-box,
+	      .progress-box {
+	        min-height: 64px;
+	        font-size: 18px;
+	      }
+
+	      .progress-times {
+	        flex-wrap: nowrap;
+	        justify-content: space-between;
+	        gap: 6px;
+	        font-size: 10px;
+	      }
+
+	      .progress-elapsed,
+	      .progress-speed,
+	      .progress-remaining {
+	        min-width: 0;
+	        overflow: hidden;
+	        text-overflow: ellipsis;
+	      }
+
+	      .progress-elapsed { flex: 0 0 48px; }
+	      .progress-speed { flex: 1 1 100px; }
+	      .progress-remaining { flex: 1 1 96px; }
 
       .more-btn {
         width: 56px;
@@ -922,6 +1143,10 @@
 
       .active-action-row {
         grid-template-columns: minmax(0, 1fr) 56px;
+      }
+
+      .format-grid {
+        grid-template-columns: minmax(0, 1fr);
       }
 
       .path-line {
@@ -944,6 +1169,7 @@
 
     <main class="content">
       <div class="topbar">
+        <div class="free-space-label" id="free-space-label">Free Space <span>--</span></div>
         <button class="icon-btn" id="history-top" title="History" aria-label="History"></button>
       </div>
       <section class="detail" id="detail"></section>
@@ -995,26 +1221,90 @@
         <button class="icon-btn" id="format-close" aria-label="Close"></button>
       </div>
       <div class="modal-body" id="format-body">
-        <button class="format-row" data-compress-format="pfs">
-          <div>
-            <div class="history-title">PFS</div>
-            <div class="history-meta" id="format-pfs-name">pfs_image.dat</div>
-          </div>
-          <span class="chip">Select</span>
-        </button>
-        <button class="format-row" data-compress-format="exfat">
-          <div>
-            <div class="history-title">exFAT</div>
-            <div class="history-meta" id="format-exfat-name">&lt;TITLE_ID&gt;.exfat</div>
-          </div>
-          <span class="chip">Select</span>
-        </button>
+        <div class="format-section-title">Format</div>
+        <div class="format-grid">
+          <button class="format-row" type="button" data-compress-format="pfs">
+            <div>
+              <div class="history-title">PFS</div>
+              <div class="history-meta" id="format-pfs-name">pfs_image.dat</div>
+            </div>
+            <span class="chip">Select</span>
+          </button>
+          <button class="format-row" type="button" data-compress-format="exfat">
+            <div>
+              <div class="history-title">exFAT</div>
+              <div class="history-meta" id="format-exfat-name">&lt;TITLE_ID&gt;.exfat</div>
+            </div>
+            <span class="chip">Select</span>
+          </button>
+        </div>
+        <div class="format-section-title">Optimization</div>
+        <div class="format-grid">
+          <button class="format-row" type="button" data-compress-profile="space">
+            <div>
+              <div class="history-title">Space optimized</div>
+              <div class="history-meta">zlib level 7; stores blocks only when savings are meaningful</div>
+            </div>
+            <span class="chip">Select</span>
+          </button>
+          <button class="format-row" type="button" data-compress-profile="fast">
+            <div>
+              <div class="history-title">Fast optimized</div>
+              <div class="history-meta">miniz best-speed; faster block deflate with a larger output</div>
+            </div>
+            <span class="chip">Select</span>
+          </button>
+        </div>
+        <div class="format-section-title">Storage Mode</div>
+        <div class="format-grid">
+          <button class="format-row" type="button" data-compress-policy="after">
+            <div>
+              <div class="history-title">Safe</div>
+              <div class="history-meta" id="format-safe-space">Keeps the original until the new file is complete</div>
+            </div>
+            <span class="chip">Select</span>
+          </button>
+          <button class="format-row" type="button" data-compress-policy="stream" id="format-stream-row">
+            <div>
+              <div class="history-title">Destructive</div>
+              <div class="history-meta" id="format-stream-space">Deletes while writing to use less free space</div>
+            </div>
+            <span class="chip">Select</span>
+          </button>
+        </div>
+        <div class="format-section-title">Destination</div>
+        <div class="format-grid">
+          <button class="format-row" type="button" data-compress-destination="keep">
+            <div>
+              <div class="history-title">Keep in place</div>
+              <div class="history-meta">Write next to the current game</div>
+            </div>
+            <span class="chip">Select</span>
+          </button>
+          <button class="format-row" type="button" data-compress-destination="usb">
+            <div>
+              <div class="history-title">External USB</div>
+              <div class="history-meta">Write compressed file to USB</div>
+            </div>
+            <span class="chip">Select</span>
+          </button>
+        </div>
+        <div class="compress-usb-panel hidden" id="compress-usb-panel">
+          <select class="compress-usb-select" id="compress-usb-select"></select>
+          <div class="compress-usb-meta" id="compress-usb-meta"></div>
+        </div>
+        <div class="modal-actions">
+          <button class="small-action is-primary" type="button" id="format-start">Compress</button>
+        </div>
       </div>
     </div>
   </div>
 
   <script>
     const SELECTED_GAME_COOKIE = 'game_compressor_selected_title';
+    const PFS_BLOCK_SIZE = 64 * 1024;
+    const SPEED_SAMPLE_WINDOW_MS = 120 * 1000;
+    const SPEED_MIN_SAMPLE_MS = 20 * 1000;
 
     const state = {
       games: [],
@@ -1023,20 +1313,29 @@
       job: null,
       speed: {
         activeId: '',
-        copiedBytes: 0,
+        metricBytes: 0,
         sampledAt: 0,
-        bytesPerSecond: 0
+        bytesPerSecond: 0,
+        samples: []
       },
       selected: '',
       revealSelected: false,
       moveGame: null,
       compressGame: null,
+      compressFormat: 'pfs',
+      compressProfile: 'space',
+      compressDeletePolicy: 'after',
+      compressDestination: 'keep',
+      compressUsbId: '',
+      compressUsbLoading: false,
       secondaryMenuFor: '',
+      mountingTitles: {},
       iconCache: {},
       iconRequests: {},
       iconFailures: {},
       animatedIconKeys: {},
       renderKeys: {
+        header: '',
         list: '',
         detail: '',
         history: ''
@@ -1044,6 +1343,8 @@
     };
     let refreshAllInFlight = false;
     let refreshJobInFlight = false;
+    let pollBurstTimer = 0;
+    let pollBurstUntil = 0;
 
     const $ = (id) => document.getElementById(id);
 
@@ -1094,6 +1395,7 @@
         info: '<circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/>',
         timer: '<path d="M9 2h6"/><path d="M12 6v2"/><circle cx="12" cy="14" r="8"/><path d="M12 10v4l3 2"/>',
         copy: '<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',
+        refresh: '<path d="M21 12a9 9 0 0 1-15 6.7"/><path d="M3 12a9 9 0 0 1 15-6.7"/><path d="M18 3v5h-5"/><path d="M6 21v-5h5"/>',
         close: '<path d="M18 6 6 18"/><path d="m6 6 12 12"/>'
       };
       return '<svg viewBox="0 0 24 24" aria-hidden="true">' + (paths[name] || '') + '</svg>';
@@ -1116,6 +1418,22 @@
       return value > 0 ? shortSize(value) + '/s' : '--';
     }
 
+    function reportedSpeedBytesPerSecond(job) {
+      job = job || {};
+      const candidates = [
+        job.speedBytesPerSec,
+        job.speedBytesPerSecond,
+        job.averageSpeedBytesPerSec,
+        job.compressBytesPerSecond,
+        job.bytesPerSecond
+      ];
+      for (let i = 0; i < candidates.length; i++) {
+        const value = Number(candidates[i] || 0);
+        if (value > 0) return value;
+      }
+      return 0;
+    }
+
     async function api(url, options) {
       const res = await fetch(url, Object.assign({ cache: 'no-store' }, options || {}));
       const text = await res.text();
@@ -1133,18 +1451,46 @@
       return state.games.find((g) => g.titleId === state.selected) || state.games[0] || null;
     }
 
-    function jobForOperation(op) {
-      if (!op || !state.job || !state.job.busy) return null;
-      return String(state.job.activeId || '') === String(op.id || '') ? state.job : null;
+    function gameSortName(g) {
+      return String((g && (g.name || g.titleId)) || '');
     }
 
-    function operationVisual(op, job) {
-      const action = String((op && op.action) || (job && job.verb) || '').toLowerCase();
-      const phase = String((job && job.phase) || (op && op.phase) || '').toLowerCase();
-      const current = String((job && job.current) || '').toLowerCase();
+    function sortGamesForList(games) {
+      return (games || []).slice().sort((a, b) => {
+        const aHasIcon = !!(a && a.hasIcon);
+        const bHasIcon = !!(b && b.hasIcon);
+        if (aHasIcon !== bHasIcon) return aHasIcon ? -1 : 1;
+        const byName = gameSortName(a).localeCompare(gameSortName(b), undefined, {
+          numeric: true,
+          sensitivity: 'base'
+        });
+        if (byName) return byName;
+        return String((a && a.titleId) || '').localeCompare(String((b && b.titleId) || ''));
+      });
+    }
+
+    function activeJob() {
+      const job = state.job || {};
+      return job.busy && job.activeId ? job : null;
+    }
+
+    function jobForOperation(op) {
+      const job = activeJob();
+      if (!op || !job) return null;
+      return String(job.activeId || '') === String(op.id || '') ? job : null;
+    }
+
+	    function operationVisual(op, job) {
+	      const action = String((op && op.action) || (job && job.verb) || '').toLowerCase();
+	      const phase = String((job && job.phase) || (op && op.phase) || '').toLowerCase();
+	      const current = String((job && job.current) || '').toLowerCase();
+	      const validationAction = action === 'validate-repair' || action === 'validate-only';
       const repairBlocks = Number((job && job.repairBlocks) ||
         (op && (op.badBlocksFound || op.repairedBlocks)) || 0);
 
+      if (job && job.rollbackRequested) {
+        return { label: 'Restoring...', className: 'restoring' };
+      }
       if (phase === 'closing' || current.indexOf('closing') !== -1) {
         return { label: 'Closing', className: 'closing' };
       }
@@ -1155,26 +1501,34 @@
           current.indexOf('remount') !== -1) {
         return { label: 'Mounting', className: 'mounting' };
       }
-      if (action === 'move-to-usb' || action === 'move-to-internal' || phase === 'copying') {
-        return { label: 'Moving', className: 'moving' };
+      if (phase === 'metadata' || current.indexOf('finalizing') !== -1) {
+        return { label: 'Finalizing', className: 'finalizing' };
+      }
+      if (phase === 'restoring' || current.indexOf('restoring original') !== -1) {
+        return { label: 'Restoring', className: 'unpacking' };
+      }
+      if (action === 'move-to-usb' || action === 'move-to-internal') {
+        return { label: 'Transferring', className: 'moving' };
+      }
+      if (phase === 'copying') {
+        return { label: 'Repacking', className: 'repacking' };
       }
       if (action === 'uncompress') {
         return { label: 'Unpacking', className: 'unpacking' };
       }
-      if (action === 'validate-repair' &&
-          repairBlocks <= 0 &&
-          (phase === 'repairing' || current.indexOf('repairing') !== -1)) {
-        return { label: 'Validating', className: 'validating' };
-      }
+	      if (validationAction &&
+	          repairBlocks <= 0 &&
+	          (phase === 'repairing' || current.indexOf('repairing') !== -1)) {
+	        return { label: 'Validating', className: 'validating' };
+	      }
       if (phase === 'repairing' ||
-          phase === 'metadata' ||
           current.indexOf('repairing') !== -1 ||
-          current.indexOf('finalizing') !== -1) {
+          current.indexOf('rebuilding repaired') !== -1) {
         return { label: 'Repacking', className: 'repacking' };
       }
-      if (action === 'validate-repair' ||
-          phase === 'scanning' ||
-          phase === 'opening' ||
+	      if (validationAction ||
+	          phase === 'scanning' ||
+	          phase === 'opening' ||
           phase === 'finding-mounted-image' ||
           current.indexOf('validat') !== -1 ||
           current.indexOf('scanning mounted') !== -1 ||
@@ -1187,16 +1541,66 @@
       return { label: 'Running', className: 'run' };
     }
 
-    function visualShowsPercent(visual) {
-      return !visual ||
-        (visual.className !== 'closing' && visual.className !== 'mounting');
+	    function progressUnits(job) {
+	      job = job || activeJob() || {};
+	      const phase = String(job.phase || '').toLowerCase();
+	      const totalBlocks = Number(job.totalBlocks || 0);
+	      const doneBlocks = Number(job.doneBlocks || 0);
+      if (phase === 'compressing' && totalBlocks > 0) {
+        return {
+          done: Math.max(0, Math.min(totalBlocks, doneBlocks)),
+          total: totalBlocks,
+	          countable: true
+	        };
+	      }
+	      const total = Number(job.totalBytes || 0);
+	      const copied = Number(job.copiedBytes || 0);
+	      if (total > 0 && (
+	          phase === 'copying' ||
+	          phase === 'unpacking' ||
+	          phase === 'moving' ||
+	          phase === 'restoring' ||
+	          phase === 'scanning')) {
+	        return {
+	          done: Math.max(0, Math.min(total, copied)),
+	          total,
+	          countable: true
+	        };
+	      }
+	      const count = Number(job.phaseCount || 0);
+	      const step = Number(job.phaseStep || 0);
+	      if (count > 0 && (
+	          phase === 'copying' ||
+	          phase === 'unpacking' ||
+	          phase === 'moving' ||
+	          phase === 'restoring' ||
+	          phase === 'scanning')) {
+	        return {
+	          done: Math.max(0, Math.min(count, step)),
+	          total: count,
+	          countable: true
+	        };
+      }
+      return { done: 0, total: 0, countable: false };
     }
 
-    function visualShowsThroughput(visual) {
-      return !!visual &&
-        visual.className !== 'closing' &&
-        visual.className !== 'mounting';
+    function progressIsCountable(job) {
+      return progressUnits(job).countable;
     }
+
+    function visualShowsPercent(visual, progress) {
+      return !!(progress && progress.countable) &&
+        !!visual &&
+        visual.className !== 'closing' &&
+        visual.className !== 'mounting' &&
+        visual.className !== 'finalizing';
+    }
+
+	    function visualShowsThroughput(visual, progress) {
+	      return !!(progress && progress.countable && progress.hasSpeed) &&
+	        !!visual &&
+	        visual.className !== 'closing';
+	    }
 
     function statusChip(g) {
       if (g.activeOp) {
@@ -1208,6 +1612,9 @@
         return '<span class="chip warn">' +
           escapeHtml(pendingOperationLabel(g.pendingOp).toLowerCase()) +
           '</span>';
+      }
+      if (isTryMounting(g)) {
+        return '<span class="chip mounting">Mounting</span>';
       }
       if (g.sourceKind === 'compressed') {
         if (g.validation === 'validated') return '<span class="chip ok">validated</span>';
@@ -1222,24 +1629,285 @@
     function savedChip(g) {
       const saved = Number(g && g.savedBytes || 0);
       if (!g || g.sourceKind !== 'compressed' || saved <= 0) return '';
-      return '<span class="chip ok">saved ' + escapeHtml(shortSize(saved)) + '</span>';
+      return '<span class="chip metric ok">saved ' + escapeHtml(shortSize(saved)) + '</span>';
     }
 
-    function repairBlocksForOperation(op, job) {
-      const action = String((op && op.action) || (job && job.verb) || '').toLowerCase();
+    function sizeChip(g) {
+      if (g && g.sizePending) {
+        return '<span class="chip size-pending"><span class="mini-spinner" aria-hidden="true"></span>measuring</span>';
+      }
+      return '<span class="chip metric">' + shortSize(g && g.sourceSize) + '</span>';
+    }
+
+		    function opCanRepairBlocks(op) {
+		      const action = String((op && op.action) || '').toLowerCase();
+		      return action === 'validate-repair' || action === 'compress';
+		    }
+
+		    function opCanFindBadBlocks(op) {
+		      const action = String((op && op.action) || '').toLowerCase();
+		      return action === 'validate-repair' || action === 'validate-only';
+		    }
+
+    function normalizedPath(path) {
+      return String(path || '').replace(/\/+$/, '');
+    }
+
+    function operationTime(op) {
+      return Math.max(
+        0,
+        Number((op && op.endedAt) || 0),
+        Number((op && op.startedAt) || 0),
+        Number((op && op.createdAt) || 0)
+      );
+    }
+
+    function operationChangesGameState(op) {
+      const action = String((op && op.action) || '').toLowerCase();
+      return action === 'compress' ||
+        action === 'uncompress' ||
+        action === 'move-to-usb' ||
+        action === 'move-to-internal';
+    }
+
+    function latestStateChangeTimeForGame(g) {
+      const titleId = String((g && g.titleId) || '');
+      if (!titleId || !Array.isArray(state.history)) return 0;
+      let latest = 0;
+      for (const op of state.history) {
+        if (String((op && op.titleId) || '') !== titleId) continue;
+        if (!operationChangesGameState(op)) continue;
+        if (String((op && op.status) || '').toLowerCase() !== 'success') continue;
+        latest = Math.max(latest, operationTime(op));
+      }
+      return latest;
+    }
+
+    function operationBelongsToCurrentGame(g, op) {
+      if (!g || !op) return false;
+      if (String(op.titleId || '') !== String(g.titleId || '')) return false;
+      const current = normalizedPath(g.sourcePath);
+      if (!current) return true;
+      return normalizedPath(op.sourcePath) === current ||
+        normalizedPath(op.outputPath) === current;
+    }
+
+    function operationIsCurrentForGame(g, op) {
+      if (!operationBelongsToCurrentGame(g, op)) return false;
+      const cutoff = latestStateChangeTimeForGame(g);
+      return cutoff <= 0 || operationTime(op) >= cutoff;
+    }
+
+    function opLooksLikeMountFailure(op) {
+      if (!op) return false;
+      const result = String(op.result || '').toLowerCase();
+      if (result === 'verified-not-mounted' ||
+          result === 'not-mounted' ||
+          result === 'bad-blocks-found-not-mounted') return true;
+      if (op.status !== 'failed') return false;
+      const text = String((op.error || '') + ' ' + (op.result || '') + ' ' + (op.phase || '')).toLowerCase();
+      const repairBlocks = Math.max(0, Number(op.repairedBlocks || op.badBlocksFound || 0));
+      return text.indexOf('mount') !== -1 ||
+        text.indexOf('shadowmount') !== -1 ||
+        text.indexOf('remount') !== -1 ||
+        (repairBlocks > 0 && text.indexOf('post-repair') !== -1);
+    }
+
+	    function latestRepairOperationForGame(g, includeMountFailure) {
+	      const titleId = String((g && g.titleId) || '');
+	      if (!titleId || !Array.isArray(state.history)) return null;
+	      for (const op of state.history) {
+	        if (!operationIsCurrentForGame(g, op)) continue;
+	        if (!opCanRepairBlocks(op)) continue;
+	        if (op.status !== 'success' &&
+	            !(includeMountFailure && opLooksLikeMountFailure(op))) continue;
+	        return op;
+	      }
+	      return null;
+	    }
+
+	    function latestBadBlocksOperationForGame(g, includeMountFailure) {
+	      const titleId = String((g && g.titleId) || '');
+	      if (!titleId || !Array.isArray(state.history)) return null;
+	      for (const op of state.history) {
+	        if (!operationIsCurrentForGame(g, op)) continue;
+	        if (!opCanFindBadBlocks(op)) continue;
+	        if (op.status !== 'success' &&
+	            !(includeMountFailure && opLooksLikeMountFailure(op))) continue;
+	        return op;
+	      }
+	      return null;
+	    }
+
+    function latestMountFailureForGame(g) {
+      const titleId = String((g && g.titleId) || '');
+      if (!titleId || !Array.isArray(state.history)) return null;
+      for (const op of state.history) {
+        if (!operationIsCurrentForGame(g, op)) continue;
+        if (opLooksLikeMountFailure(op)) return op;
+        if (op.status === 'success') return null;
+      }
+      return null;
+    }
+
+    function isTryMounting(g) {
+      const titleId = String((g && g.titleId) || '');
+      if (!titleId || !state.mountingTitles[titleId]) return false;
+      if (Date.now() > Number(state.mountingTitles[titleId] || 0)) {
+        delete state.mountingTitles[titleId];
+        return false;
+      }
+      return true;
+    }
+
+    function setTryMounting(g, active) {
+      const titleId = String((g && g.titleId) || '');
+      if (!titleId) return;
+      if (active) {
+        state.mountingTitles[titleId] = Date.now() + 30000;
+        setTimeout(() => {
+          if (!state.mountingTitles[titleId] || Date.now() <= state.mountingTitles[titleId]) return;
+          delete state.mountingTitles[titleId];
+          render();
+        }, 31000);
+      } else {
+        delete state.mountingTitles[titleId];
+      }
+    }
+
+    function mountNoticeChip(g) {
+      if (isTryMounting(g)) return '';
+      if (!g || g.activeOp || g.pendingOp || g.sourceKind !== 'compressed' ||
+          !latestMountFailureForGame(g)) return '';
+      return "<span class=\"chip bad\">didn't mount</span>";
+    }
+
+	    function completedBadBlocksForGame(g) {
+	      const op = latestBadBlocksOperationForGame(g, true);
+	      if (!op) return null;
+	      if (operationShowsRepairedOutcome(op, null)) return null;
+	      const blocks = Math.max(0, Number(op.badBlocksFound || op.repairedBlocks || 0));
+	      return Number.isFinite(blocks) ? blocks : null;
+	    }
+
+	    function completedBadBlocksOperationForGame(g) {
+	      const op = latestBadBlocksOperationForGame(g, true);
+	      if (!op) return null;
+	      if (operationShowsRepairedOutcome(op, null)) return null;
+	      const blocks = Math.max(0, Number(op.badBlocksFound || op.repairedBlocks || 0));
+	      return Number.isFinite(blocks) && blocks > 0 ? op : null;
+	    }
+
+    function operationShowsRepairedOutcome(op, job) {
+      if (!op || !opCanRepairBlocks(op)) return false;
+      const blocks = repairBlocksForOperation(op, job);
+      if (blocks <= 0) return false;
+      if (job && String(job.activeId || '') === String(op.id || '')) return true;
+      return op.status === 'success' || opLooksLikeMountFailure(op);
+    }
+
+    function liveBadBlocksForOperation(op, job) {
       const storedBlocks = op && op.badBlocksFound !== undefined && op.badBlocksFound !== null
         ? op.badBlocksFound
-        : op && op.repairedBlocks;
+        : 0;
+      const persistedBlocks = Math.max(0, Number(storedBlocks || 0));
+      const liveBlocks = Math.max(0, Number((job && (job.badBlocksFound || job.repairBlocks)) || 0));
+      return Math.max(persistedBlocks, liveBlocks);
+    }
+
+    function activeBadBlocksChipVisible(op, job) {
+      if (!op || !opCanFindBadBlocks(op)) return false;
+      const action = String((op && op.action) || '').toLowerCase();
+      const phase = String((job && job.phase) || (op && op.phase) || '').toLowerCase();
+      const current = String((job && job.current) || '').toLowerCase();
+      if (phase === 'mounting') return false;
+      if (action === 'validate-repair' || action === 'validate-only') return true;
+      return phase === 'validating' ||
+        phase === 'repairing' ||
+        phase === 'finding-mounted-image' ||
+        current.indexOf('validat') !== -1 ||
+        current.indexOf('repair') !== -1 ||
+        Math.max(0, Number((job && (
+          job.badBlocksFound ||
+          job.repairBlocks ||
+          job.repairedBlocks ||
+          job.hashCheckedBlocks ||
+          job.softwareComparedBlocks
+        )) || 0)) > 0;
+    }
+
+	    function badBlocksChipHtml(blocks, dir) {
+	      const label = blocks + ' bad block' + (blocks === 1 ? '' : 's') + ' found';
+	      if (blocks <= 0) {
+		        return '<span class="chip metric ok">' + escapeHtml(label) + '</span>';
+	      }
+	      if (dir) {
+		        return '<button class="chip metric warn" type="button" title="Open bad block log" data-bad-blocks-dir="' +
+		          escapeHtml(dir) + '">' + escapeHtml(label) + '</button>';
+		      }
+		      return '<span class="chip metric warn">' + escapeHtml(label) + '</span>';
+	    }
+
+	    function badBlocksChip(g) {
+	      if (!g || g.sourceKind !== 'compressed') return '';
+	      if (g.activeOp) {
+	        const job = jobForOperation(g.activeOp);
+	        if (operationShowsRepairedOutcome(g.activeOp, job)) return '';
+	        const blocks = liveBadBlocksForOperation(g.activeOp, job);
+	        if (activeBadBlocksChipVisible(g.activeOp, job)) {
+	          return badBlocksChipHtml(blocks, blocks > 0 ? (g.activeOp.repairSummary || '') : '');
+	        }
+	      }
+	      const blocks = completedBadBlocksForGame(g);
+	      if (blocks === null) return '';
+	      const op = completedBadBlocksOperationForGame(g);
+	      return badBlocksChipHtml(blocks, (op && op.repairSummary) || '');
+	    }
+
+    function completedRepairBlocksForGame(g) {
+      const op = latestRepairOperationForGame(g, true);
+      if (!op) return null;
+      const storedBlocks = op.repairedBlocks !== undefined && op.repairedBlocks !== null
+        ? op.repairedBlocks
+        : op.badBlocksFound;
+      const blocks = Math.max(0, Number(storedBlocks || 0));
+      return Number.isFinite(blocks) ? blocks : null;
+    }
+
+	    function repairedBlocksChip(g) {
+	      if (!g || g.sourceKind !== 'compressed') return '';
+	      if (g.pendingOp) {
+	        const pendingAction = String((g.pendingOp && g.pendingOp.action) || '').toLowerCase();
+	        if (pendingAction === 'compress' || pendingAction === 'uncompress') return '';
+	      }
+	      if (g.activeOp) {
+	        const activeAction = String((g.activeOp && g.activeOp.action) || '').toLowerCase();
+	        if (activeAction === 'compress' ||
+	            activeAction === 'uncompress' ||
+	            activeAction === 'validate-repair') return '';
+	      }
+	      const blocks = completedRepairBlocksForGame(g);
+	      if (blocks === null || blocks <= 0) return '';
+      return '<span class="chip metric ok">' + blocks + ' block' +
+        (blocks === 1 ? '' : 's') + ' repaired</span>';
+    }
+
+	    function repairResultKeyForGame(g) {
+	      const bad = completedBadBlocksForGame(g);
+	      const repaired = completedRepairBlocksForGame(g);
+	      const mountFailed = latestMountFailureForGame(g) ? 'mount-failed' : '';
+	      const badOp = completedBadBlocksOperationForGame(g);
+		      return [bad, repaired, mountFailed, badOp && badOp.repairSummary].map(keyPart).join('|');
+		    }
+
+    function repairBlocksForOperation(op, job) {
+      const storedBlocks = op && op.repairedBlocks !== undefined && op.repairedBlocks !== null
+        ? op.repairedBlocks
+        : 0;
       const persistedBlocks = Math.max(0, Number(storedBlocks || 0));
       if (persistedBlocks > 0) return persistedBlocks;
-      const liveBlocks = Math.max(0, Number((job && job.repairBlocks) || 0));
-      if (liveBlocks <= 0) return 0;
-      if (action === 'validate-repair') return liveBlocks;
-      const phase = String((job && job.phase) || (op && op.phase) || '').toLowerCase();
-      if (action === 'compress' &&
-          (phase === 'repairing' || phase === 'validating' || phase === 'mounting')) {
-        return liveBlocks;
-      }
+      const liveRepaired = Math.max(0, Number((job && job.repairedBlocks) || 0));
+      if (liveRepaired > 0) return liveRepaired;
       return 0;
     }
 
@@ -1249,11 +1917,22 @@
       return blocks + ' block' + (blocks === 1 ? '' : 's') + ' repaired';
     }
 
-    function historyResultLabel(op, job) {
-      const result = (op.phase && op.phase !== 'complete') ? op.phase :
-        (op.result || op.status);
-      const repairText = repairedBlocksText(op, job);
-      if (!repairText) return result;
+	    function historyResultLabel(op, job) {
+	      const result = (op.phase && op.phase !== 'complete') ? op.phase :
+	        (op.result || op.status);
+	      const action = String((op && op.action) || '').toLowerCase();
+	      if (action === 'validate-only') {
+	        if (result === 'bad-blocks-found-not-mounted') return "bad blocks found, didn't mount";
+	        if (result === 'verified-not-mounted') return "no bad blocks found, didn't mount";
+	        if (result === 'bad-blocks-found') return 'bad blocks found';
+	        if (result === 'clean') return 'no bad blocks found';
+	      }
+      if (action === 'uncompress' && result === 'not-mounted') {
+        return "unpacked, didn't mount";
+      }
+      if (opLooksLikeMountFailure(op)) return "verified, didn't mount";
+	      const repairText = repairedBlocksText(op, job);
+	      if (!repairText) return result;
       return op.status === 'failed' && result ?
         result + ' - ' + repairText :
         repairText;
@@ -1338,24 +2017,28 @@
       return size || mtime ? size + '-' + mtime : '';
     }
 
-    function opKey(op) {
-      if (!op) return '';
-      return [
-        op.id, op.titleId, op.displayName, op.action, op.status, op.phase,
-        op.result, op.error, op.sourcePath, op.outputPath, op.sourceKind,
-        op.deletePolicy, op.createdAt, op.startedAt, op.endedAt,
-        op.repairedBlocks, op.badBlocksFound
-      ].map(keyPart).join('|');
-    }
+	    function opKey(op) {
+	      if (!op) return '';
+	      return [
+	        op.id, op.titleId, op.displayName, op.action, op.status, op.phase,
+	        op.result, op.error, op.sourcePath, op.outputPath, op.sourceKind,
+	        op.deletePolicy, op.compressionProfile, op.repairSummary,
+	        op.createdAt, op.startedAt, op.endedAt,
+	        op.repairedBlocks, op.badBlocksFound,
+	        op.hashCheckedBlocks, op.softwareComparedBlocks
+	      ].map(keyPart).join('|');
+	    }
 
     function gameKey(g) {
       return [
         g.titleId, g.name, g.sourceKind, g.sourcePath, g.outputPath,
         g.storage, g.validation, g.primaryAction, g.sourceSize, g.freeBytes,
-        g.requiredBytes, g.extraBytes, g.savedBytes,
+        g.requiredBytes, g.extraBytes, g.streamMinFreeBytes,
+        g.streamExtraBytes, g.savedBytes,
         g.compressionSourceSize, g.compressedSize,
-        g.canStreamDelete, g.hasIcon,
+        g.sizePending, g.canStreamDelete, g.hasIcon,
         iconVersion(g), g.outputExists, g.canMoveToUsb, g.canMoveToInternal,
+        isTryMounting(g),
         opKey(g.activeOp), opKey(g.pendingOp)
       ].map(keyPart).join('|');
     }
@@ -1364,19 +2047,71 @@
       return state.selected + '::' + state.games.map(gameKey).join('||');
     }
 
+    function headerFreeSpaceGame(selected) {
+      const hasFree = (g) => g && Number(g.freeBytes) > 0;
+      if (hasFree(selected)) return selected;
+      const storage = selected && selected.storage;
+      if (storage) {
+        const sameStorage = state.games.find((g) => g.storage === storage && hasFree(g));
+        if (sameStorage) return sameStorage;
+      }
+      return state.games.find(hasFree) || selected || null;
+    }
+
+    function headerKey() {
+      const g = selectedGame();
+      const fallback = headerFreeSpaceGame(g);
+      return [
+        state.selected,
+        g && g.freeBytes,
+        fallback && fallback.freeBytes,
+        g && g.outputPath,
+        g && g.storage
+      ].map(keyPart).join('|');
+    }
+
     function detailKey() {
       const g = selectedGame();
       if (!g) return 'empty';
       return [
-        gameKey(g), actionFor(g), actionLabel(g),
-        state.secondaryMenuFor === g.titleId ? 'menu' : ''
-      ].map(keyPart).join('|');
+	        gameKey(g), actionFor(g), actionLabel(g),
+	        repairResultKeyForGame(g),
+	        g && g.activeOp && state.job && state.job.activeId === g.activeOp.id
+	          ? [
+	                state.job.badBlocksFound,
+	                state.job.repairedBlocks,
+	                state.job.repairBlocks,
+		                state.job.rollbackRequested
+	              ].map(keyPart).join(':')
+	          : '',
+	        state.secondaryMenuFor === g.titleId ? 'menu' : ''
+	      ].map(keyPart).join('|');
     }
 
     function historyKey() {
-      const job = state.job || {};
-      return state.history.map(opKey).join('||') + '::' +
-        keyPart(job.activeId) + '::' + keyPart(job.repairBlocks);
+      const job = activeJob() || {};
+	      return state.history.map(opKey).join('||') + '::' +
+	        keyPart(job.activeId) + '::' + keyPart(job.badBlocksFound) + '::' +
+	        keyPart(job.repairedBlocks) + '::' + keyPart(job.repairBlocks) + '::' +
+          keyPart(job.rollbackRequested);
+    }
+
+    function currentHistoryRows() {
+      const latestSuccess = new Map();
+      state.history.forEach((op) => {
+        const titleId = String((op && op.titleId) || '');
+        if (!titleId || latestSuccess.has(titleId) || op.status !== 'success') return;
+        latestSuccess.set(titleId, op);
+      });
+      return state.history.filter((op) => {
+        const titleId = String((op && op.titleId) || '');
+        const latest = latestSuccess.get(titleId);
+        if (!latest || latest === op) return true;
+        if (Number(op.createdAt || 0) >= Number(latest.createdAt || 0)) return true;
+        const noisy = op.status === 'failed' ||
+	          Math.max(0, Number(op.badBlocksFound || op.repairedBlocks || 0)) > 0;
+        return !noisy;
+      });
     }
 
     function renderList(force) {
@@ -1437,25 +2172,30 @@
       return 'Start';
     }
 
-    function pendingOperationLabel(op) {
-      const action = String((op && op.action) || '').toLowerCase();
-      if (action === 'compress') return 'Pending Compress';
-      if (action === 'validate-repair') return 'Pending Validate';
+	    function pendingOperationLabel(op) {
+	      const action = String((op && op.action) || '').toLowerCase();
+	      if (action === 'compress') return 'Pending Compress';
+	      if (action === 'validate-repair' || action === 'validate-only') return 'Pending Validate';
       if (action === 'uncompress') return 'Pending Unpack';
       if (action === 'move-to-usb') return 'Pending Move to USB';
       if (action === 'move-to-internal') return 'Pending Move to Internal SSD';
       return 'Pending Operation';
     }
 
-    function progressPercent() {
-      const job = state.job || {};
-      const total = Number(job.totalBytes || 0);
-      const copied = Number(job.copiedBytes || 0);
-      if (total > 0) return Math.max(0, Math.min(100, copied / total * 100));
-      const count = Number(job.phaseCount || 0);
-      const step = Number(job.phaseStep || 0);
-      if (count > 0) return Math.max(0, Math.min(100, step / count * 100));
-      return 0;
+    function progressPercent(job) {
+      const units = progressUnits(job);
+      if (!units.countable || units.total <= 0) return 0;
+      return Math.max(0, Math.min(100, units.done / units.total * 100));
+    }
+
+    function progressFillPercent(progress, visual) {
+      if (!visual ||
+          visual.className === 'closing' ||
+          visual.className === 'mounting' ||
+          visual.className === 'finalizing') {
+        return 100;
+      }
+      return progress && progress.countable ? progress.percent : 100;
     }
 
     function formatDuration(seconds) {
@@ -1470,61 +2210,92 @@
         : minutes + ':' + two(secs);
     }
 
-    function progressTiming() {
-      const job = state.job || {};
+    function progressTiming(job) {
+      job = job || activeJob() || {};
       const elapsed = Math.max(0, Number(job.elapsedSeconds || 0));
-      const copied = Math.max(0, Number(job.copiedBytes || 0));
-      const percent = progressPercent();
-      const fraction = percent / 100;
+      const units = progressUnits(job);
+      const percent = progressPercent(job);
+      const fraction = units.countable && units.total > 0 ? units.done / units.total : 0;
       const remaining = fraction >= 1
         ? 0
         : fraction > 0.001 && elapsed > 0
         ? Math.max(0, elapsed * (1 - fraction) / fraction)
         : null;
-      const averageSpeed = elapsed > 0 ? copied / elapsed : 0;
-      const instantSpeed = Number(state.speed.bytesPerSecond || 0);
+      const reportedSpeed = reportedSpeedBytesPerSecond(job);
+      const sampledSpeed = Number(state.speed.bytesPerSecond || 0);
+      const instantSpeed = reportedSpeed > 0 ? reportedSpeed : sampledSpeed;
       return {
         percent,
+        countable: units.countable,
+        hasSpeed: instantSpeed > 0,
         elapsedText: formatDuration(elapsed),
         remainingText: remaining === null ? '--' : formatDuration(remaining),
-        speedText: speedText(instantSpeed || averageSpeed)
+        speedText: speedText(instantSpeed)
       };
+    }
+
+	    function speedMetricBytes(job) {
+	      job = job || {};
+	      if (!progressIsCountable(job)) return 0;
+	      const phase = String(job.phase || '').toLowerCase();
+	      const totalBlocks = Math.max(0, Number(job.totalBlocks || 0));
+	      const doneBlocks = Math.max(0, Number(job.doneBlocks || 0));
+      if (phase === 'compressing' && totalBlocks > 0) {
+        return Math.min(doneBlocks, totalBlocks) * PFS_BLOCK_SIZE;
+      }
+      return Math.max(0, Number(job.copiedBytes || 0));
     }
 
     function updateSpeedSample(job) {
       const activeId = String((job && job.activeId) || '');
       const busy = !!(job && job.busy);
-      const copied = Math.max(0, Number((job && job.copiedBytes) || 0));
+      const metricBytes = speedMetricBytes(job);
       const now = Date.now();
       if (!busy || !activeId) {
         state.speed.activeId = '';
-        state.speed.copiedBytes = 0;
+        state.speed.metricBytes = 0;
         state.speed.sampledAt = 0;
         state.speed.bytesPerSecond = 0;
+        state.speed.samples = [];
         return;
       }
       if (state.speed.activeId !== activeId ||
           state.speed.sampledAt <= 0 ||
-          copied < state.speed.copiedBytes) {
+          metricBytes < state.speed.metricBytes) {
         state.speed.activeId = activeId;
-        state.speed.copiedBytes = copied;
+        state.speed.metricBytes = metricBytes;
         state.speed.sampledAt = now;
         state.speed.bytesPerSecond = 0;
+        state.speed.samples = [{ at: now, bytes: metricBytes }];
         return;
       }
-      const elapsedMs = now - state.speed.sampledAt;
-      if (elapsedMs >= 250) {
-        const delta = copied - state.speed.copiedBytes;
-        state.speed.bytesPerSecond = delta > 0 ? delta * 1000 / elapsedMs : 0;
-        state.speed.copiedBytes = copied;
-        state.speed.sampledAt = now;
+      state.speed.metricBytes = metricBytes;
+      state.speed.sampledAt = now;
+      const samples = state.speed.samples || [];
+      const last = samples.length ? samples[samples.length - 1] : null;
+      if (!last || last.bytes !== metricBytes || now - last.at >= 1000) {
+        samples.push({ at: now, bytes: metricBytes });
+      }
+      const cutoff = now - SPEED_SAMPLE_WINDOW_MS;
+      while (samples.length > 2 && samples[1].at < cutoff) samples.shift();
+      state.speed.samples = samples;
+      const base = samples[0];
+      if (base && now - Number(base.at || 0) >= SPEED_MIN_SAMPLE_MS) {
+        const elapsedMs = now - Number(base.at || 0);
+        const delta = metricBytes - base.bytes;
+        state.speed.bytesPerSecond =
+          elapsedMs > 0 && delta > 0 ? delta * 1000 / elapsedMs : 0;
+      } else {
+        state.speed.bytesPerSecond = 0;
       }
     }
 
     function secondaryActions(g) {
       if (!g || g.activeOp || g.pendingOp || g.sourceKind === 'unknown') return [];
       const actions = [];
-      if (g.sourceKind === 'compressed') {
+      const sourceKind = String(g.sourceKind || '').toLowerCase();
+      if (sourceKind === 'compressed' || actionFor(g) === 'validate-repair') {
+        actions.push({ id: 'validate-only', label: 'Validate Only' });
         actions.push({ id: 'uncompress', label: 'Uncompress' });
       }
       if (g.canMoveToUsb) {
@@ -1538,55 +2309,65 @@
 
     function renderSecondaryMenu(g, actions) {
       if (state.secondaryMenuFor !== g.titleId) return '';
-      return '<div class="secondary-menu" id="secondary-menu" role="menu">' +
+      return '<div class="secondary-menu" id="secondary-menu" role="menu" style="visibility:hidden">' +
         actions.map((action) => (
-          '<button class="menu-action" role="menuitem" data-secondary-action="' + escapeHtml(action.id) + '">' +
+          '<button class="menu-action" role="menuitem" data-secondary-action="' + escapeHtml(action.id) + '" data-menu-label="' + escapeHtml(action.label) + '">' +
             escapeHtml(action.label) +
           '</button>'
         )).join('') +
-      '</div>';
-    }
+	      '</div>';
+	    }
 
     function renderPrimary(g) {
-      if (!g) return '';
-      if (g.activeOp) {
-        const progress = progressTiming();
-        const job = jobForOperation(g.activeOp);
-        const visual = operationVisual(g.activeOp, job);
-        const percentText = visualShowsPercent(visual)
-          ? '<span class="progress-percent">' + progress.percent.toFixed(0) + '%</span>'
-          : '';
-        const throughputHtml = visualShowsThroughput(visual)
+	      if (!g) return '';
+	      if (g.activeOp) {
+	        const job = jobForOperation(g.activeOp);
+        const unsafeStreamActive =
+          String((g.activeOp && g.activeOp.action) || '').toLowerCase() === 'compress' &&
+          String((g.activeOp && g.activeOp.deletePolicy) || '').toLowerCase() === 'stream';
+        const destructiveStreamLocked = unsafeStreamActive && job && job.destructiveStreamActive;
+			        const progress = progressTiming(job);
+			        const visual = operationVisual(g.activeOp, job);
+			        const fillPercent = progressFillPercent(progress, visual);
+        const cancelAttrs = destructiveStreamLocked
+          ? ' disabled title="Unsafe compression cannot be cancelled after it starts"'
+          : job && job.rollbackRequested
+          ? ' disabled title="Cancel already requested"'
+          : ' title="Cancel operation"';
+		        const percentText = visualShowsPercent(visual, progress)
+		          ? '<span class="progress-percent">' + progress.percent.toFixed(0) + '%</span>'
+		          : '<span class="progress-percent is-empty">...</span>';
+        const throughputHtml = visualShowsThroughput(visual, progress)
           ? '<span class="progress-time progress-speed">Speed: ' +
               '<span class="progress-speed-value">' + progress.speedText + '</span></span>' +
-            '<span class="progress-time progress-remaining">Remaining: ' +
-              '<span class="progress-remaining-value">' + progress.remainingText + '</span></span>'
+            (progress.countable
+              ? '<span class="progress-time progress-remaining">Remaining: ' +
+                  '<span class="progress-remaining-value">' + progress.remainingText + '</span></span>'
+              : '')
           : '';
-        const repairText = repairedBlocksText(g.activeOp, job);
-        const repairHtml = repairText
-          ? '<div class="progress-repair-count">' + escapeHtml(repairText) + '</div>'
-          : '';
-        return '<div class="active-action-row">' +
-          '<div class="progress-box is-' + visual.className + '">' +
-            '<div class="progress-heading">' +
-              '<span class="progress-label">' + escapeHtml(visual.label) + '</span>' +
-              percentText +
-            '</div>' +
-            repairHtml +
-            '<div class="bar"><span class="progress-fill" style="width:' + progress.percent.toFixed(1) + '%"></span></div>' +
+	        return '<div class="active-action-row">' +
+	          '<div class="progress-box is-' + visual.className + '">' +
+	            '<div class="progress-heading">' +
+	              '<span class="progress-label">' + escapeHtml(visual.label) + '</span>' +
+	              percentText +
+	            '</div>' +
+	            '<div class="bar"><span class="progress-fill" style="width:' + fillPercent.toFixed(1) + '%"></span></div>' +
             '<div class="progress-times">' +
               '<span class="progress-time progress-elapsed">' + icon('timer') +
                 '<span class="progress-elapsed-value">' + progress.elapsedText + '</span></span>' +
               throughputHtml +
-            '</div>' +
-          '</div>' +
-          '<button class="more-btn" id="cancel-active" aria-label="Cancel operation">' + icon('close') + '</button>' +
-        '</div>';
+	            '</div>' +
+	          '</div>' +
+	          '<button class="more-btn" id="cancel-active" aria-label="Cancel operation"' + cancelAttrs + '>' + icon('close') + '</button>' +
+	        '</div>';
       }
       if (g.pendingOp) {
         return '<div class="pending-box"><div class="pending-label">' +
           escapeHtml(pendingOperationLabel(g.pendingOp)) + '</div>' +
           '<button class="small-action" id="cancel-pending">Cancel</button></div>';
+      }
+      if (isTryMounting(g)) {
+        return '<div class="pending-box"><div class="pending-label">Mounting</div></div>';
       }
       const action = actionFor(g);
       if (!action) return '<button class="primary-btn" disabled>Unavailable</button>';
@@ -1606,6 +2387,12 @@
     function wirePrimaryControls(g) {
       const btn = $('primary-action');
       if (btn) btn.addEventListener('click', () => startAction(g));
+      document.querySelectorAll('[data-bad-blocks-dir]').forEach((chip) => {
+        chip.addEventListener('click', (event) => {
+          event.stopPropagation();
+          openBadBlocksLog(chip.getAttribute('data-bad-blocks-dir') || '');
+        });
+      });
       const cancel = $('cancel-pending');
       if (cancel && g.pendingOp) {
         cancel.addEventListener('click', () => cancelPending(g.pendingOp.id));
@@ -1621,12 +2408,75 @@
           toggleSecondaryMenu(g);
         });
       }
+
       document.querySelectorAll('[data-secondary-action]').forEach((item) => {
         item.addEventListener('click', (event) => {
           event.stopPropagation();
           runSecondaryAction(g, item.getAttribute('data-secondary-action'));
         });
       });
+      positionSecondaryMenu();
+    }
+
+    function positionSecondaryMenu() {
+      const menu = $('secondary-menu');
+      const trigger = $('more-actions');
+      if (!menu || !trigger) return;
+      const padding = 12;
+      const gap = 10;
+      const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0;
+      const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+      const maxHeight = Math.max(120, viewportHeight - padding * 2);
+      menu.style.visibility = 'hidden';
+      menu.style.maxHeight = maxHeight + 'px';
+      menu.style.left = '0px';
+      menu.style.top = '0px';
+
+      const triggerRect = trigger.getBoundingClientRect();
+      const menuRect = menu.getBoundingClientRect();
+      let left = triggerRect.right - menuRect.width;
+      left = Math.min(left, viewportWidth - padding - menuRect.width);
+      left = Math.max(padding, left);
+
+      const belowTop = triggerRect.bottom + gap;
+      const aboveTop = triggerRect.top - menuRect.height - gap;
+      let top = belowTop;
+      if (belowTop + menuRect.height > viewportHeight - padding && aboveTop >= padding) {
+        top = aboveTop;
+      } else if (belowTop + menuRect.height > viewportHeight - padding) {
+        top = Math.max(padding, viewportHeight - padding - menuRect.height);
+      }
+      top = Math.max(padding, Math.min(top, viewportHeight - padding - Math.min(menuRect.height, maxHeight)));
+
+      menu.style.left = left + 'px';
+      menu.style.top = top + 'px';
+      menu.style.visibility = 'visible';
+    }
+
+    function openBadBlocksLog(dir) {
+      if (!dir) return;
+      window.open('/api/gc/bad-blocks?dir=' + encodeURIComponent(dir), '_blank', 'noopener');
+    }
+
+    async function tryMountGame(g) {
+      if (!g || !g.titleId) return;
+      const btn = $('remount-path');
+      if (btn) btn.disabled = true;
+      setTryMounting(g, true);
+      render();
+      try {
+        await api('/api/gc/refresh-mount?titleId=' + encodeURIComponent(g.titleId), {
+          method: 'POST'
+        });
+        await refreshAll();
+        setTryMounting(g, false);
+      } catch (err) {
+        setTryMounting(g, false);
+        render();
+        alert(err.message || 'Could not request ShadowMountPlus mount');
+      } finally {
+        if (btn) btn.disabled = false;
+      }
     }
 
     function refreshPrimaryArea(g) {
@@ -1654,7 +2504,9 @@
 
     function runSecondaryAction(g, action) {
       closeSecondaryMenu();
-      if (action === 'uncompress') {
+      if (action === 'validate-only') {
+        startAction(g, false, 'validate-only');
+      } else if (action === 'uncompress') {
         startAction(g, false, 'uncompress');
       } else if (action === 'move-usb') {
         showUsbModal(g);
@@ -1704,6 +2556,14 @@
         detail.innerHTML = '<div class="empty">No games found</div>';
         return;
       }
+      const mounting = isTryMounting(g);
+      const showRemount = (mounting || !!latestMountFailureForGame(g)) &&
+        !g.activeOp && !g.pendingOp && g.sourceKind === 'compressed';
+      const remountButton = showRemount
+        ? '<button class="remount-path" id="remount-path" aria-label="Try to mount" title="Try to mount"' +
+            (mounting ? ' disabled' : '') + '>' + icon('refresh') +
+            '<span>' + (mounting ? 'Mounting' : 'Try to mount') + '</span></button>'
+        : '';
       detail.innerHTML =
         '<div class="detail-inner">' +
           '<div class="hero-icon' + heroIconClass(g) + '">' + gameIcon(g, true) + '</div>' +
@@ -1711,14 +2571,18 @@
           '<div class="facts">' +
             '<span class="chip">' + escapeHtml(g.titleId) + '</span>' +
             '<span class="chip">' + escapeHtml(g.sourceKind) + '</span>' +
-            statusChip(g) +
-            '<span class="chip">' + shortSize(g.sourceSize) + '</span>' +
-            savedChip(g) +
+	            statusChip(g) +
+	            sizeChip(g) +
+		            savedChip(g) +
+            mountNoticeChip(g) +
+			            badBlocksChip(g) +
+		            repairedBlocksChip(g) +
           '</div>' +
           '<div class="primary-area">' + renderPrimary(g) + '</div>' +
           '<div class="path-box">' +
-            '<div class="path-row">' +
+            '<div class="path-row' + (showRemount ? ' has-remount' : '') + '">' +
               '<div class="path-line" title="' + escapeHtml(g.sourcePath || '-') + '">' + escapeHtml(g.sourcePath || '-') + '</div>' +
+              remountButton +
               '<button class="copy-path" id="copy-path" aria-label="Copy path">' + icon('copy') + '</button>' +
             '</div>' +
           '</div>' +
@@ -1728,6 +2592,10 @@
       if (copyPath) {
         copyPath.addEventListener('click', () => copyCurrentPath(g.sourcePath || ''));
       }
+      const remountPath = $('remount-path');
+      if (remountPath) {
+        remountPath.addEventListener('click', () => tryMountGame(g));
+      }
     }
 
     function renderHistory(force) {
@@ -1735,11 +2603,12 @@
       if (!force && state.renderKeys.history === key) return;
       state.renderKeys.history = key;
       const body = $('history-body');
-      if (!state.history.length) {
+      const rows = currentHistoryRows();
+      if (!rows.length) {
         body.innerHTML = '<div class="empty">No operations</div>';
         return;
       }
-      body.innerHTML = state.history.map((op) => {
+      body.innerHTML = rows.map((op) => {
         const chipClass = op.status === 'success' ? 'ok' :
           op.status === 'failed' ? 'bad' :
           op.status === 'running' ? 'run' :
@@ -1757,14 +2626,35 @@
       }).join('');
     }
 
+    function renderHeader(force) {
+      const key = headerKey();
+      if (!force && state.renderKeys.header === key) return;
+      state.renderKeys.header = key;
+      const label = $('free-space-label');
+      const value = label ? label.querySelector('span') : null;
+      const g = selectedGame();
+      const freeGame = headerFreeSpaceGame(g);
+      const freeBytes = freeGame ? Number(freeGame.freeBytes) : NaN;
+      if (value) {
+        value.textContent = Number.isFinite(freeBytes) ? shortSize(freeBytes) : '--';
+      }
+      if (label) {
+        label.title = freeGame && freeGame.outputPath
+          ? 'Free space for ' + freeGame.outputPath
+          : 'Free space';
+      }
+    }
+
     function render(force) {
+      renderHeader(force);
       renderList(force);
       renderDetail(force);
       renderHistory(force);
     }
 
     function activeGameForJob() {
-      const job = state.job || {};
+      const job = activeJob();
+      if (!job) return null;
       const activeId = String(job.activeId || '');
       if (!activeId) return null;
       return state.games.find((g) => g.activeOp && String(g.activeOp.id || '') === activeId) || null;
@@ -1790,57 +2680,55 @@
       const speed = box.querySelector('.progress-speed-value');
       const remainingRow = box.querySelector('.progress-remaining');
       const remaining = box.querySelector('.progress-remaining-value');
-      const progress = progressTiming();
       const g = activeGameForJob();
       const job = g && g.activeOp ? jobForOperation(g.activeOp) : null;
+      if (!job) {
+        renderDetail(true);
+        renderHistory(true);
+        return;
+      }
+      const progress = progressTiming(job);
       const visual = g && g.activeOp
         ? operationVisual(g.activeOp, job)
         : { label: 'Running', className: 'run' };
       box.classList.remove('is-compressing', 'is-closing', 'is-mounting', 'is-validating', 'is-repacking',
-        'is-moving', 'is-unpacking', 'is-run');
+        'is-moving', 'is-finalizing', 'is-unpacking', 'is-restoring', 'is-run');
       box.classList.add('is-' + visual.className);
       if (label) {
         label.textContent = visual.label;
       }
-      if (!visualShowsPercent(visual)) {
-        if (percent) percent.remove();
-      } else {
-        if (!percent && label && label.parentNode) {
-          percent = document.createElement('span');
-          percent.className = 'progress-percent';
-          label.parentNode.appendChild(percent);
-        }
-        if (percent) {
-          percent.style.display = '';
-          percent.textContent = progress.percent.toFixed(0) + '%';
-        }
-      }
+	      if (!percent && label && label.parentNode) {
+	        percent = document.createElement('span');
+	        percent.className = 'progress-percent is-empty';
+	        percent.textContent = '...';
+	        label.parentNode.appendChild(percent);
+	      }
+	      if (percent) {
+	        if (visualShowsPercent(visual, progress)) {
+	          percent.className = 'progress-percent';
+	          percent.textContent = progress.percent.toFixed(0) + '%';
+	        } else {
+	          percent.className = 'progress-percent is-empty';
+	          percent.textContent = '...';
+	        }
+	      }
       if (fill) {
-        fill.style.width = progress.percent.toFixed(1) + '%';
+        fill.style.width = progressFillPercent(progress, visual).toFixed(1) + '%';
       }
-      const repairText = g && g.activeOp ? repairedBlocksText(g.activeOp, job) : '';
-      let repairCount = box.querySelector('.progress-repair-count');
-      if (repairText) {
-        if (!repairCount) {
-          repairCount = document.createElement('div');
-          repairCount.className = 'progress-repair-count';
-          const bar = box.querySelector('.bar');
-          if (bar) box.insertBefore(repairCount, bar);
-          else box.appendChild(repairCount);
-        }
-        repairCount.textContent = repairText;
-      } else if (repairCount) {
-        repairCount.remove();
-      }
-      if (elapsed) {
+	      if (elapsed) {
         elapsed.textContent = progress.elapsedText;
       }
-      const showThroughput = visualShowsThroughput(visual);
+      const showThroughput = visualShowsThroughput(visual, progress);
+      if (showThroughput && !speedRow) {
+        renderDetail(true);
+        renderHistory(true);
+        return;
+      }
       if (speedRow) {
         speedRow.style.display = showThroughput ? '' : 'none';
       }
       if (remainingRow) {
-        remainingRow.style.display = showThroughput ? '' : 'none';
+        remainingRow.style.display = showThroughput && progress.countable ? '' : 'none';
       }
       if (speed && showThroughput) {
         speed.textContent = progress.speedText;
@@ -1860,7 +2748,7 @@
           api('/api/gc/job'),
           api('/api/gc/history')
         ]);
-        state.games = games.games || [];
+        state.games = sortGamesForList(games.games);
         state.job = job;
         updateSpeedSample(job);
         state.history = history.history || [];
@@ -1871,6 +2759,7 @@
         render();
         updateProgressOnly();
       } catch (err) {
+        state.renderKeys.header = '';
         state.renderKeys.list = '';
         state.renderKeys.detail = '';
         state.renderKeys.history = '';
@@ -1899,12 +2788,28 @@
           await refreshAll();
           return;
         }
+        renderDetail(false);
+        renderHistory(false);
         updateProgressOnly();
       } catch (err) {
         /* Keep the last rendered UI during transient polling errors. */
       } finally {
         refreshJobInFlight = false;
       }
+    }
+
+    function startPollBurst(durationMs) {
+      pollBurstUntil = Date.now() + Math.max(1000, Number(durationMs || 5000));
+      if (pollBurstTimer) clearInterval(pollBurstTimer);
+      refreshAll();
+      pollBurstTimer = setInterval(() => {
+        if (Date.now() > pollBurstUntil) {
+          clearInterval(pollBurstTimer);
+          pollBurstTimer = 0;
+          return;
+        }
+        refreshJob();
+      }, 250);
     }
 
     function renderUsbList() {
@@ -1928,6 +2833,42 @@
       });
     }
 
+    function selectedCompressUsb() {
+      return (state.usb || []).find((usb) => usb.id === state.compressUsbId) || null;
+    }
+
+    function renderCompressUsbSelect() {
+      const select = $('compress-usb-select');
+      const meta = $('compress-usb-meta');
+      if (!select || !meta) return;
+      if (state.compressUsbLoading) {
+        select.innerHTML = '<option value="">Loading USB storage</option>';
+        select.disabled = true;
+        meta.textContent = '';
+        return;
+      }
+      if (!state.usb.length) {
+        select.innerHTML = '<option value="">No USB storage found</option>';
+        select.disabled = true;
+        meta.textContent = '';
+        return;
+      }
+      if (!state.compressUsbId || !selectedCompressUsb()) {
+        state.compressUsbId = state.usb[0].id || '';
+      }
+      select.disabled = false;
+      select.innerHTML = state.usb.map((usb) => (
+        '<option value="' + escapeHtml(usb.id) + '">' +
+        escapeHtml(usb.name + ' - ' + shortSize(usb.freeBytes) + ' free') +
+        '</option>'
+      )).join('');
+      select.value = state.compressUsbId;
+      const usb = selectedCompressUsb();
+      meta.textContent = usb
+        ? usb.path + ' - ' + shortSize(usb.freeBytes) + ' free of ' + shortSize(usb.totalBytes)
+        : '';
+    }
+
     async function showUsbModal(g) {
       state.moveGame = g;
       $('usb-title').textContent = 'Move ' + (g.name || g.titleId) + ' to USB';
@@ -1947,17 +2888,114 @@
       state.moveGame = null;
     }
 
+    function modalSizeText(bytes) {
+      return shortSize(bytes).replace(/\.00 /, ' ');
+    }
+
+    function safeSpaceText(g) {
+      if (state.compressDestination === 'usb') {
+        const usb = selectedCompressUsb();
+        if (usb) return 'Writes to ' + usb.name + '; original is removed after verification';
+        return 'Writes to selected USB; original is removed after verification';
+      }
+      if (!g || g.sizePending || !Number(g.requiredBytes || 0)) {
+        return 'Keeps the original until verified; needs measured source-size free';
+      }
+      const extra = Number(g.extraBytes || 0);
+      const required = modalSizeText(g.requiredBytes || 0);
+      return extra > 0
+        ? 'Keeps the original until verified; needs ' + required + ' free (' + modalSizeText(extra) + ' more needed)'
+        : 'Keeps the original until verified; needs ' + required + ' free';
+    }
+
+    function destructiveSpaceText(g) {
+      if (state.compressDestination === 'usb') {
+        return 'Not available when writing to USB';
+      }
+      const minFree = Number((g && g.streamMinFreeBytes) || 1073741824);
+      if (!g || !g.canStreamDelete) return 'Not available for image-file compression';
+      const extra = Number(g.streamExtraBytes || 0);
+      const base = 'Deletes while writing; cannot cancel after start; needs ' +
+        modalSizeText(minFree) + ' free';
+      return extra > 0
+        ? base + ' (' + modalSizeText(extra) + ' more needed)'
+        : base;
+    }
+
+    function updateCompressModalSelection() {
+      const g = state.compressGame;
+      const movingToUsb = state.compressDestination === 'usb';
+      const destructiveUnavailable = movingToUsb || !(g && g.canStreamDelete);
+      if (destructiveUnavailable && state.compressDeletePolicy === 'stream') {
+        state.compressDeletePolicy = 'after';
+      }
+      $('format-safe-space').textContent = safeSpaceText(g);
+      $('format-stream-space').textContent = destructiveSpaceText(g);
+      $('compress-usb-panel').classList.toggle('hidden', !movingToUsb);
+      renderCompressUsbSelect();
+      document.querySelectorAll('[data-compress-format], [data-compress-profile], [data-compress-policy], [data-compress-destination]').forEach((button) => {
+        const format = button.getAttribute('data-compress-format');
+        const profile = button.getAttribute('data-compress-profile');
+        const policy = button.getAttribute('data-compress-policy');
+        const destination = button.getAttribute('data-compress-destination');
+        const selected = format
+          ? format === state.compressFormat
+          : (profile
+              ? profile === state.compressProfile
+              : (destination
+                  ? destination === state.compressDestination
+                  : policy === state.compressDeletePolicy));
+        const disabled = policy === 'stream' && destructiveUnavailable;
+        button.disabled = disabled;
+        button.classList.toggle('is-disabled', disabled);
+        button.classList.toggle('is-selected', selected && !disabled);
+        const chip = button.querySelector('.chip');
+        if (chip) {
+          chip.textContent = disabled ? 'Unavailable' : (selected ? 'Selected' : 'Select');
+          chip.classList.toggle('run', selected && !disabled);
+          chip.classList.toggle('bad', disabled);
+        }
+      });
+      $('format-start').disabled = !g || (movingToUsb && !state.compressUsbId);
+    }
+
     function showCompressFormatModal(g) {
       state.compressGame = g;
+      state.compressFormat = 'pfs';
+      state.compressProfile = 'space';
+      state.compressDeletePolicy = 'after';
+      state.compressDestination = 'keep';
+      state.compressUsbId = '';
+      state.compressUsbLoading = false;
       $('format-title').textContent = 'Compress ' + (g.name || g.titleId);
       $('format-pfs-name').textContent = 'pfs_image.dat';
       $('format-exfat-name').textContent = (g.titleId || '<TITLE_ID>') + '.exfat';
+      updateCompressModalSelection();
       $('format-modal').classList.remove('hidden');
+      state.compressUsbLoading = true;
+      updateCompressModalSelection();
+      api('/api/gc/usb')
+        .then((data) => {
+          state.usb = data.usb || [];
+          if (!selectedCompressUsb()) state.compressUsbId = state.usb[0] ? state.usb[0].id : '';
+        })
+        .catch(() => {
+          state.usb = [];
+          state.compressUsbId = '';
+        })
+        .finally(() => {
+          state.compressUsbLoading = false;
+          updateCompressModalSelection();
+        });
     }
 
     function closeCompressFormatModal() {
       $('format-modal').classList.add('hidden');
       state.compressGame = null;
+      state.compressDestination = 'keep';
+      state.compressUsbId = '';
+      state.compressUsbLoading = false;
+      updateCompressModalSelection();
     }
 
     async function startMove(url) {
@@ -1986,14 +3024,26 @@
       await startMove('/api/gc/move-to-internal?titleId=' + encodeURIComponent(g.titleId));
     }
 
-    async function startSelectedCompress(format) {
+    async function startSelectedCompress() {
       const g = state.compressGame;
+      const format = state.compressFormat;
+      const profile = state.compressProfile;
+      const deletePolicy = state.compressDeletePolicy;
+      const usbId = state.compressDestination === 'usb' ? state.compressUsbId : '';
+      if (deletePolicy === 'stream' && (!g || !g.canStreamDelete)) {
+        updateCompressModalSelection();
+        return;
+      }
+      if (state.compressDestination === 'usb' && !usbId) {
+        updateCompressModalSelection();
+        return;
+      }
       closeCompressFormatModal();
       if (!g || (format !== 'pfs' && format !== 'exfat')) return;
-      await startAction(g, false, 'compress', format);
+      await startAction(g, false, 'compress', format, deletePolicy, profile, usbId);
     }
 
-    async function startAction(g, confirmStream, overrideAction, compressFormat) {
+    async function startAction(g, confirmStream, overrideAction, compressFormat, deletePolicy, compressionProfile, usbId) {
       const action = overrideAction || actionFor(g);
       if (!action) return;
       if (action === 'compress' && !compressFormat) {
@@ -2001,27 +3051,46 @@
         return;
       }
       let url = '';
-      if (action === 'compress') {
-        url = '/api/gc/compress?titleId=' + encodeURIComponent(g.titleId) +
-          '&format=' + encodeURIComponent(compressFormat);
-      } else if (action === 'uncompress') {
-        url = '/api/gc/uncompress?titleId=' + encodeURIComponent(g.titleId);
-      } else {
-        url = '/api/gc/validate-repair?titleId=' + encodeURIComponent(g.titleId);
-      }
+	      if (action === 'compress') {
+	        url = '/api/gc/compress?titleId=' + encodeURIComponent(g.titleId) +
+	          '&format=' + encodeURIComponent(compressFormat);
+	        if (deletePolicy) url += '&deletePolicy=' + encodeURIComponent(deletePolicy);
+	        if (compressionProfile) url += '&profile=' + encodeURIComponent(compressionProfile);
+	        if (usbId) url += '&usbId=' + encodeURIComponent(usbId);
+	      } else if (action === 'uncompress') {
+	        url = '/api/gc/uncompress?titleId=' + encodeURIComponent(g.titleId);
+	      } else if (action === 'validate-only') {
+	        url = '/api/gc/validate-only?titleId=' + encodeURIComponent(g.titleId);
+	      } else {
+	        url = '/api/gc/validate-repair?titleId=' + encodeURIComponent(g.titleId);
+	      }
       if (confirmStream) url += '&confirmStream=1';
       try {
         await api(url, { method: 'POST' });
+        startPollBurst(6000);
         await refreshAll();
       } catch (err) {
         const data = err.data || {};
         if (data.lowSpace) {
+          const requested = deletePolicy || data.requestedDeletePolicy || '';
+          if (requested === 'stream') {
+            const minFree = modalSizeText(data.streamMinFreeBytes || 1073741824);
+            const extra = modalSizeText(data.streamExtraBytes || 0);
+            alert('Not enough free storage for destructive compression.\n\nDestructive deletes the source while writing and cannot be cancelled after it starts. It requires ' + minFree + ' free. Free ' + extra + ' more on the target storage.');
+            return;
+          }
+          if (requested === 'after') {
+            const required = modalSizeText(data.requiredBytes || 0);
+            const extra = modalSizeText(data.extraBytes || 0);
+            alert('Not enough free storage for safe compression.\n\nSafe keeps the original until the new file is complete and verified. It requires ' + required + ' free. Free ' + extra + ' more on the target storage.');
+            return;
+          }
           const extra = shortSize(data.extraBytes || 0);
           const base = 'Free ' + extra + ' more to keep the original untouched until the new file is complete.';
           if (data.canStreamDelete) {
             const msg = 'Not enough free storage for the safer path.\n\nDelete while processing can damage the original source if the operation stops.\n\n' + base;
             if (confirm(msg)) {
-              await startAction(g, true, overrideAction, compressFormat);
+              await startAction(g, true, overrideAction, compressFormat, deletePolicy, compressionProfile, usbId);
               return;
             }
           } else {
@@ -2039,7 +3108,9 @@
     }
 
     async function cancelActiveJob() {
-      await api('/api/gc/job/cancel', { method: 'POST' }).catch((err) => alert(err.message));
+      await api('/api/gc/job/cancel', { method: 'POST' })
+        .catch((err) => alert(err.message));
+      startPollBurst(8000);
       await refreshAll();
     }
 
@@ -2059,8 +3130,38 @@
       $('usb-close').addEventListener('click', closeUsbModal);
       $('format-close').addEventListener('click', closeCompressFormatModal);
       document.querySelectorAll('[data-compress-format]').forEach((button) => {
-        button.addEventListener('click', () => startSelectedCompress(button.getAttribute('data-compress-format')));
+        button.addEventListener('click', () => {
+          state.compressFormat = button.getAttribute('data-compress-format') || 'pfs';
+          updateCompressModalSelection();
+        });
       });
+      document.querySelectorAll('[data-compress-profile]').forEach((button) => {
+        button.addEventListener('click', () => {
+          state.compressProfile = button.getAttribute('data-compress-profile') || 'space';
+          updateCompressModalSelection();
+        });
+      });
+      document.querySelectorAll('[data-compress-policy]').forEach((button) => {
+        button.addEventListener('click', () => {
+          if (button.disabled) return;
+          state.compressDeletePolicy = button.getAttribute('data-compress-policy') || 'after';
+          updateCompressModalSelection();
+        });
+      });
+      document.querySelectorAll('[data-compress-destination]').forEach((button) => {
+        button.addEventListener('click', () => {
+          state.compressDestination = button.getAttribute('data-compress-destination') || 'keep';
+          if (state.compressDestination === 'usb' && !state.compressUsbId && state.usb[0]) {
+            state.compressUsbId = state.usb[0].id || '';
+          }
+          updateCompressModalSelection();
+        });
+      });
+      $('compress-usb-select').addEventListener('change', (event) => {
+        state.compressUsbId = event.target.value || '';
+        updateCompressModalSelection();
+      });
+      $('format-start').addEventListener('click', startSelectedCompress);
       document.querySelectorAll('.modal-backdrop').forEach((modal) => {
         modal.addEventListener('click', (event) => {
           if (event.target !== modal) return;
@@ -2076,6 +3177,9 @@
       });
       document.addEventListener('keydown', (event) => {
         if (event.key === 'Escape') closeSecondaryMenu();
+      });
+      window.addEventListener('resize', () => {
+        if (state.secondaryMenuFor) positionSecondaryMenu();
       });
 
       refreshAll();

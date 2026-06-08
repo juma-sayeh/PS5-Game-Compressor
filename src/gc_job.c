@@ -271,6 +271,18 @@ job_set_phase(const char *phase, long step, long count, const char *current) {
 }
 
 void
+job_clear_countable_progress(void) {
+  atomic_store(&g_job.total_bytes, 0);
+  atomic_store(&g_job.copied_bytes, 0);
+  atomic_store(&g_job.total_blocks, 0);
+  atomic_store(&g_job.phase_step, 0);
+  atomic_store(&g_job.phase_count, 0);
+  atomic_store(&g_job.total_files, 0);
+  atomic_store(&g_job.done_files, 0);
+  atomic_store(&g_job.failed_files, 0);
+}
+
+void
 job_set_target(const char *path) {
   pthread_mutex_lock(&g_job.lock);
   snprintf(g_job.target, sizeof(g_job.target), "%s", path ? path : "");
@@ -295,6 +307,8 @@ job_begin(const char *verb) {
   atomic_store(&g_job.compressed_blocks, 0);
   atomic_store(&g_job.skipped_zlib_blocks, 0);
   atomic_store(&g_job.total_blocks, 0);
+  atomic_store(&g_job.bad_blocks_found, 0);
+  atomic_store(&g_job.repaired_blocks, 0);
   atomic_store(&g_job.hash_checked_blocks, 0);
   atomic_store(&g_job.hash_matched_blocks, 0);
   atomic_store(&g_job.hash_mismatched_blocks, 0);
@@ -306,9 +320,18 @@ job_begin(const char *verb) {
   atomic_store(&g_job.repair_read_bytes, 0);
   atomic_store(&g_job.repair_written_bytes, 0);
   atomic_store(&g_job.repair_copy_bytes, 0);
+  atomic_store(&g_job.stream_min_free_bytes, 0);
+  atomic_store(&g_job.stream_budget_bytes, 0);
+  atomic_store(&g_job.stream_current_credit_bytes, 0);
+  atomic_store(&g_job.stream_deleted_bytes, 0);
+  atomic_store(&g_job.stream_reverse_temp_bytes, 0);
+  atomic_store(&g_job.stream_forward_files, 0);
+  atomic_store(&g_job.stream_reverse_files, 0);
   atomic_store(&g_job.total_files, 0);
   atomic_store(&g_job.done_files, 0);
   atomic_store(&g_job.failed_files, 0);
+  atomic_store(&g_job.destructive_stream_active, 0);
+  atomic_store(&g_job.rollback_requested, 0);
   snprintf(g_job.verb, sizeof(g_job.verb), "%s", verb ? verb : "");
   g_job.current[0] = 0;
   g_job.phase[0] = 0;

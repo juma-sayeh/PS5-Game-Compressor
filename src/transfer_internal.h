@@ -50,6 +50,8 @@ struct job_state {
   atomic_long     compressed_blocks;
   atomic_long     skipped_zlib_blocks;
   atomic_long     total_blocks;
+  atomic_long     bad_blocks_found;
+  atomic_long     repaired_blocks;
   atomic_long     hash_checked_blocks;
   atomic_long     hash_matched_blocks;
   atomic_long     hash_mismatched_blocks;
@@ -61,9 +63,18 @@ struct job_state {
   atomic_long     repair_read_bytes;
   atomic_long     repair_written_bytes;
   atomic_long     repair_copy_bytes;
+  atomic_long     stream_min_free_bytes;
+  atomic_long     stream_budget_bytes;
+  atomic_long     stream_current_credit_bytes;
+  atomic_long     stream_deleted_bytes;
+  atomic_long     stream_reverse_temp_bytes;
+  atomic_long     stream_forward_files;
+  atomic_long     stream_reverse_files;
   atomic_int      total_files;
   atomic_int      done_files;
   atomic_int      failed_files;
+  atomic_int      destructive_stream_active;
+  atomic_int      rollback_requested;
   char            current[512];
   char            phase[32];
   char            verb[16];
@@ -100,6 +111,7 @@ void du_walk(const char *path, du_state_t *du);
 void job_set_current(const char *path);
 void job_set_phase(const char *phase, long step, long count,
                    const char *current);
+void job_clear_countable_progress(void);
 void job_set_target(const char *path);
 int job_cancelled(void);
 int job_begin(const char *verb);
