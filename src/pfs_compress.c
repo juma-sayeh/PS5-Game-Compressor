@@ -910,6 +910,25 @@ pwrite_all_local(int fd, const void *data, size_t size, off_t offset) {
   return 0;
 }
 
+static int
+write_all_local(int fd, const void *data, size_t size) {
+  const unsigned char *p = data;
+  while(size > 0) {
+    ssize_t n = write(fd, p, size);
+    if(n < 0) {
+      if(errno == EINTR) continue;
+      return -1;
+    }
+    if(n == 0) {
+      errno = EIO;
+      return -1;
+    }
+    p += n;
+    size -= (size_t)n;
+  }
+  return 0;
+}
+
 static uint64_t monotonic_us(void);
 static void virtual_reader_close_file(virtual_reader_t *vr);
 static int virtual_reader_open_path(virtual_reader_t *vr, const char *path,
@@ -1335,17 +1354,6 @@ sync_completed_output_file(int fd, char *err, size_t err_size) {
     return -1;
   }
   return 0;
-}
-
-static int
-path_is_usb_mount_path(const char *path) {
-  const char *prefix = "/mnt/usb";
-  size_t prefix_len = strlen(prefix);
-  if(!path || strncmp(path, prefix, prefix_len)) return 0;
-  const char *p = path + prefix_len;
-  if(!isdigit((unsigned char)*p)) return 0;
-  while(isdigit((unsigned char)*p)) p++;
-  return *p == '/' || *p == 0;
 }
 
 static int
@@ -5541,6 +5549,144 @@ pfsc_window_write_task(pfsc_window_pool_t *pool, pfsc_window_task_t *task) {
   pthread_mutex_unlock(&pool->lock);
 }
 
+static int
+pfsc_window_write_lane_hashes_ordered(pfs_vhash_writer_t *vhash,
+                                      pfsc_window_lane_t *lane,
+                                      char *err, size_t err_size) {
+  if(!vhash || vhash->fd < 0 || !lane) {
+    errno = EINVAL;
+    set_err(err, err_size, "bad ordered validation hash write");
+    return -1;
+  }
+  uint64_t expected = PFS_VHASH_HEADER_SIZE +
+      lane->start_block * (uint64_t)PFS_VHASH_HASH_SIZE;
+  off_t pos = lseek(vhash->fd, 0, SEEK_CUR);
+  if(pos < 0) {
+    set_err(err, err_size, "seek validation hash: %s", strerror(errno));
+    return -1;
+  }
+  if((uint64_t)pos != expected) {
+    errno = EIO;
+    set_err(err, err_size,
+            "validation hash out of order: got %llu expected %llu",
+            (unsigned long long)(uint64_t)pos,
+            (unsigned long long)expected);
+    return -1;
+  }
+
+  size_t bytes = (size_t)lane->block_count * (size_t)PFS_VHASH_HASH_SIZE;
+  unsigned char *hashes = malloc(bytes);
+  if(!hashes) {
+    errno = ENOMEM;
+    set_err(err, err_size, "out of memory");
+    return -1;
+  }
+
+  long raw_blocks = 0;
+  long compressed_blocks = 0;
+  for(uint64_t i = 0; i < lane->block_count; i++) {
+    memcpy(hashes + i * PFS_VHASH_HASH_SIZE, lane->blocks[i].hash,
+           PFS_VHASH_HASH_SIZE);
+    if(lane->blocks[i].compressed) compressed_blocks++;
+    else raw_blocks++;
+  }
+
+  if(write_all_local(vhash->fd, hashes, bytes) != 0) {
+    set_err(err, err_size, "write validation hash: %s", strerror(errno));
+    free(hashes);
+    return -1;
+  }
+  free(hashes);
+
+  if(raw_blocks) atomic_fetch_add(&g_job.raw_blocks, raw_blocks);
+  if(compressed_blocks) {
+    atomic_fetch_add(&g_job.compressed_blocks, compressed_blocks);
+  }
+  return 0;
+}
+
+static int
+pfsc_window_commit_lane_ordered(pfsc_window_pool_t *pool,
+                                const pfsc_window_t *window,
+                                pfsc_window_lane_t *lane, int lane_index,
+                                uint64_t *data_pos, uint64_t *offsets,
+                                char *err, size_t err_size) {
+  if(job_cancelled()) {
+    errno = EINTR;
+    set_err(err, err_size, "cancelled");
+    return -1;
+  }
+
+  pfsc_window_pack_lane(lane);
+  lane->packed = 1;
+  lane->output_offset = *data_pos;
+
+  uint64_t packed_sum = 0;
+  for(uint64_t i = 0; i < lane->block_count; i++) {
+    if(!lane->blocks[i].ready || lane->blocks[i].stored_len == 0 ||
+       lane->blocks[i].stored_len > (uint32_t)PFS_BLOCK_SIZE) {
+      errno = EIO;
+      set_err(err, err_size, "bad ordered window block state");
+      return -1;
+    }
+    packed_sum += lane->blocks[i].stored_len;
+  }
+  if(packed_sum != lane->packed_len) {
+    errno = EIO;
+    set_err(err, err_size,
+            "ordered window packed size mismatch: got %llu expected %llu",
+            (unsigned long long)lane->packed_len,
+            (unsigned long long)packed_sum);
+    return -1;
+  }
+
+  uint64_t expected = pool->file_start + lane->output_offset;
+  off_t pos = lseek(pool->fd, 0, SEEK_CUR);
+  if(pos < 0) {
+    set_err(err, err_size, "seek compressed payload: %s", strerror(errno));
+    return -1;
+  }
+  if((uint64_t)pos != expected) {
+    errno = EIO;
+    set_err(err, err_size,
+            "compressed payload out of order: got %llu expected %llu",
+            (unsigned long long)(uint64_t)pos,
+            (unsigned long long)expected);
+    return -1;
+  }
+
+  unsigned char *payload = lane->write_data ? lane->write_data : lane->out;
+  PFSC_WINDOW_LOG("pfsc window commit index=%llu offset=%llu bytes=%llu lane=%d",
+                  (unsigned long long)window->index,
+                  (unsigned long long)lane->output_offset,
+                  (unsigned long long)lane->packed_len, lane_index);
+  if(write_all_local(pool->fd, payload, (size_t)lane->packed_len) != 0) {
+    set_err(err, err_size, "write compressed payload: %s", strerror(errno));
+    return -1;
+  }
+  if(pfsc_window_write_lane_hashes_ordered(pool->vhash, lane,
+                                           err, err_size) != 0) {
+    return -1;
+  }
+
+  for(uint64_t i = 0; i < lane->block_count; i++) {
+    uint64_t block = lane->start_block + i;
+    *data_pos += lane->blocks[i].stored_len;
+    offsets[block + 1ULL] = *data_pos;
+    lane->blocks[i].written = 1;
+  }
+
+  uint64_t copied = (lane->start_block + lane->block_count) * PFS_BLOCK_SIZE;
+  if(copied > pool->nested->image_size) copied = pool->nested->image_size;
+  job_store_long_max(&g_job.copied_bytes, copied);
+  job_store_int_max(&g_job.done_files, lane->start_block + lane->block_count);
+  uint64_t output_end = lane->output_offset + lane->packed_len;
+  job_store_long_max(&g_job.compressed_output_bytes,
+                     output_end > pool->header_size ?
+                         output_end - pool->header_size : 0);
+  return 0;
+}
+
 static void *
 pfsc_window_worker_main(void *arg) {
   pfsc_window_pool_t *pool = arg;
@@ -5813,58 +5959,37 @@ pfsc_window_write_window(pfsc_window_pool_t *pool, pfsc_window_t *window,
   uint64_t wait_us = 0;
   int next_lane = 0;
   pfsc_window_pool_set_phase(pool, PFSC_WINDOW_PHASE_WRITE,
-                             0, comp_permits, tuning->write_permits);
+                             0, comp_permits, 0);
 
   pthread_mutex_lock(&pool->lock);
-  while(next_lane < window->lane_count ||
-        window->write_tasks_remaining > 0 ||
-        pool->running_write > 0) {
+  while(next_lane < window->lane_count) {
     if(pfsc_window_pool_check_error_locked(pool, err, err_size) != 0) {
       pthread_mutex_unlock(&pool->lock);
       return -1;
     }
-    if(next_lane < window->lane_count) {
-      pfsc_window_lane_t *lane = &window->lanes[next_lane];
-      if(pfsc_window_lane_ready_locked(lane)) {
-        pthread_mutex_unlock(&pool->lock);
-        pfsc_window_pack_lane(lane);
-        pthread_mutex_lock(&pool->lock);
-        if(pfsc_window_pool_check_error_locked(pool, err, err_size) != 0) {
-          pthread_mutex_unlock(&pool->lock);
-          return -1;
-        }
-        lane->packed = 1;
-        lane->output_offset = *data_pos;
-        for(uint64_t i = 0; i < lane->block_count; i++) {
-          uint64_t block = lane->start_block + i;
-          *data_pos += lane->blocks[i].stored_len;
-          offsets[block + 1ULL] = *data_pos;
-        }
-        if(pfsc_window_pool_enqueue_locked(pool, PFSC_WINDOW_TASK_WRITE,
-                                           window, next_lane, 0, 0,
-                                           lane->output_offset) != 0) {
-          pthread_mutex_unlock(&pool->lock);
-          set_err(err, err_size, "out of memory");
-          return -1;
-        }
-        next_lane++;
-        continue;
+    pfsc_window_lane_t *lane = &window->lanes[next_lane];
+    if(pfsc_window_lane_ready_locked(lane)) {
+      pthread_mutex_unlock(&pool->lock);
+      int commit_rc = pfsc_window_commit_lane_ordered(
+          pool, window, lane, next_lane, data_pos, offsets, err, err_size);
+      int saved_errno = errno ? errno : EIO;
+      if(commit_rc != 0) {
+        pfsc_window_pool_set_error(pool, saved_errno,
+                                   err && err[0] ? err : strerror(saved_errno));
+        errno = saved_errno;
+        return -1;
       }
+      pthread_mutex_lock(&pool->lock);
+      lane->write_done = 1;
+      pthread_cond_broadcast(&pool->cond);
+      next_lane++;
+      continue;
     }
-    if(next_lane >= window->lane_count &&
-       window->write_tasks_remaining == 0 &&
-       pool->running_write == 0) {
-      break;
-    }
-    if(next_lane < window->lane_count) {
-      uint64_t wait_start = monotonic_us();
-      pthread_cond_wait(&pool->cond, &pool->lock);
-      uint64_t now = monotonic_us();
-      if(now > wait_start) wait_us += now - wait_start;
-      job_add_wait_us(&g_job.writer_wait_us, wait_start);
-    } else {
-      pthread_cond_wait(&pool->cond, &pool->lock);
-    }
+    uint64_t wait_start = monotonic_us();
+    pthread_cond_wait(&pool->cond, &pool->lock);
+    uint64_t now = monotonic_us();
+    if(now > wait_start) wait_us += now - wait_start;
+    job_add_wait_us(&g_job.writer_wait_us, wait_start);
   }
   if(pfsc_window_pool_check_error_locked(pool, err, err_size) != 0) {
     pthread_mutex_unlock(&pool->lock);
@@ -5873,7 +5998,7 @@ pfsc_window_write_window(pfsc_window_pool_t *pool, pfsc_window_t *window,
   pthread_mutex_unlock(&pool->lock);
 
   uint64_t elapsed = monotonic_us() - start;
-  PFSC_WINDOW_LOG("pfsc window write index=%llu lanes=%d writePermits=%d compPermits=%d waitUs=%llu elapsedUs=%llu",
+  PFSC_WINDOW_LOG("pfsc window write index=%llu lanes=%d writePermits=0 orderedCommit=1 requestedWritePermits=%d compPermits=%d waitUs=%llu elapsedUs=%llu",
                   (unsigned long long)window->index, window->lane_count,
                   tuning->write_permits, comp_permits,
                   (unsigned long long)wait_us, (unsigned long long)elapsed);
@@ -5953,6 +6078,14 @@ compress_nested_to_pfsc_windowed(int fd, uint64_t file_start,
     goto done;
   }
   vhash_open = 1;
+  if(lseek(fd, (off_t)(file_start + header_size), SEEK_SET) < 0) {
+    set_err(err, err_size, "seek compressed payload: %s", strerror(errno));
+    goto done;
+  }
+  if(lseek(vhash.fd, (off_t)PFS_VHASH_HEADER_SIZE, SEEK_SET) < 0) {
+    set_err(err, err_size, "seek validation hash: %s", strerror(errno));
+    goto done;
+  }
 
   offsets[0] = header_size;
   atomic_store(&g_job.total_bytes,
@@ -5983,6 +6116,7 @@ compress_nested_to_pfsc_windowed(int fd, uint64_t file_start,
                   comp_config.zlib_level, comp_config.threshold_gain,
                   comp_config.fast_deflate,
                   comp_config.raw_only, comp_config.entropy_skip);
+  PFSC_WINDOW_LOG("pfsc window mode=ordered-commit");
 
   uint64_t next_block = 0;
   uint64_t next_window_index = 0;
@@ -6147,8 +6281,7 @@ compress_nested_to_pfsc(int fd, uint64_t file_start, pfs_layout_t *nested,
   if(delete_stream && worker_count > PFS_STREAM_COMPRESS_WORKERS) {
     worker_count = PFS_STREAM_COMPRESS_WORKERS;
   }
-  int usb_output = path_is_usb_mount_path(tmp_path);
-  if(!delete_stream && !usb_output) {
+  if(!delete_stream) {
     int window_rc = compress_nested_to_pfsc_windowed(
         fd, file_start, nested, requested_workers, nested_name, nested_type,
         vhash_path, stored_size, compression_profile, err, err_size);
@@ -6161,9 +6294,6 @@ compress_nested_to_pfsc(int fd, uint64_t file_start, pfs_layout_t *nested,
     }
     if(err && err_size) err[0] = 0;
     PFSC_WINDOW_LOG("pfsc window falling back to legacy compressor");
-  } else if(!delete_stream && usb_output) {
-    PFSC_WINDOW_LOG("pfsc window disabled for USB output path=%s",
-                    tmp_path ? tmp_path : "");
   }
   pfsc_output_buffer_init(&outbuf);
   virtual_reader_init(&vr);
