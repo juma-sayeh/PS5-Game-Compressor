@@ -1324,6 +1324,31 @@ destructive_stream_fsync_parent_best_effort(const char *path) {
 }
 
 static int
+sync_completed_output_file(int fd, char *err, size_t err_size) {
+  if(fd < 0) {
+    errno = EINVAL;
+    set_err(err, err_size, "sync output: bad file descriptor");
+    return -1;
+  }
+  if(fsync(fd) != 0) {
+    set_err(err, err_size, "sync output: %s", strerror(errno));
+    return -1;
+  }
+  return 0;
+}
+
+static int
+path_is_usb_mount_path(const char *path) {
+  const char *prefix = "/mnt/usb";
+  size_t prefix_len = strlen(prefix);
+  if(!path || strncmp(path, prefix, prefix_len)) return 0;
+  const char *p = path + prefix_len;
+  if(!isdigit((unsigned char)*p)) return 0;
+  while(isdigit((unsigned char)*p)) p++;
+  return *p == '/' || *p == 0;
+}
+
+static int
 destructive_stream_stat_size(const char *path, int *exists,
                              uint64_t *size_out, char *err,
                              size_t err_size) {
@@ -6122,7 +6147,8 @@ compress_nested_to_pfsc(int fd, uint64_t file_start, pfs_layout_t *nested,
   if(delete_stream && worker_count > PFS_STREAM_COMPRESS_WORKERS) {
     worker_count = PFS_STREAM_COMPRESS_WORKERS;
   }
-  if(!delete_stream) {
+  int usb_output = path_is_usb_mount_path(tmp_path);
+  if(!delete_stream && !usb_output) {
     int window_rc = compress_nested_to_pfsc_windowed(
         fd, file_start, nested, requested_workers, nested_name, nested_type,
         vhash_path, stored_size, compression_profile, err, err_size);
@@ -6135,6 +6161,9 @@ compress_nested_to_pfsc(int fd, uint64_t file_start, pfs_layout_t *nested,
     }
     if(err && err_size) err[0] = 0;
     PFSC_WINDOW_LOG("pfsc window falling back to legacy compressor");
+  } else if(!delete_stream && usb_output) {
+    PFSC_WINDOW_LOG("pfsc window disabled for USB output path=%s",
+                    tmp_path ? tmp_path : "");
   }
   pfsc_output_buffer_init(&outbuf);
   virtual_reader_init(&vr);
@@ -7137,7 +7166,14 @@ pfs_compress_probed_to_ffpfsc_opts(pfs_app_info_t *info, int overwrite,
                               info->nested_name, err, err_size) != 0) {
     goto done;
   }
-  close(fd);
+  if(sync_completed_output_file(fd, err, err_size) != 0) {
+    goto done;
+  }
+  if(close(fd) != 0) {
+    set_err(err, err_size, "close output: %s", strerror(errno));
+    fd = -1;
+    goto done;
+  }
   fd = -1;
 
   if(info->source_type == PFS_COMPRESS_SOURCE_APP &&
@@ -7160,12 +7196,14 @@ pfs_compress_probed_to_ffpfsc_opts(pfs_app_info_t *info, int overwrite,
     set_err(err, err_size, "rename output: %s", strerror(errno));
     goto done;
   }
+  destructive_stream_fsync_parent_best_effort(info->output_path);
   info->output_exists = 1;
   if(rename(vhash_tmp_path, vhash_output_path) != 0) {
     set_err(err, err_size, "rename validation hash: %s", strerror(errno));
     unlink(vhash_output_path);
     goto done;
   }
+  destructive_stream_fsync_parent_best_effort(vhash_output_path);
   if(destructive_stream) {
     stream_ctx.output_finalized = 1;
     if(destructive_stream_write_header(&stream_ctx, err, err_size) != 0 ||
@@ -7301,7 +7339,14 @@ pfs_compress_resume_stream_journal_profile(const char *journal_path,
                                   err_size) != 0) {
         goto done;
       }
-      close(fd);
+      if(sync_completed_output_file(fd, err, err_size) != 0) {
+        goto done;
+      }
+      if(close(fd) != 0) {
+        set_err(err, err_size, "close output: %s", strerror(errno));
+        fd = -1;
+        goto done;
+      }
       fd = -1;
       if(rename(stream_ctx.tmp_path, stream_ctx.output_path) != 0) {
         int rename_errno = errno;
@@ -7312,6 +7357,7 @@ pfs_compress_resume_stream_journal_profile(const char *journal_path,
           goto done;
         }
       }
+      destructive_stream_fsync_parent_best_effort(stream_ctx.output_path);
     } else if(access(stream_ctx.output_path, F_OK) != 0) {
       set_err(err, err_size, "stream final output is missing");
       goto done;
@@ -7325,6 +7371,7 @@ pfs_compress_resume_stream_journal_profile(const char *journal_path,
         goto done;
       }
     }
+    destructive_stream_fsync_parent_best_effort(stream_ctx.vhash_output_path);
     stream_ctx.output_finalized = 1;
     if(destructive_stream_write_header(&stream_ctx, err, err_size) != 0 ||
        destructive_stream_sync(&stream_ctx, err, err_size) != 0) {

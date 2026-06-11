@@ -88,6 +88,7 @@ typedef enum gc_action {
   GC_ACTION_REFRESH_MOUNT,
   GC_ACTION_DELETE_GAME_DATA,
   GC_ACTION_READ_SPEED_TEST,
+  GC_ACTION_READ_EOF_TEST,
 } gc_action_t;
 
 typedef enum gc_op_status {
@@ -152,13 +153,29 @@ typedef struct gc_operation {
   char stream_order[24];
   uint64_t stream_budget_bytes;
   char target_root[1024];
+  char preserve_original[16];
+  char preserved_original_path[1024];
+  char preserved_hidden_path[1024];
   char phase[32];
   char result[32];
   char error[256];
   char repair_summary[1024];
+  char read_root[1024];
+  char read_storage[32];
+  char read_first_error_path[1024];
+  char read_first_error[256];
   uint64_t compression_source_size;
   uint64_t compressed_size;
   uint64_t saved_bytes;
+  uint64_t read_bytes;
+  uint64_t read_files;
+  uint64_t read_dirs;
+  uint64_t read_elapsed_ms;
+  uint64_t read_avg_bps;
+  uint64_t read_min_bps;
+  uint64_t read_max_bps;
+  uint64_t read_errors;
+  uint64_t read_skipped;
   uint64_t repaired_blocks;
   uint64_t bad_blocks_found;
   uint64_t hash_checked_blocks;
@@ -213,10 +230,26 @@ typedef struct gc_history_recovery_event {
   char stream_order[24];
   uint64_t stream_budget_bytes;
   char target_root[1024];
+  char preserve_original[16];
+  char preserved_original_path[1024];
+  char preserved_hidden_path[1024];
   char repair_summary[1024];
+  char read_root[1024];
+  char read_storage[32];
+  char read_first_error_path[1024];
+  char read_first_error[256];
   uint64_t compression_source_size;
   uint64_t compressed_size;
   uint64_t saved_bytes;
+  uint64_t read_bytes;
+  uint64_t read_files;
+  uint64_t read_dirs;
+  uint64_t read_elapsed_ms;
+  uint64_t read_avg_bps;
+  uint64_t read_min_bps;
+  uint64_t read_max_bps;
+  uint64_t read_errors;
+  uint64_t read_skipped;
   time_t created_at;
   time_t started_at;
   time_t ended_at;
@@ -289,6 +322,7 @@ action_name(gc_action_t action) {
   if(action == GC_ACTION_REFRESH_MOUNT) return "refresh-mount";
   if(action == GC_ACTION_DELETE_GAME_DATA) return "delete-game-data";
   if(action == GC_ACTION_READ_SPEED_TEST) return "read-speed-test";
+  if(action == GC_ACTION_READ_EOF_TEST) return "read-eof-test";
   return "unknown";
 }
 
@@ -316,6 +350,9 @@ action_from_name(const char *name) {
   }
   if(!strcmp(name ? name : "", "read-speed-test")) {
     return GC_ACTION_READ_SPEED_TEST;
+  }
+  if(!strcmp(name ? name : "", "read-eof-test")) {
+    return GC_ACTION_READ_EOF_TEST;
   }
   return (gc_action_t)0;
 }
@@ -2091,7 +2128,7 @@ scan_roots_add_parent(gc_scan_roots_t *roots, const char *path) {
 static void
 scan_roots_add_history(gc_scan_roots_t *roots) {
   FILE *f = fopen(GC_HISTORY_LOG, "r");
-  char line[4096];
+  char line[16384];
   if(!f) return;
   while(fgets(line, sizeof(line), f)) {
     char source_path[1024] = {0};
@@ -2540,26 +2577,54 @@ append_history_log(const gc_operation_t *op) {
      json_string(&b, compression_profile_or_default(op->compression_profile)) == 0 &&
      json_append(&b, ",\"streamOrder\":") == 0 &&
      json_string(&b, op->stream_order[0] ? op->stream_order : "budgeted-gain") == 0 &&
-     json_append(&b, ",\"targetRoot\":") == 0 &&
-     json_string(&b, op->target_root) == 0 &&
-     json_append(&b, ",\"repairSummary\":") == 0 &&
-     json_string(&b, op->repair_summary) == 0 &&
-	     json_appendf(&b,
-		                  ",\"streamBudgetBytes\":%llu,"
-		                  "\"compressionSourceSize\":%llu,"
-		                  "\"compressedSize\":%llu,"
-		                  "\"savedBytes\":%llu,"
-		                  "\"createdAt\":%ld,\"startedAt\":%ld,\"endedAt\":%ld,"
-		                  "\"repairedBlocks\":%llu,\"badBlocksFound\":%llu,"
-		                  "\"hashCheckedBlocks\":%llu,"
+	     json_append(&b, ",\"targetRoot\":") == 0 &&
+	     json_string(&b, op->target_root) == 0 &&
+	     json_append(&b, ",\"preserveOriginal\":") == 0 &&
+	     json_string(&b, op->preserve_original) == 0 &&
+	     json_append(&b, ",\"preservedOriginalPath\":") == 0 &&
+	     json_string(&b, op->preserved_original_path) == 0 &&
+	     json_append(&b, ",\"preservedHiddenPath\":") == 0 &&
+	     json_string(&b, op->preserved_hidden_path) == 0 &&
+	     json_append(&b, ",\"repairSummary\":") == 0 &&
+	     json_string(&b, op->repair_summary) == 0 &&
+	     json_append(&b, ",\"readRoot\":") == 0 &&
+	     json_string(&b, op->read_root) == 0 &&
+	     json_append(&b, ",\"readStorage\":") == 0 &&
+	     json_string(&b, op->read_storage) == 0 &&
+	     json_append(&b, ",\"readFirstErrorPath\":") == 0 &&
+	     json_string(&b, op->read_first_error_path) == 0 &&
+	     json_append(&b, ",\"readFirstError\":") == 0 &&
+	     json_string(&b, op->read_first_error) == 0 &&
+		     json_appendf(&b,
+			                  ",\"streamBudgetBytes\":%llu,"
+			                  "\"compressionSourceSize\":%llu,"
+			                  "\"compressedSize\":%llu,"
+			                  "\"savedBytes\":%llu,"
+			                  "\"readBytes\":%llu,\"readFiles\":%llu,"
+			                  "\"readDirs\":%llu,\"readElapsedMs\":%llu,"
+			                  "\"readAvgBps\":%llu,\"readMinBps\":%llu,"
+			                  "\"readMaxBps\":%llu,\"readErrors\":%llu,"
+			                  "\"readSkipped\":%llu,"
+			                  "\"createdAt\":%ld,\"startedAt\":%ld,\"endedAt\":%ld,"
+			                  "\"repairedBlocks\":%llu,\"badBlocksFound\":%llu,"
+			                  "\"hashCheckedBlocks\":%llu,"
 		                  "\"hashMismatchedBlocks\":%llu,"
 		                  "\"softwareComparedBlocks\":%llu}\n",
 		                  (unsigned long long)op->stream_budget_bytes,
-		                  (unsigned long long)op->compression_source_size,
-		                  (unsigned long long)op->compressed_size,
-		                  (unsigned long long)op->saved_bytes,
-		                  (long)op->created_at, (long)op->started_at,
-	                  (long)op->ended_at,
+			                  (unsigned long long)op->compression_source_size,
+			                  (unsigned long long)op->compressed_size,
+			                  (unsigned long long)op->saved_bytes,
+			                  (unsigned long long)op->read_bytes,
+			                  (unsigned long long)op->read_files,
+			                  (unsigned long long)op->read_dirs,
+			                  (unsigned long long)op->read_elapsed_ms,
+			                  (unsigned long long)op->read_avg_bps,
+			                  (unsigned long long)op->read_min_bps,
+			                  (unsigned long long)op->read_max_bps,
+			                  (unsigned long long)op->read_errors,
+			                  (unsigned long long)op->read_skipped,
+			                  (long)op->created_at, (long)op->started_at,
+		                  (long)op->ended_at,
 	                  (unsigned long long)op->repaired_blocks,
 	                  (unsigned long long)bad_blocks_found,
 	                  (unsigned long long)op->hash_checked_blocks,
@@ -3300,7 +3365,8 @@ recovery_queued_event_valid(const gc_history_recovery_event_t *ev,
     }
     return 1;
   }
-  if(!strcmp(ev->action, "read-speed-test")) {
+  if(!strcmp(ev->action, "read-speed-test") ||
+     !strcmp(ev->action, "read-eof-test")) {
     source = ev->output_path[0] ? ev->output_path : ev->source_path;
     if(!source || !source[0] || stat(source, &st) != 0 ||
        !S_ISDIR(st.st_mode)) {
@@ -3361,14 +3427,40 @@ recovery_event_from_history_line(const char *line,
   out->stream_budget_bytes =
       json_find_u64_value(line, "streamBudgetBytes", 0);
   json_find_string_value(line, "targetRoot", out->target_root,
-                         sizeof(out->target_root));
-	  json_find_string_value(line, "repairSummary", out->repair_summary,
-	                         sizeof(out->repair_summary));
-	  out->compression_source_size =
-	      json_find_u64_value(line, "compressionSourceSize", 0);
-	  out->compressed_size = json_find_u64_value(line, "compressedSize", 0);
-	  out->saved_bytes = json_find_u64_value(line, "savedBytes", 0);
-	  out->created_at = (time_t)json_find_u64_value(line, "createdAt", 0);
+	                         sizeof(out->target_root));
+  json_find_string_value(line, "preserveOriginal", out->preserve_original,
+                         sizeof(out->preserve_original));
+  json_find_string_value(line, "preservedOriginalPath",
+                         out->preserved_original_path,
+                         sizeof(out->preserved_original_path));
+  json_find_string_value(line, "preservedHiddenPath",
+                         out->preserved_hidden_path,
+                         sizeof(out->preserved_hidden_path));
+		  json_find_string_value(line, "repairSummary", out->repair_summary,
+		                         sizeof(out->repair_summary));
+  json_find_string_value(line, "readRoot", out->read_root,
+                         sizeof(out->read_root));
+  json_find_string_value(line, "readStorage", out->read_storage,
+                         sizeof(out->read_storage));
+  json_find_string_value(line, "readFirstErrorPath",
+                         out->read_first_error_path,
+                         sizeof(out->read_first_error_path));
+  json_find_string_value(line, "readFirstError", out->read_first_error,
+                         sizeof(out->read_first_error));
+		  out->compression_source_size =
+		      json_find_u64_value(line, "compressionSourceSize", 0);
+		  out->compressed_size = json_find_u64_value(line, "compressedSize", 0);
+		  out->saved_bytes = json_find_u64_value(line, "savedBytes", 0);
+  out->read_bytes = json_find_u64_value(line, "readBytes", 0);
+  out->read_files = json_find_u64_value(line, "readFiles", 0);
+  out->read_dirs = json_find_u64_value(line, "readDirs", 0);
+  out->read_elapsed_ms = json_find_u64_value(line, "readElapsedMs", 0);
+  out->read_avg_bps = json_find_u64_value(line, "readAvgBps", 0);
+  out->read_min_bps = json_find_u64_value(line, "readMinBps", 0);
+  out->read_max_bps = json_find_u64_value(line, "readMaxBps", 0);
+  out->read_errors = json_find_u64_value(line, "readErrors", 0);
+  out->read_skipped = json_find_u64_value(line, "readSkipped", 0);
+		  out->created_at = (time_t)json_find_u64_value(line, "createdAt", 0);
   out->started_at = (time_t)json_find_u64_value(line, "startedAt", 0);
   out->ended_at = (time_t)json_find_u64_value(line, "endedAt", 0);
   if(!valid_title_id(out->title_id) || !out->action[0] ||
@@ -3421,13 +3513,34 @@ recovery_append_terminal_history(const gc_history_recovery_event_t *ev,
     snprintf(op.stream_order, sizeof(op.stream_order), "%s",
              ev->stream_order[0] ? ev->stream_order : "budgeted-gain");
     op.stream_budget_bytes = ev->stream_budget_bytes;
-    snprintf(op.target_root, sizeof(op.target_root), "%s", ev->target_root);
-	    snprintf(op.repair_summary, sizeof(op.repair_summary), "%s",
-	             ev->repair_summary);
-	    op.compression_source_size = ev->compression_source_size;
-	    op.compressed_size = ev->compressed_size;
-	    op.saved_bytes = ev->saved_bytes;
-	  }
+	    snprintf(op.target_root, sizeof(op.target_root), "%s", ev->target_root);
+    snprintf(op.preserve_original, sizeof(op.preserve_original), "%s",
+             ev->preserve_original);
+    snprintf(op.preserved_original_path, sizeof(op.preserved_original_path),
+             "%s", ev->preserved_original_path);
+    snprintf(op.preserved_hidden_path, sizeof(op.preserved_hidden_path), "%s",
+             ev->preserved_hidden_path);
+		    snprintf(op.repair_summary, sizeof(op.repair_summary), "%s",
+		             ev->repair_summary);
+    snprintf(op.read_root, sizeof(op.read_root), "%s", ev->read_root);
+    snprintf(op.read_storage, sizeof(op.read_storage), "%s", ev->read_storage);
+    snprintf(op.read_first_error_path, sizeof(op.read_first_error_path), "%s",
+             ev->read_first_error_path);
+    snprintf(op.read_first_error, sizeof(op.read_first_error), "%s",
+             ev->read_first_error);
+		    op.compression_source_size = ev->compression_source_size;
+		    op.compressed_size = ev->compressed_size;
+		    op.saved_bytes = ev->saved_bytes;
+    op.read_bytes = ev->read_bytes;
+    op.read_files = ev->read_files;
+    op.read_dirs = ev->read_dirs;
+    op.read_elapsed_ms = ev->read_elapsed_ms;
+    op.read_avg_bps = ev->read_avg_bps;
+    op.read_min_bps = ev->read_min_bps;
+    op.read_max_bps = ev->read_max_bps;
+    op.read_errors = ev->read_errors;
+    op.read_skipped = ev->read_skipped;
+		  }
   snprintf(op.result, sizeof(op.result), "%s", result ? result : "");
   snprintf(op.error, sizeof(op.error), "%s", error ? error : "");
   append_history_log(&op);
@@ -3462,13 +3575,34 @@ recovery_append_phase_history(const gc_history_recovery_event_t *ev,
   snprintf(op.stream_order, sizeof(op.stream_order), "%s",
            ev->stream_order[0] ? ev->stream_order : "budgeted-gain");
   op.stream_budget_bytes = ev->stream_budget_bytes;
-  snprintf(op.target_root, sizeof(op.target_root), "%s", ev->target_root);
-	  snprintf(op.repair_summary, sizeof(op.repair_summary), "%s",
-	           ev->repair_summary);
-	  op.compression_source_size = ev->compression_source_size;
-	  op.compressed_size = ev->compressed_size;
-	  op.saved_bytes = ev->saved_bytes;
-	  snprintf(op.phase, sizeof(op.phase), "%s", phase);
+	  snprintf(op.target_root, sizeof(op.target_root), "%s", ev->target_root);
+  snprintf(op.preserve_original, sizeof(op.preserve_original), "%s",
+           ev->preserve_original);
+  snprintf(op.preserved_original_path, sizeof(op.preserved_original_path), "%s",
+           ev->preserved_original_path);
+  snprintf(op.preserved_hidden_path, sizeof(op.preserved_hidden_path), "%s",
+           ev->preserved_hidden_path);
+		  snprintf(op.repair_summary, sizeof(op.repair_summary), "%s",
+		           ev->repair_summary);
+  snprintf(op.read_root, sizeof(op.read_root), "%s", ev->read_root);
+  snprintf(op.read_storage, sizeof(op.read_storage), "%s", ev->read_storage);
+  snprintf(op.read_first_error_path, sizeof(op.read_first_error_path), "%s",
+           ev->read_first_error_path);
+  snprintf(op.read_first_error, sizeof(op.read_first_error), "%s",
+           ev->read_first_error);
+		  op.compression_source_size = ev->compression_source_size;
+		  op.compressed_size = ev->compressed_size;
+		  op.saved_bytes = ev->saved_bytes;
+  op.read_bytes = ev->read_bytes;
+  op.read_files = ev->read_files;
+  op.read_dirs = ev->read_dirs;
+  op.read_elapsed_ms = ev->read_elapsed_ms;
+  op.read_avg_bps = ev->read_avg_bps;
+  op.read_min_bps = ev->read_min_bps;
+  op.read_max_bps = ev->read_max_bps;
+  op.read_errors = ev->read_errors;
+  op.read_skipped = ev->read_skipped;
+		  snprintf(op.phase, sizeof(op.phase), "%s", phase);
   snprintf(op.result, sizeof(op.result), "%s", phase);
   op.created_at = ev->created_at ? ev->created_at : time(NULL);
   op.started_at = ev->started_at ? ev->started_at : op.created_at;
@@ -3804,15 +3938,36 @@ recovery_restore_queued_op(const gc_history_recovery_event_t *ev) {
            ev->format[0] ? ev->format : "pfs");
   snprintf(op->delete_policy, sizeof(op->delete_policy), "%s",
            ev->delete_policy[0] ? ev->delete_policy : "after");
-  snprintf(op->compression_profile, sizeof(op->compression_profile), "%s",
-           compression_profile_or_default(ev->compression_profile));
-	  snprintf(op->target_root, sizeof(op->target_root), "%s", ev->target_root);
-	  snprintf(op->repair_summary, sizeof(op->repair_summary), "%s",
-	           ev->repair_summary);
-	  op->compression_source_size = ev->compression_source_size;
-	  op->compressed_size = ev->compressed_size;
-	  op->saved_bytes = ev->saved_bytes;
-	  if(action == GC_ACTION_VALIDATE_REPAIR ||
+	  snprintf(op->compression_profile, sizeof(op->compression_profile), "%s",
+	           compression_profile_or_default(ev->compression_profile));
+		  snprintf(op->target_root, sizeof(op->target_root), "%s", ev->target_root);
+  snprintf(op->preserve_original, sizeof(op->preserve_original), "%s",
+           ev->preserve_original);
+  snprintf(op->preserved_original_path, sizeof(op->preserved_original_path), "%s",
+           ev->preserved_original_path);
+  snprintf(op->preserved_hidden_path, sizeof(op->preserved_hidden_path), "%s",
+           ev->preserved_hidden_path);
+		  snprintf(op->repair_summary, sizeof(op->repair_summary), "%s",
+		           ev->repair_summary);
+  snprintf(op->read_root, sizeof(op->read_root), "%s", ev->read_root);
+  snprintf(op->read_storage, sizeof(op->read_storage), "%s", ev->read_storage);
+  snprintf(op->read_first_error_path, sizeof(op->read_first_error_path), "%s",
+           ev->read_first_error_path);
+  snprintf(op->read_first_error, sizeof(op->read_first_error), "%s",
+           ev->read_first_error);
+		  op->compression_source_size = ev->compression_source_size;
+		  op->compressed_size = ev->compressed_size;
+		  op->saved_bytes = ev->saved_bytes;
+  op->read_bytes = ev->read_bytes;
+  op->read_files = ev->read_files;
+  op->read_dirs = ev->read_dirs;
+  op->read_elapsed_ms = ev->read_elapsed_ms;
+  op->read_avg_bps = ev->read_avg_bps;
+  op->read_min_bps = ev->read_min_bps;
+  op->read_max_bps = ev->read_max_bps;
+  op->read_errors = ev->read_errors;
+  op->read_skipped = ev->read_skipped;
+		  if(action == GC_ACTION_VALIDATE_REPAIR ||
      action == GC_ACTION_VALIDATE_ONLY) {
     op->recovery_direct = 1;
   }
@@ -4244,7 +4399,7 @@ mount_switch_recovery_append(const char *op_id, const char *title_id,
 static int
 mount_switch_restore_recovery_log(void) {
   FILE *f = fopen(GC_MOUNT_SWITCH_LOG, "r");
-  char line[4096];
+  char line[16384];
   int restored = 0;
   if(!f) return 0;
   while(fgets(line, sizeof(line), f)) {
@@ -4787,6 +4942,115 @@ mount_switch_restore_after_operation(gc_operation_t *op,
   return 0;
 }
 
+static void
+fsync_parent_dir_best_effort(const char *path) {
+  char parent[1024];
+  if(!path || path_parent(path, parent, sizeof(parent)) != 0) return;
+  int fd = open(parent, O_RDONLY);
+  if(fd >= 0) {
+    fsync(fd);
+    close(fd);
+  }
+}
+
+static int
+build_preserved_original_path(const char *original_path,
+                              char *out,
+                              size_t out_size) {
+  char parent[1024];
+  const char *name = path_basename(original_path);
+  if(!original_path || !original_path[0] || !name || !name[0] ||
+     !out || out_size == 0 ||
+     path_parent(original_path, parent, sizeof(parent)) != 0) {
+    errno = EINVAL;
+    return -1;
+  }
+  int n = snprintf(out, out_size, "%s%s.%s.original",
+                   parent, parent[1] ? "/" : "", name);
+  if(n < 0 || (size_t)n >= out_size) {
+    errno = ENAMETOOLONG;
+    return -1;
+  }
+  if(!path_is_safe(out)) {
+    errno = EINVAL;
+    return -1;
+  }
+  return 0;
+}
+
+static int
+preserve_original_source_after_success(gc_operation_t *op,
+                                       const gc_game_t *game,
+                                       gc_hidden_instance_t *hidden,
+                                       size_t hidden_count,
+                                       char *err,
+                                       size_t err_size) {
+  char hidden_path[1024];
+  const char *rename_from = NULL;
+  gc_hidden_instance_t *hidden_entry = NULL;
+  struct stat st;
+
+  if(!op || !game || !game->source_path[0]) {
+    snprintf(err, err_size, "%s", "source is unavailable for preserve");
+    errno = EINVAL;
+    return -1;
+  }
+  if(build_preserved_original_path(game->source_path, hidden_path,
+                                   sizeof(hidden_path)) != 0) {
+    snprintf(err, err_size, "build preserved original path: %s",
+             strerror(errno));
+    return -1;
+  }
+  if(lstat(hidden_path, &st) == 0) {
+    snprintf(err, err_size, "preserved original already exists: %s",
+             hidden_path);
+    errno = EEXIST;
+    return -1;
+  }
+  if(errno != ENOENT) {
+    snprintf(err, err_size, "check preserved original path: %s",
+             strerror(errno));
+    return -1;
+  }
+
+  for(size_t i = 0; i < hidden_count; i++) {
+    gc_hidden_instance_t *entry = &hidden[i];
+    if(entry->hidden &&
+       paths_equal_ignoring_trailing_slash(entry->original_path,
+                                           game->source_path)) {
+      hidden_entry = entry;
+      rename_from = entry->hidden_path;
+      break;
+    }
+  }
+  if(!rename_from) rename_from = game->source_path;
+
+  if(rename(rename_from, hidden_path) != 0) {
+    snprintf(err, err_size, "preserve original source: %s", strerror(errno));
+    return -1;
+  }
+  if(hidden_entry) hidden_entry->hidden = 0;
+  fsync_parent_dir_best_effort(hidden_path);
+
+  snprintf(op->preserve_original, sizeof(op->preserve_original), "%s", "hide");
+  snprintf(op->preserved_original_path, sizeof(op->preserved_original_path),
+           "%s", game->source_path);
+  snprintf(op->preserved_hidden_path, sizeof(op->preserved_hidden_path),
+           "%s", hidden_path);
+  size_cache_forget(game->source_path);
+  artifact_cache_invalidate();
+  gc_log("compress preserved original title=%s original=%s hidden=%s from=%s",
+         op->title_id, game->source_path, hidden_path, rename_from);
+  append_operation_phase(op, "source-preserved");
+
+  char scan_err[256] = {0};
+  if(gc_shadowmount_request_scan(scan_err, sizeof(scan_err)) != 0) {
+    gc_log("preserve original scan request failed title=%s err=%s",
+           op->title_id, scan_err[0] ? scan_err : "unknown");
+  }
+  return 0;
+}
+
 static int
 transfer_action_to_external(gc_action_t action) {
   return action == GC_ACTION_MOVE_TO_USB || action == GC_ACTION_COPY_TO_USB;
@@ -4990,6 +5254,7 @@ run_compress_op(gc_operation_t *op) {
       PFS_COMPRESS_FORMAT_EXFAT : PFS_COMPRESS_FORMAT_PFS;
   int stream_delete = !strcmp(op->delete_policy, "stream");
   int delete_after = !strcmp(op->delete_policy, "after");
+  int preserve_hide = !strcmp(op->preserve_original, "hide");
   int delete_policy = stream_delete ?
       PFS_DELETE_STREAM : PFS_DELETE_KEEP;
   int compression_profile = compression_profile_value(op->compression_profile);
@@ -5379,6 +5644,24 @@ post_compress:
     append_operation_phase(op, "source-deleted");
     snprintf(final_result, sizeof(final_result), "%s",
              repair.repaired_blocks > 0 ? "repaired" : "success");
+  } else if(preserve_hide) {
+    char preserve_err[256] = {0};
+    gc_checkpoint("compress preserve original");
+    job_set_current("Preserving original source");
+    if(preserve_original_source_after_success(op, &game, hidden, hidden_count,
+                                              preserve_err,
+                                              sizeof(preserve_err)) != 0) {
+      char restore_err[256] = {0};
+      snprintf(op->error, sizeof(op->error), "%s",
+               preserve_err[0] ? preserve_err :
+               "could not preserve original source");
+      gc_log("compress preserve original failed title=%s err=%s",
+             op->title_id, op->error);
+      (void)mount_switch_restore_after_operation(op, hidden, hidden_count,
+                                                 restore_err,
+                                                 sizeof(restore_err));
+      return -1;
+    }
   }
   {
     char restore_err[256] = {0};
@@ -6227,6 +6510,307 @@ run_read_speed_test_op(gc_operation_t *op) {
   return 0;
 }
 
+typedef struct gc_read_eof_ctx {
+  uint64_t started_ms;
+  uint64_t window_started_ms;
+  uint64_t window_bytes;
+  uint64_t bytes_read;
+  uint64_t files_read;
+  uint64_t dirs_read;
+  uint64_t elapsed_ms;
+  uint64_t avg_bps;
+  uint64_t min_bps;
+  uint64_t max_bps;
+  uint64_t errors;
+  uint64_t skipped;
+  char first_error_path[1024];
+  char first_error[256];
+  char *buf;
+} gc_read_eof_ctx_t;
+
+static void
+read_eof_store_progress(const gc_read_eof_ctx_t *ctx) {
+  if(!ctx) return;
+  job_store_u64(&g_job.copied_bytes, ctx->bytes_read);
+  job_store_u64(&g_job.phase_step, ctx->bytes_read);
+  atomic_store(&g_job.done_files,
+               ctx->files_read > (uint64_t)INT_MAX ? INT_MAX :
+               (int)ctx->files_read);
+  atomic_store(&g_job.failed_files,
+               ctx->errors > (uint64_t)INT_MAX ? INT_MAX :
+               (int)ctx->errors);
+}
+
+static void
+read_eof_note_error(gc_read_eof_ctx_t *ctx,
+                    const char *path,
+                    const char *message) {
+  if(!ctx) return;
+  ctx->errors++;
+  if(!ctx->first_error[0]) {
+    snprintf(ctx->first_error_path, sizeof(ctx->first_error_path), "%s",
+             path ? path : "");
+    snprintf(ctx->first_error, sizeof(ctx->first_error), "%s",
+             message && message[0] ? message : "read error");
+  }
+}
+
+static void
+read_eof_record_window(gc_read_eof_ctx_t *ctx, uint64_t elapsed_ms) {
+  if(!ctx || elapsed_ms == 0 || ctx->window_bytes == 0) return;
+  uint64_t bps = (ctx->window_bytes * 1000ULL) / elapsed_ms;
+  if(bps == 0) return;
+  if(ctx->min_bps == 0 || bps < ctx->min_bps) ctx->min_bps = bps;
+  if(bps > ctx->max_bps) ctx->max_bps = bps;
+}
+
+static void
+read_eof_account_bytes(gc_read_eof_ctx_t *ctx, uint64_t bytes) {
+  uint64_t now = monotonic_millis_gc();
+  if(!ctx) return;
+  ctx->bytes_read += bytes;
+  ctx->window_bytes += bytes;
+  if(now > ctx->window_started_ms &&
+     now - ctx->window_started_ms >= 1000ULL) {
+    read_eof_record_window(ctx, now - ctx->window_started_ms);
+    ctx->window_started_ms = now;
+    ctx->window_bytes = 0;
+  }
+  read_eof_store_progress(ctx);
+}
+
+static void
+read_eof_finish_metrics(gc_read_eof_ctx_t *ctx) {
+  uint64_t now = monotonic_millis_gc();
+  if(!ctx) return;
+  if(now > ctx->window_started_ms) {
+    read_eof_record_window(ctx, now - ctx->window_started_ms);
+  }
+  ctx->elapsed_ms = now > ctx->started_ms ? now - ctx->started_ms : 1;
+  if(ctx->elapsed_ms == 0) ctx->elapsed_ms = 1;
+  ctx->avg_bps = (ctx->bytes_read * 1000ULL) / ctx->elapsed_ms;
+  if(ctx->min_bps == 0 && ctx->avg_bps > 0) ctx->min_bps = ctx->avg_bps;
+  if(ctx->max_bps == 0 && ctx->avg_bps > 0) ctx->max_bps = ctx->avg_bps;
+  read_eof_store_progress(ctx);
+}
+
+static int
+read_eof_file(const char *path, gc_read_eof_ctx_t *ctx,
+              char *err, size_t err_size) {
+  int fd = open(path, O_RDONLY);
+  if(fd < 0) {
+    char msg[256];
+    snprintf(msg, sizeof(msg), "open: %s", strerror(errno));
+    read_eof_note_error(ctx, path, msg);
+    return 0;
+  }
+  ctx->files_read++;
+  job_set_current(path);
+  while(1) {
+    if(job_cancelled()) {
+      snprintf(err, err_size, "%s", "cancelled");
+      close(fd);
+      errno = EINTR;
+      return -1;
+    }
+    ssize_t n = read(fd, ctx->buf, GC_COPY_CHUNK_SIZE);
+    if(n < 0) {
+      if(errno == EINTR) continue;
+      snprintf(err, err_size, "read eof source: %s", strerror(errno));
+      read_eof_note_error(ctx, path, err);
+      close(fd);
+      return -1;
+    }
+    if(n == 0) break;
+    read_eof_account_bytes(ctx, (uint64_t)n);
+  }
+  close(fd);
+  read_eof_store_progress(ctx);
+  return 0;
+}
+
+static int
+read_eof_walk(const char *path, gc_read_eof_ctx_t *ctx,
+              char *err, size_t err_size) {
+  struct stat st;
+  if(job_cancelled()) {
+    snprintf(err, err_size, "%s", "cancelled");
+    errno = EINTR;
+    return -1;
+  }
+  if(lstat(path, &st) != 0) {
+    char msg[256];
+    snprintf(msg, sizeof(msg), "stat: %s", strerror(errno));
+    read_eof_note_error(ctx, path, msg);
+    return 0;
+  }
+  if(S_ISREG(st.st_mode)) {
+    return read_eof_file(path, ctx, err, err_size);
+  }
+  if(!S_ISDIR(st.st_mode)) {
+    ctx->skipped++;
+    return 0;
+  }
+
+  ctx->dirs_read++;
+  DIR *d = opendir(path);
+  if(!d) {
+    char msg[256];
+    snprintf(msg, sizeof(msg), "opendir: %s", strerror(errno));
+    read_eof_note_error(ctx, path, msg);
+    return 0;
+  }
+  int rc = 0;
+  struct dirent *ent;
+  while((ent = readdir(d))) {
+    if(!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) continue;
+    char child[1024];
+    int n = snprintf(child, sizeof(child), "%s/%s", path, ent->d_name);
+    if(n < 0 || (size_t)n >= sizeof(child)) {
+      ctx->skipped++;
+      continue;
+    }
+    if(read_eof_walk(child, ctx, err, err_size) != 0) {
+      rc = -1;
+      break;
+    }
+  }
+  closedir(d);
+  read_eof_store_progress(ctx);
+  return rc;
+}
+
+static void
+operation_store_read_eof_metrics(gc_operation_t *op,
+                                 const gc_read_eof_ctx_t *ctx) {
+  if(!op || !ctx) return;
+  op->read_bytes = ctx->bytes_read;
+  op->read_files = ctx->files_read;
+  op->read_dirs = ctx->dirs_read;
+  op->read_elapsed_ms = ctx->elapsed_ms;
+  op->read_avg_bps = ctx->avg_bps;
+  op->read_min_bps = ctx->min_bps;
+  op->read_max_bps = ctx->max_bps;
+  op->read_errors = ctx->errors;
+  op->read_skipped = ctx->skipped;
+  snprintf(op->read_first_error_path, sizeof(op->read_first_error_path), "%s",
+           ctx->first_error_path);
+  snprintf(op->read_first_error, sizeof(op->read_first_error), "%s",
+           ctx->first_error);
+  op->compression_source_size = ctx->bytes_read;
+  op->compressed_size = ctx->bytes_read;
+  op->saved_bytes = 0;
+}
+
+static int
+run_read_eof_test_op(gc_operation_t *op) {
+  gc_game_t game = {0};
+  gc_read_eof_ctx_t ctx;
+  du_state_t du;
+  struct stat st;
+  char read_root[1024] = {0};
+  char err[256] = {0};
+
+  gc_checkpoint("read-eof find game");
+  gc_log("read-eof start op=%s title=%s", op->id, op->title_id);
+  if(find_game_for_operation(op, &game, 0) != 0 ||
+     game.source_kind == GC_SOURCE_UNKNOWN) {
+    snprintf(op->error, sizeof(op->error), "%s", "game data is unavailable");
+    gc_log("read-eof failed title=%s err=%s", op->title_id, op->error);
+    return -1;
+  }
+  if(read_speed_mount_root(&game, read_root, sizeof(read_root),
+                           err, sizeof(err)) != 0) {
+    snprintf(op->error, sizeof(op->error), "%s",
+             err[0] ? err : "game is not mounted");
+    gc_log("read-eof mount unavailable title=%s err=%s",
+           op->title_id, op->error);
+    return -1;
+  }
+  if(stat(read_root, &st) != 0 || !S_ISDIR(st.st_mode)) {
+    snprintf(op->error, sizeof(op->error), "%s",
+             "mounted game folder is unavailable");
+    gc_log("read-eof stat failed title=%s root=%s err=%s",
+           op->title_id, read_root, strerror(errno));
+    return -1;
+  }
+
+  snprintf(op->source_path, sizeof(op->source_path), "%s", game.source_path);
+  snprintf(op->output_path, sizeof(op->output_path), "%s", read_root);
+  snprintf(op->source_kind, sizeof(op->source_kind), "%s",
+           source_kind_name(game.source_kind));
+  snprintf(op->format, sizeof(op->format), "%s", "read-eof");
+  snprintf(op->delete_policy, sizeof(op->delete_policy), "%s", "none");
+  snprintf(op->read_root, sizeof(op->read_root), "%s", read_root);
+  snprintf(op->read_storage, sizeof(op->read_storage), "%s",
+           storage_name_for_path(game.source_path));
+  job_set_target(read_root);
+
+  memset(&ctx, 0, sizeof(ctx));
+  ctx.buf = malloc(GC_COPY_CHUNK_SIZE);
+  if(!ctx.buf) {
+    snprintf(op->error, sizeof(op->error), "%s", "out of memory");
+    return -1;
+  }
+  ctx.started_ms = monotonic_millis_gc();
+  ctx.window_started_ms = ctx.started_ms;
+
+  du_walk(read_root, &du);
+  job_store_u64(&g_job.total_bytes, du.bytes);
+  atomic_store(&g_job.total_files,
+               du.files > (uint64_t)INT_MAX ? INT_MAX : (int)du.files);
+  atomic_store(&g_job.copied_bytes, 0);
+
+  gc_checkpoint("read-eof scanning");
+  append_operation_phase(op, "read-eof");
+  job_set_phase("read-eof", 0,
+                du.bytes > (uint64_t)LONG_MAX ? LONG_MAX : (long)du.bytes,
+                "Reading mounted game to EOF");
+  gc_log("read-eof reading title=%s root=%s storage=%s files=%llu bytes=%llu",
+         op->title_id, read_root, op->read_storage,
+         (unsigned long long)du.files, (unsigned long long)du.bytes);
+
+  err[0] = 0;
+  int rc = read_eof_walk(read_root, &ctx, err, sizeof(err));
+  read_eof_finish_metrics(&ctx);
+  operation_store_read_eof_metrics(op, &ctx);
+
+  if(rc != 0) {
+    snprintf(op->error, sizeof(op->error), "%s",
+             err[0] ? err : "read eof test failed");
+    free(ctx.buf);
+    return -1;
+  }
+  if(ctx.files_read == 0) {
+    snprintf(op->error, sizeof(op->error), "%s", "no readable files found");
+    free(ctx.buf);
+    return -1;
+  }
+  if(ctx.bytes_read == 0) {
+    snprintf(op->error, sizeof(op->error), "%s", "no readable file data found");
+    free(ctx.buf);
+    return -1;
+  }
+  if(ctx.errors > 0) {
+    snprintf(op->error, sizeof(op->error), "read eof errors=%llu first=%s",
+             (unsigned long long)ctx.errors,
+             ctx.first_error[0] ? ctx.first_error : "unknown");
+    free(ctx.buf);
+    return -1;
+  }
+
+  snprintf(op->result, sizeof(op->result), "%s", "tested");
+  gc_log("read-eof complete title=%s root=%s bytes=%llu files=%llu dirs=%llu "
+         "elapsedMs=%llu avgBps=%llu minBps=%llu maxBps=%llu skipped=%llu",
+         op->title_id, read_root, (unsigned long long)ctx.bytes_read,
+         (unsigned long long)ctx.files_read, (unsigned long long)ctx.dirs_read,
+         (unsigned long long)ctx.elapsed_ms, (unsigned long long)ctx.avg_bps,
+         (unsigned long long)ctx.min_bps, (unsigned long long)ctx.max_bps,
+         (unsigned long long)ctx.skipped);
+  free(ctx.buf);
+  return 0;
+}
+
 static int
 run_delete_game_data_op(gc_operation_t *op) {
   gc_game_t game = {0};
@@ -6340,9 +6924,11 @@ operation_thread(void *arg) {
   else if(op->action == GC_ACTION_REFRESH_MOUNT) rc = run_refresh_mount_op(op);
   else if(op->action == GC_ACTION_DELETE_GAME_DATA) {
     rc = run_delete_game_data_op(op);
-  } else if(op->action == GC_ACTION_READ_SPEED_TEST) {
-    rc = run_read_speed_test_op(op);
-  }
+	  } else if(op->action == GC_ACTION_READ_SPEED_TEST) {
+	    rc = run_read_speed_test_op(op);
+  } else if(op->action == GC_ACTION_READ_EOF_TEST) {
+    rc = run_read_eof_test_op(op);
+	  }
 
   int cancelled = job_cancelled();
   gc_checkpoint("operation job end");
@@ -6485,14 +7071,16 @@ preflight_action(const gc_game_t *game, gc_action_t action, int confirm_stream,
         ? -2 : -1;
   }
   if(game->size_pending || game->source_size == 0 || game->required_bytes == 0) {
-    if(action == GC_ACTION_COMPRESS &&
-       game->source_kind == GC_SOURCE_FOLDER) {
-      snprintf(delete_policy, delete_policy_size, "%s",
-               requested_delete_policy && !strcmp(requested_delete_policy, "stream")
-                   ? "stream"
-                   : "after");
-      return 0;
-    }
+	    if(action == GC_ACTION_COMPRESS &&
+	       game->source_kind == GC_SOURCE_FOLDER) {
+	      snprintf(delete_policy, delete_policy_size, "%s",
+	               requested_delete_policy &&
+	                   !strcmp(requested_delete_policy, "stream") ? "stream" :
+	               (requested_delete_policy &&
+	                   !strcmp(requested_delete_policy, "keep") ? "keep" :
+	                   "after"));
+	      return 0;
+	    }
     return json_append(problem,
         "{\"ok\":false,\"error\":\"could not measure game size\"}") == 0
         ? -2 : -1;
@@ -6516,7 +7104,16 @@ preflight_action(const gc_game_t *game, gc_action_t action, int confirm_stream,
     return append_low_space_problem(problem, game, stream_ok, "after",
                                     stream_budget_bytes);
   }
-  if(action == GC_ACTION_UNCOMPRESS &&
+	  if(action == GC_ACTION_UNCOMPRESS &&
+	     requested_delete_policy && !strcmp(requested_delete_policy, "keep")) {
+    if(game->free_bytes >= game->required_bytes) {
+      snprintf(delete_policy, delete_policy_size, "%s", "keep");
+      return 0;
+    }
+    return append_low_space_problem(problem, game, stream_ok, "keep",
+                                    stream_budget_bytes);
+	  }
+  if(action == GC_ACTION_COMPRESS &&
      requested_delete_policy && !strcmp(requested_delete_policy, "keep")) {
     if(game->free_bytes >= game->required_bytes) {
       snprintf(delete_policy, delete_policy_size, "%s", "keep");
@@ -6525,7 +7122,7 @@ preflight_action(const gc_game_t *game, gc_action_t action, int confirm_stream,
     return append_low_space_problem(problem, game, stream_ok, "keep",
                                     stream_budget_bytes);
   }
-  if(game->free_bytes >= game->required_bytes) {
+	  if(game->free_bytes >= game->required_bytes) {
     snprintf(delete_policy, delete_policy_size, "%s", "after");
     return 0;
   }
@@ -6548,10 +7145,12 @@ enqueue_action(const http_request_t *req, gc_action_t action) {
   char profile_arg[24];
   char confirm_arg[16];
   char delete_policy_arg[24];
+  char preserve_arg[24];
   char budget_arg[32];
   char order_arg[24];
   char usb_id[16] = "";
   char requested_delete_policy[16] = "";
+  char preserve_original[16] = "";
   char compression_profile[16] = "space";
   char stream_order[24] = "budgeted-gain";
   uint64_t stream_budget_bytes = PFS_STREAM_DEFAULT_BUDGET_BYTES;
@@ -6674,6 +7273,27 @@ enqueue_action(const http_request_t *req, gc_action_t action) {
     }
   }
   if(action == GC_ACTION_COMPRESS &&
+     websrv_get_query_arg(req, "preserveOriginal", preserve_arg,
+                          sizeof(preserve_arg))) {
+    if(!strcasecmp(preserve_arg, "hide")) {
+      snprintf(preserve_original, sizeof(preserve_original), "%s", "hide");
+      if(!requested_delete_policy[0]) {
+        snprintf(requested_delete_policy, sizeof(requested_delete_policy),
+                 "%s", "keep");
+      }
+    } else if(!strcasecmp(preserve_arg, "0") ||
+              !strcasecmp(preserve_arg, "false") ||
+              !strcasecmp(preserve_arg, "none")) {
+      preserve_original[0] = 0;
+    } else {
+      return serve_error(req, 400, "bad preserveOriginal");
+    }
+  }
+  if(preserve_original[0] && !strcmp(requested_delete_policy, "stream")) {
+    return serve_error(req, 400,
+                       "preserveOriginal=hide is not compatible with destructive compression");
+  }
+  if(action == GC_ACTION_COMPRESS &&
      websrv_get_query_arg(req, "budgetBytes", budget_arg,
                           sizeof(budget_arg))) {
     if(parse_u64_arg(budget_arg, &stream_budget_bytes) != 0 ||
@@ -6794,9 +7414,9 @@ enqueue_action(const http_request_t *req, gc_action_t action) {
              !strcasecmp(destination_arg, "external"))) {
     return serve_error(req, 400, "bad storage target");
   }
-  if((action == GC_ACTION_UNCOMPRESS ||
-      action == GC_ACTION_VALIDATE_REPAIR ||
-      action == GC_ACTION_VALIDATE_ONLY) &&
+	  if((action == GC_ACTION_UNCOMPRESS ||
+	      action == GC_ACTION_VALIDATE_REPAIR ||
+	      action == GC_ACTION_VALIDATE_ONLY) &&
      game.source_kind != GC_SOURCE_COMPRESSED) {
     return serve_error(req, 400, "game is not compressed");
   }
@@ -6849,18 +7469,22 @@ enqueue_action(const http_request_t *req, gc_action_t action) {
       }
     }
   }
-  if(action == GC_ACTION_COMPRESS && target_root[0]) {
-    snprintf(delete_policy, sizeof(delete_policy), "%s",
-             !strcmp(requested_delete_policy, "keep") ? "keep" : "after");
-  } else {
-    if(action == GC_ACTION_COMPRESS &&
-       requested_delete_policy[0] &&
-       !strcmp(requested_delete_policy, "keep")) {
-      return serve_error(req, 400,
-                         "keep both is only available when moving to another storage");
-    }
-    int p = preflight_action(&game, action, confirm_stream,
-                             requested_delete_policy, stream_budget_bytes,
+	  if(action == GC_ACTION_COMPRESS && target_root[0]) {
+	    snprintf(delete_policy, sizeof(delete_policy), "%s",
+	             !strcmp(requested_delete_policy, "keep") ? "keep" : "after");
+	  } else {
+	    if(action == GC_ACTION_COMPRESS &&
+	       requested_delete_policy[0] &&
+	       !strcmp(requested_delete_policy, "keep")) {
+      if(preserve_original[0]) {
+        snprintf(delete_policy, sizeof(delete_policy), "%s", "keep");
+      } else {
+        return serve_error(req, 400,
+                           "keep both is only available when moving to another storage");
+      }
+	    }
+	    int p = preflight_action(&game, action, confirm_stream,
+	                             requested_delete_policy, stream_budget_bytes,
                              delete_policy,
                              sizeof(delete_policy), &problem);
     if(p == -2) return serve_owned(req, 409, problem.data, problem.len);
@@ -6899,11 +7523,13 @@ enqueue_action(const http_request_t *req, gc_action_t action) {
   snprintf(op->format, sizeof(op->format), "%s", format);
   snprintf(op->delete_policy, sizeof(op->delete_policy), "%s",
            delete_policy);
-  snprintf(op->compression_profile, sizeof(op->compression_profile), "%s",
-           compression_profile_or_default(compression_profile));
-  snprintf(op->stream_order, sizeof(op->stream_order), "%s", stream_order);
-  op->stream_budget_bytes = stream_budget_bytes;
-  snprintf(op->target_root, sizeof(op->target_root), "%s", target_root);
+	  snprintf(op->compression_profile, sizeof(op->compression_profile), "%s",
+	           compression_profile_or_default(compression_profile));
+	  snprintf(op->stream_order, sizeof(op->stream_order), "%s", stream_order);
+	  op->stream_budget_bytes = stream_budget_bytes;
+	  snprintf(op->target_root, sizeof(op->target_root), "%s", target_root);
+  snprintf(op->preserve_original, sizeof(op->preserve_original), "%s",
+           preserve_original);
   append_history_log(op);
   start_next_locked();
   gc_op_status_t status = op->status;
@@ -7293,7 +7919,7 @@ enqueue_delete_game_data_action(const http_request_t *req) {
 }
 
 static int
-enqueue_read_speed_test_action(const http_request_t *req) {
+enqueue_read_test_action(const http_request_t *req, gc_action_t action) {
   char title_id[64];
   char source_path_arg[1024] = "";
   char read_root[1024] = {0};
@@ -7348,7 +7974,7 @@ enqueue_read_speed_test_action(const http_request_t *req) {
   op->seq = g_next_seq++;
   snprintf(op->id, sizeof(op->id), "op-%llu",
            (unsigned long long)op->seq);
-  op->action = GC_ACTION_READ_SPEED_TEST;
+  op->action = action;
   op->status = GC_OP_QUEUED;
   op->created_at = time(NULL);
   snprintf(op->title_id, sizeof(op->title_id), "%s", title_id);
@@ -7357,8 +7983,14 @@ enqueue_read_speed_test_action(const http_request_t *req) {
   snprintf(op->output_path, sizeof(op->output_path), "%s", read_root);
   snprintf(op->source_kind, sizeof(op->source_kind), "%s",
            source_kind_name(game.source_kind));
-  snprintf(op->format, sizeof(op->format), "%s", "read");
+  snprintf(op->format, sizeof(op->format), "%s",
+           action == GC_ACTION_READ_EOF_TEST ? "read-eof" : "read");
   snprintf(op->delete_policy, sizeof(op->delete_policy), "%s", "none");
+  if(action == GC_ACTION_READ_EOF_TEST) {
+    snprintf(op->read_root, sizeof(op->read_root), "%s", read_root);
+    snprintf(op->read_storage, sizeof(op->read_storage), "%s",
+             storage_name_for_path(game.source_path));
+  }
   append_history_log(op);
   start_next_locked();
   gc_op_status_t status = op->status;
@@ -7372,6 +8004,90 @@ enqueue_read_speed_test_action(const http_request_t *req) {
      json_append(&b, ",\"status\":") != 0 ||
      json_string(&b, status_name(status)) != 0 ||
      json_append(&b, "}") != 0) {
+    free(b.data);
+    return -1;
+  }
+  return serve_owned(req, 200, b.data, b.len);
+}
+
+static int
+enqueue_read_speed_test_action(const http_request_t *req) {
+  return enqueue_read_test_action(req, GC_ACTION_READ_SPEED_TEST);
+}
+
+static int
+enqueue_read_eof_test_action(const http_request_t *req) {
+  return enqueue_read_test_action(req, GC_ACTION_READ_EOF_TEST);
+}
+
+static int
+original_restore_request(const http_request_t *req) {
+  char path[1024] = "";
+  char hidden_path[1024] = "";
+  char scan_err[256] = {0};
+  struct stat visible_st;
+  struct stat hidden_st;
+  int visible_exists;
+  int hidden_exists;
+  int restored = 0;
+  int already_visible = 0;
+
+  if(strcmp(req->method, "POST")) {
+    return serve_error(req, 405, "method not allowed");
+  }
+  if(!websrv_get_query_arg(req, "path", path, sizeof(path)) &&
+     !websrv_get_query_arg(req, "sourcePath", path, sizeof(path))) {
+    return serve_error(req, 400, "missing path");
+  }
+  if(!path_is_safe(path)) {
+    return serve_error(req, 400, "bad path");
+  }
+  if(build_preserved_original_path(path, hidden_path, sizeof(hidden_path)) != 0) {
+    return serve_error(req, 400, "bad preserved original path");
+  }
+
+  pthread_mutex_lock(&g_gc_lock);
+  if(active_op_locked()) {
+    pthread_mutex_unlock(&g_gc_lock);
+    return serve_error(req, 409, "action already running");
+  }
+  pthread_mutex_unlock(&g_gc_lock);
+
+  visible_exists = lstat(path, &visible_st) == 0;
+  hidden_exists = lstat(hidden_path, &hidden_st) == 0;
+  if(visible_exists && hidden_exists) {
+    return serve_error(req, 409, "visible and hidden originals both exist");
+  }
+  if(visible_exists) {
+    already_visible = 1;
+  } else if(hidden_exists) {
+    if(rename(hidden_path, path) != 0) {
+      return serve_error(req, 500, strerror(errno));
+    }
+    fsync_parent_dir_best_effort(path);
+    restored = 1;
+    size_cache_forget(hidden_path);
+    size_cache_forget(path);
+    artifact_cache_invalidate();
+    if(gc_shadowmount_request_scan(scan_err, sizeof(scan_err)) != 0) {
+      gc_log("original restore scan request failed path=%s err=%s",
+             path, scan_err[0] ? scan_err : "unknown");
+    }
+    gc_log("original restored path=%s hidden=%s", path, hidden_path);
+  } else {
+    return serve_error(req, 404, "hidden original is unavailable");
+  }
+
+  json_buf_t b = {0};
+  if(json_append(&b, "{\"ok\":true,\"path\":") != 0 ||
+     json_string(&b, path) != 0 ||
+     json_append(&b, ",\"hiddenPath\":") != 0 ||
+     json_string(&b, hidden_path) != 0 ||
+     json_appendf(&b, ",\"restored\":%s,\"alreadyVisible\":%s,"
+                  "\"scanRequested\":%s}",
+                  restored ? "true" : "false",
+                  already_visible ? "true" : "false",
+                  restored ? "true" : "false") != 0) {
     free(b.data);
     return -1;
   }
@@ -7446,26 +8162,54 @@ append_op_summary(json_buf_t *b, const gc_operation_t *op) {
       json_string(b, compression_profile_or_default(op->compression_profile)) == 0 &&
       json_append(b, ",\"streamOrder\":") == 0 &&
       json_string(b, op->stream_order[0] ? op->stream_order : "budgeted-gain") == 0 &&
-      json_append(b, ",\"targetRoot\":") == 0 &&
-      json_string(b, op->target_root) == 0 &&
-      json_append(b, ",\"repairSummary\":") == 0 &&
-      json_string(b, op->repair_summary) == 0 &&
-      json_appendf(b,
-	                   ",\"streamBudgetBytes\":%llu,"
-	                   "\"compressionSourceSize\":%llu,"
-	                   "\"compressedSize\":%llu,"
-	                   "\"savedBytes\":%llu,"
-	                   "\"createdAt\":%ld,\"startedAt\":%ld,\"endedAt\":%ld,"
-	                   "\"repairedBlocks\":%llu,\"badBlocksFound\":%llu,"
-	                   "\"hashCheckedBlocks\":%llu,"
+	      json_append(b, ",\"targetRoot\":") == 0 &&
+	      json_string(b, op->target_root) == 0 &&
+	      json_append(b, ",\"preserveOriginal\":") == 0 &&
+	      json_string(b, op->preserve_original) == 0 &&
+	      json_append(b, ",\"preservedOriginalPath\":") == 0 &&
+	      json_string(b, op->preserved_original_path) == 0 &&
+	      json_append(b, ",\"preservedHiddenPath\":") == 0 &&
+	      json_string(b, op->preserved_hidden_path) == 0 &&
+	      json_append(b, ",\"repairSummary\":") == 0 &&
+	      json_string(b, op->repair_summary) == 0 &&
+	      json_append(b, ",\"readRoot\":") == 0 &&
+	      json_string(b, op->read_root) == 0 &&
+	      json_append(b, ",\"readStorage\":") == 0 &&
+	      json_string(b, op->read_storage) == 0 &&
+	      json_append(b, ",\"readFirstErrorPath\":") == 0 &&
+	      json_string(b, op->read_first_error_path) == 0 &&
+	      json_append(b, ",\"readFirstError\":") == 0 &&
+	      json_string(b, op->read_first_error) == 0 &&
+	      json_appendf(b,
+		                   ",\"streamBudgetBytes\":%llu,"
+		                   "\"compressionSourceSize\":%llu,"
+		                   "\"compressedSize\":%llu,"
+		                   "\"savedBytes\":%llu,"
+		                   "\"readBytes\":%llu,\"readFiles\":%llu,"
+		                   "\"readDirs\":%llu,\"readElapsedMs\":%llu,"
+		                   "\"readAvgBps\":%llu,\"readMinBps\":%llu,"
+		                   "\"readMaxBps\":%llu,\"readErrors\":%llu,"
+		                   "\"readSkipped\":%llu,"
+		                   "\"createdAt\":%ld,\"startedAt\":%ld,\"endedAt\":%ld,"
+		                   "\"repairedBlocks\":%llu,\"badBlocksFound\":%llu,"
+		                   "\"hashCheckedBlocks\":%llu,"
 	                   "\"hashMismatchedBlocks\":%llu,"
 	                   "\"softwareComparedBlocks\":%llu}",
 	                   (unsigned long long)op->stream_budget_bytes,
-	                   (unsigned long long)op->compression_source_size,
-	                   (unsigned long long)op->compressed_size,
-	                   (unsigned long long)op->saved_bytes,
-	                   (long)op->created_at, (long)op->started_at,
-                   (long)op->ended_at,
+		                   (unsigned long long)op->compression_source_size,
+		                   (unsigned long long)op->compressed_size,
+		                   (unsigned long long)op->saved_bytes,
+		                   (unsigned long long)op->read_bytes,
+		                   (unsigned long long)op->read_files,
+		                   (unsigned long long)op->read_dirs,
+		                   (unsigned long long)op->read_elapsed_ms,
+		                   (unsigned long long)op->read_avg_bps,
+		                   (unsigned long long)op->read_min_bps,
+		                   (unsigned long long)op->read_max_bps,
+		                   (unsigned long long)op->read_errors,
+		                   (unsigned long long)op->read_skipped,
+		                   (long)op->created_at, (long)op->started_at,
+	                   (long)op->ended_at,
                    (unsigned long long)op->repaired_blocks,
                    (unsigned long long)bad_blocks_found,
                    (unsigned long long)op->hash_checked_blocks,
@@ -7702,7 +8446,7 @@ append_persisted_history(json_buf_t *b, int *first,
   if(!f) return 0;
   memset(slots, 0, sizeof(slots));
 
-  char line[4096];
+  char line[16384];
   while(fgets(line, sizeof(line), f)) {
     char id[64] = {0};
     char key[GC_HISTORY_KEY_SIZE] = {0};
@@ -7972,9 +8716,11 @@ job_speed_metric_bytes(const char *verb, const char *phase, long copied,
     }
   } else if(!strcmp(v, "uncompress")) {
     source = "unpacked-output";
-  } else if(!strcmp(v, "read-speed-test")) {
-    source = "read-test";
-  } else if(!strcmp(v, "move-to-usb") ||
+	  } else if(!strcmp(v, "read-speed-test")) {
+	    source = "read-test";
+  } else if(!strcmp(v, "read-eof-test")) {
+    source = "read-eof";
+	  } else if(!strcmp(v, "move-to-usb") ||
             !strcmp(v, "move-to-internal") ||
             !strcmp(v, "copy-to-usb") ||
             !strcmp(v, "copy-to-internal")) {
@@ -8370,7 +9116,7 @@ gc_api_recover_on_startup(void) {
   recovery_slot_t latest[GC_MAX_OPS];
   size_t count = 0;
   uint64_t order = 1;
-  char line[4096];
+  char line[16384];
   memset(latest, 0, sizeof(latest));
   while(fgets(line, sizeof(line), f)) {
     gc_history_recovery_event_t ev;
@@ -8485,8 +9231,14 @@ gc_api_request(const http_request_t *req, const char *url) {
   if(!strcmp(req->path, "/api/gc/delete-game-data")) {
     return enqueue_delete_game_data_action(req);
   }
-  if(!strcmp(req->path, "/api/gc/read-speed-test")) {
-    return enqueue_read_speed_test_action(req);
+	  if(!strcmp(req->path, "/api/gc/read-speed-test")) {
+	    return enqueue_read_speed_test_action(req);
+	  }
+  if(!strcmp(req->path, "/api/gc/read-eof-test")) {
+    return enqueue_read_eof_test_action(req);
   }
-  return serve_error(req, 404, "not found");
-}
+  if(!strcmp(req->path, "/api/gc/original-restore")) {
+    return original_restore_request(req);
+  }
+	  return serve_error(req, 404, "not found");
+	}
