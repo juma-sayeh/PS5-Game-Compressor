@@ -142,6 +142,37 @@ typedef struct scan_list {
   size_t cap;
 } scan_list_t;
 
+typedef struct scan_stats {
+  uint64_t bytes;
+  uint64_t files;
+  uint64_t dirs;
+  uint64_t entries;
+  uint64_t elapsed_ms;
+  uint64_t workers;
+} scan_stats_t;
+
+typedef struct scan_dir_task {
+  char rel[1024];
+} scan_dir_task_t;
+
+typedef struct scan_parallel_ctx {
+  char root[1024];
+  scan_list_t *files;
+  scan_dir_task_t *tasks;
+  size_t task_count;
+  size_t task_cap;
+  int active;
+  int stop;
+  int error;
+  char err[256];
+  pthread_mutex_t lock;
+  pthread_cond_t cond;
+  int lock_initialized;
+  int sync_initialized;
+  uint64_t started_us;
+  scan_stats_t stats;
+} scan_parallel_ctx_t;
+
 typedef struct int_list {
   int *items;
   size_t count;
@@ -227,6 +258,11 @@ typedef struct pfs_layout {
   uint64_t final_ndblock;
   uint64_t image_size;
 } pfs_layout_t;
+
+struct pfs_compress_plan {
+  pfs_app_info_t info;
+  pfs_layout_t nested;
+};
 
 typedef struct fpt_entry {
   uint32_t hash;
@@ -3082,8 +3118,340 @@ scan_push(scan_list_t *list, const char *abs, const char *rel, uint64_t size) {
 }
 
 static int
-scan_collect(const char *root, const char *rel, scan_list_t *files,
-             char *err, size_t err_size) {
+scan_path_under_prefix(const char *path, const char *prefix) {
+  size_t n = strlen(prefix ? prefix : "");
+  return path && prefix && !strncmp(path, prefix, n) &&
+         (path[n] == 0 || path[n] == '/');
+}
+
+static int
+scan_default_workers_for_root(const char *root) {
+  if(scan_path_under_prefix(root, "/mnt/ext0") ||
+     scan_path_under_prefix(root, "/mnt/ext1")) {
+    return 4;
+  }
+  for(int i = 0; i <= 7; i++) {
+    char prefix[16];
+    snprintf(prefix, sizeof(prefix), "/mnt/usb%d", i);
+    if(scan_path_under_prefix(root, prefix)) return 4;
+  }
+  return 2;
+}
+
+static void
+scan_store_u64(atomic_long *dst, uint64_t value) {
+  atomic_store(dst, value > (uint64_t)LONG_MAX ? LONG_MAX : (long)value);
+}
+
+static void
+scan_publish_stats(scan_stats_t *stats, uint64_t started_us) {
+  if(!stats) return;
+  if(started_us > 0) {
+    uint64_t now = monotonic_us();
+    stats->elapsed_ms = now > started_us ? (now - started_us) / 1000ULL : 0;
+  }
+  scan_store_u64(&g_job.scan_bytes, stats->bytes);
+  scan_store_u64(&g_job.scan_files, stats->files);
+  scan_store_u64(&g_job.scan_dirs, stats->dirs);
+  scan_store_u64(&g_job.scan_entries, stats->entries);
+  scan_store_u64(&g_job.scan_elapsed_ms, stats->elapsed_ms);
+  scan_store_u64(&g_job.scan_workers, stats->workers);
+}
+
+static void
+scan_stats_to_info(pfs_app_info_t *info, const scan_stats_t *stats) {
+  if(!info || !stats) return;
+  info->scan_bytes = stats->bytes;
+  info->scan_files = stats->files;
+  info->scan_dirs = stats->dirs;
+  info->scan_entries = stats->entries;
+  info->scan_elapsed_ms = stats->elapsed_ms;
+  info->scan_workers = stats->workers;
+}
+
+static void
+scan_list_reset(scan_list_t *files) {
+  if(!files) return;
+  free(files->items);
+  memset(files, 0, sizeof(*files));
+}
+
+static int
+scan_queue_push_locked(scan_parallel_ctx_t *ctx, const char *rel) {
+  if(ctx->task_count == ctx->task_cap) {
+    size_t next = ctx->task_cap ? ctx->task_cap * 2 : 128;
+    scan_dir_task_t *p = realloc(ctx->tasks, next * sizeof(*p));
+    if(!p) return -1;
+    ctx->tasks = p;
+    ctx->task_cap = next;
+  }
+  snprintf(ctx->tasks[ctx->task_count++].rel,
+           sizeof(ctx->tasks[0].rel), "%s", rel ? rel : "");
+  pthread_cond_signal(&ctx->cond);
+  return 0;
+}
+
+static void
+scan_parallel_fail_locked(scan_parallel_ctx_t *ctx, const char *msg) {
+  if(!ctx->error) {
+    ctx->error = errno ? errno : EIO;
+    snprintf(ctx->err, sizeof(ctx->err), "%s", msg ? msg : "scan failed");
+  }
+  pthread_cond_broadcast(&ctx->cond);
+}
+
+static int
+scan_parallel_note_dir(scan_parallel_ctx_t *ctx, const char *rel,
+                       char *local_err, size_t local_err_size) {
+  int rc = 0;
+  pthread_mutex_lock(&ctx->lock);
+  ctx->stats.entries++;
+  ctx->stats.dirs++;
+  if(scan_queue_push_locked(ctx, rel) != 0) {
+    snprintf(local_err, local_err_size, "%s", "out of memory");
+    rc = -1;
+  } else {
+    scan_publish_stats(&ctx->stats, ctx->started_us);
+  }
+  pthread_mutex_unlock(&ctx->lock);
+  return rc;
+}
+
+static int
+scan_parallel_note_file(scan_parallel_ctx_t *ctx, const char *abs,
+                        const char *rel, uint64_t size,
+                        char *local_err, size_t local_err_size) {
+  int rc = 0;
+  pthread_mutex_lock(&ctx->lock);
+  ctx->stats.entries++;
+  ctx->stats.files++;
+  if(UINT64_MAX - ctx->stats.bytes < size) ctx->stats.bytes = UINT64_MAX;
+  else ctx->stats.bytes += size;
+  if(scan_push(ctx->files, abs, rel, size) != 0) {
+    snprintf(local_err, local_err_size, "%s", "out of memory");
+    rc = -1;
+  } else {
+    scan_publish_stats(&ctx->stats, ctx->started_us);
+  }
+  pthread_mutex_unlock(&ctx->lock);
+  return rc;
+}
+
+static int
+scan_process_dir_parallel(scan_parallel_ctx_t *ctx, const char *rel,
+                          char *local_err, size_t local_err_size) {
+  char dir_path[1024];
+  if(rel && rel[0]) {
+    if(join_abs(dir_path, sizeof(dir_path), ctx->root, rel) != 0) {
+      snprintf(local_err, local_err_size, "%s", "path too long");
+      errno = ENAMETOOLONG;
+      return -1;
+    }
+  } else {
+    snprintf(dir_path, sizeof(dir_path), "%s", ctx->root);
+  }
+
+  DIR *d = opendir(dir_path);
+  if(!d) {
+    snprintf(local_err, local_err_size, "scan: %s", strerror(errno));
+    return -1;
+  }
+
+  int rc = 0;
+  struct dirent *ent;
+  while((ent = readdir(d))) {
+    char child_abs[1024];
+    char child_rel[1024];
+    struct stat st;
+
+    if(job_cancelled()) {
+      snprintf(local_err, local_err_size, "%s", "cancelled");
+      errno = EINTR;
+      rc = -1;
+      break;
+    }
+    if(!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) continue;
+    if(!path_segment_supported(ent->d_name)) {
+      snprintf(local_err, local_err_size, "unsupported path name: %s",
+               ent->d_name);
+      errno = EINVAL;
+      rc = -1;
+      break;
+    }
+    if(join_abs(child_abs, sizeof(child_abs), dir_path, ent->d_name) != 0 ||
+       join_rel(child_rel, sizeof(child_rel), rel ? rel : "", ent->d_name) != 0) {
+      snprintf(local_err, local_err_size, "%s", "path too long");
+      rc = -1;
+      break;
+    }
+    if(lstat(child_abs, &st) != 0) {
+      snprintf(local_err, local_err_size, "stat: %s", strerror(errno));
+      rc = -1;
+      break;
+    }
+    if(S_ISLNK(st.st_mode)) {
+      snprintf(local_err, local_err_size, "%s", "symlinks are not supported");
+      errno = EINVAL;
+      rc = -1;
+      break;
+    }
+    if(S_ISDIR(st.st_mode)) {
+      if(scan_parallel_note_dir(ctx, child_rel, local_err,
+                                local_err_size) != 0) {
+        rc = -1;
+        break;
+      }
+    } else if(S_ISREG(st.st_mode)) {
+      if(scan_parallel_note_file(ctx, child_abs, child_rel,
+                                 st.st_size > 0 ? (uint64_t)st.st_size : 0,
+                                 local_err, local_err_size) != 0) {
+        rc = -1;
+        break;
+      }
+    } else {
+      snprintf(local_err, local_err_size, "unsupported filesystem node: %s",
+               child_rel);
+      errno = EINVAL;
+      rc = -1;
+      break;
+    }
+  }
+
+  closedir(d);
+  return rc;
+}
+
+static void *
+scan_worker_thread(void *arg) {
+  scan_parallel_ctx_t *ctx = arg;
+  while(1) {
+    scan_dir_task_t task;
+    memset(&task, 0, sizeof(task));
+
+    pthread_mutex_lock(&ctx->lock);
+    while(ctx->task_count == 0 && ctx->active > 0 && !ctx->error && !ctx->stop) {
+      pthread_cond_wait(&ctx->cond, &ctx->lock);
+    }
+    if(ctx->stop || ctx->error ||
+       (ctx->task_count == 0 && ctx->active == 0)) {
+      pthread_cond_broadcast(&ctx->cond);
+      pthread_mutex_unlock(&ctx->lock);
+      break;
+    }
+    task = ctx->tasks[--ctx->task_count];
+    ctx->active++;
+    pthread_mutex_unlock(&ctx->lock);
+
+    char local_err[256] = {0};
+    int rc = scan_process_dir_parallel(ctx, task.rel, local_err,
+                                       sizeof(local_err));
+
+    pthread_mutex_lock(&ctx->lock);
+    ctx->active--;
+    if(rc != 0) {
+      scan_parallel_fail_locked(ctx, local_err[0] ? local_err : "scan failed");
+    } else if(ctx->task_count == 0 && ctx->active == 0) {
+      pthread_cond_broadcast(&ctx->cond);
+    }
+    pthread_mutex_unlock(&ctx->lock);
+  }
+  return NULL;
+}
+
+static void
+scan_parallel_cleanup(scan_parallel_ctx_t *ctx) {
+  if(!ctx) return;
+  free(ctx->tasks);
+  ctx->tasks = NULL;
+  ctx->task_count = 0;
+  ctx->task_cap = 0;
+  if(ctx->sync_initialized) pthread_cond_destroy(&ctx->cond);
+  if(ctx->lock_initialized) pthread_mutex_destroy(&ctx->lock);
+  ctx->sync_initialized = 0;
+  ctx->lock_initialized = 0;
+}
+
+static int
+scan_collect_parallel(const char *root, const char *rel, scan_list_t *files,
+                      scan_stats_t *stats, int workers,
+                      char *err, size_t err_size) {
+  scan_parallel_ctx_t ctx;
+  pthread_t *threads = NULL;
+  int started = 0;
+  int create_failed = 0;
+  int rc = -1;
+
+  memset(&ctx, 0, sizeof(ctx));
+  snprintf(ctx.root, sizeof(ctx.root), "%s", root);
+  ctx.files = files;
+  ctx.started_us = monotonic_us();
+  ctx.stats.workers = (uint64_t)workers;
+  ctx.stats.entries = 1;
+  ctx.stats.dirs = 1;
+  scan_publish_stats(&ctx.stats, ctx.started_us);
+
+  if(pthread_mutex_init(&ctx.lock, NULL) != 0) {
+    scan_parallel_cleanup(&ctx);
+    return 1;
+  }
+  ctx.lock_initialized = 1;
+  if(pthread_cond_init(&ctx.cond, NULL) != 0) {
+    scan_parallel_cleanup(&ctx);
+    return 1;
+  }
+  ctx.sync_initialized = 1;
+  if(scan_queue_push_locked(&ctx, rel ? rel : "") != 0) {
+    scan_parallel_cleanup(&ctx);
+    return 1;
+  }
+
+  threads = calloc((size_t)workers, sizeof(*threads));
+  if(!threads) {
+    scan_parallel_cleanup(&ctx);
+    return 1;
+  }
+  for(int i = 0; i < workers; i++) {
+    int prc = pthread_create(&threads[i], NULL, scan_worker_thread, &ctx);
+    if(prc != 0) {
+      create_failed = 1;
+      break;
+    }
+    started++;
+  }
+  if(create_failed) {
+    pthread_mutex_lock(&ctx.lock);
+    ctx.stop = 1;
+    pthread_cond_broadcast(&ctx.cond);
+    pthread_mutex_unlock(&ctx.lock);
+  }
+  for(int i = 0; i < started; i++) pthread_join(threads[i], NULL);
+  free(threads);
+
+  if(create_failed) {
+    scan_parallel_cleanup(&ctx);
+    return 1;
+  }
+
+  pthread_mutex_lock(&ctx.lock);
+  ctx.stats.elapsed_ms = (monotonic_us() - ctx.started_us) / 1000ULL;
+  scan_publish_stats(&ctx.stats, 0);
+  if(ctx.error) {
+    set_err(err, err_size, "%s", ctx.err[0] ? ctx.err : strerror(ctx.error));
+    errno = ctx.error;
+    rc = -1;
+  } else {
+    if(stats) *stats = ctx.stats;
+    rc = 0;
+  }
+  pthread_mutex_unlock(&ctx.lock);
+  scan_parallel_cleanup(&ctx);
+  return rc;
+}
+
+static int
+scan_collect_serial(const char *root, const char *rel, scan_list_t *files,
+                    scan_stats_t *stats, uint64_t started_us,
+                    char *err, size_t err_size) {
   char dir_path[1024];
   if(rel && rel[0]) join_abs(dir_path, sizeof(dir_path), root, rel);
   else snprintf(dir_path, sizeof(dir_path), "%s", root);
@@ -3130,13 +3498,27 @@ scan_collect(const char *root, const char *rel, scan_list_t *files,
       break;
     }
     if(S_ISDIR(st.st_mode)) {
-      if(scan_collect(root, child_rel, files, err, err_size) != 0) {
+      if(stats) {
+        stats->entries++;
+        stats->dirs++;
+        scan_publish_stats(stats, started_us);
+      }
+      if(scan_collect_serial(root, child_rel, files, stats, started_us,
+                             err, err_size) != 0) {
         rc = -1;
         break;
       }
     } else if(S_ISREG(st.st_mode)) {
+      uint64_t size = st.st_size > 0 ? (uint64_t)st.st_size : 0;
+      if(stats) {
+        stats->entries++;
+        stats->files++;
+        if(UINT64_MAX - stats->bytes < size) stats->bytes = UINT64_MAX;
+        else stats->bytes += size;
+        scan_publish_stats(stats, started_us);
+      }
       if(scan_push(files, child_abs, child_rel,
-                   st.st_size > 0 ? (uint64_t)st.st_size : 0) != 0) {
+                   size) != 0) {
         set_err(err, err_size, "out of memory");
         rc = -1;
         break;
@@ -3149,6 +3531,36 @@ scan_collect(const char *root, const char *rel, scan_list_t *files,
   }
 
   closedir(d);
+  return rc;
+}
+
+static int
+scan_collect(const char *root, const char *rel, scan_list_t *files,
+             scan_stats_t *stats, char *err, size_t err_size) {
+  int workers = scan_default_workers_for_root(root);
+  int rc;
+  if(stats) memset(stats, 0, sizeof(*stats));
+  if(workers > 1) {
+    rc = scan_collect_parallel(root, rel, files, stats, workers, err, err_size);
+    if(rc == 0 || rc < 0) return rc;
+    PFSC_WINDOW_LOG("parallel scan worker startup failed root=%s workers=%d; falling back to serial",
+                    root, workers);
+    scan_list_reset(files);
+    if(err && err_size) err[0] = 0;
+  }
+
+  uint64_t started_us = monotonic_us();
+  if(stats) {
+    stats->workers = 1;
+    stats->entries = 1;
+    stats->dirs = 1;
+    scan_publish_stats(stats, started_us);
+  }
+  rc = scan_collect_serial(root, rel, files, stats, started_us, err, err_size);
+  if(stats) {
+    stats->elapsed_ms = (monotonic_us() - started_us) / 1000ULL;
+    scan_publish_stats(stats, 0);
+  }
   return rc;
 }
 
@@ -4028,12 +4440,15 @@ done:
 
 static int
 build_layout_from_files(const char *root, pfs_layout_t *l,
+                        pfs_app_info_t *info,
                         char *err, size_t err_size) {
   scan_list_t scans = {0};
+  scan_stats_t stats = {0};
   int rc = -1;
 
   job_set_current("Scanning app folder");
-  if(scan_collect(root, "", &scans, err, err_size) != 0) goto done;
+  if(scan_collect(root, "", &scans, &stats, err, err_size) != 0) goto done;
+  scan_stats_to_info(info, &stats);
   if(scans.count == 0) {
     set_err(err, err_size, "app folder contains no files");
     goto done;
@@ -4052,6 +4467,7 @@ build_layout_from_files_stream(const char *root, pfs_layout_t *l,
                                pfs_app_info_t *info,
                                char *err, size_t err_size) {
   scan_list_t scans = {0};
+  scan_stats_t stats = {0};
   int rc = -1;
   uint64_t forward_files = 0;
   uint64_t reverse_files = 0;
@@ -4059,7 +4475,8 @@ build_layout_from_files_stream(const char *root, pfs_layout_t *l,
 
   stream_options_normalize(stream_opts, &normalized);
   job_set_current("Scheduling budgeted stream");
-  if(scan_collect(root, "", &scans, err, err_size) != 0) goto done;
+  if(scan_collect(root, "", &scans, &stats, err, err_size) != 0) goto done;
+  scan_stats_to_info(info, &stats);
   if(scans.count == 0) {
     set_err(err, err_size, "app folder contains no files");
     goto done;
@@ -4630,12 +5047,15 @@ done:
 static int
 build_exfat_layout_from_files(const char *root, const char *title_id,
                               pfs_layout_t *l,
+                              pfs_app_info_t *info,
                               char *err, size_t err_size) {
   scan_list_t scans = {0};
+  scan_stats_t stats = {0};
   int rc = -1;
 
   job_set_current("Scanning app folder");
-  if(scan_collect(root, "", &scans, err, err_size) != 0) goto done;
+  if(scan_collect(root, "", &scans, &stats, err, err_size) != 0) goto done;
+  scan_stats_to_info(info, &stats);
   if(scans.count == 0) {
     set_err(err, err_size, "app folder contains no files");
     goto done;
@@ -4655,6 +5075,7 @@ build_exfat_layout_from_files_stream(const char *root, const char *title_id,
                                      pfs_app_info_t *info,
                                      char *err, size_t err_size) {
   scan_list_t scans = {0};
+  scan_stats_t stats = {0};
   int rc = -1;
   uint64_t forward_files = 0;
   uint64_t reverse_files = 0;
@@ -4662,7 +5083,8 @@ build_exfat_layout_from_files_stream(const char *root, const char *title_id,
 
   stream_options_normalize(stream_opts, &normalized);
   job_set_current("Scheduling budgeted stream");
-  if(scan_collect(root, "", &scans, err, err_size) != 0) goto done;
+  if(scan_collect(root, "", &scans, &stats, err, err_size) != 0) goto done;
+  scan_stats_to_info(info, &stats);
   if(scans.count == 0) {
     set_err(err, err_size, "app folder contains no files");
     goto done;
@@ -7110,29 +7532,25 @@ build_layout_from_image_file(const pfs_app_info_t *info, pfs_layout_t *l,
 }
 
 static int
-pfs_compress_probed_to_ffpfsc_opts(pfs_app_info_t *info, int overwrite,
-                                   int workers, int format,
-                                   int delete_policy,
-                                   int compression_profile,
-                                   const pfs_stream_options_t *stream_opts,
-                                   char *err, size_t err_size) {
-  pfs_layout_t nested = {0};
-  char tmp_path[1024];
-  char vhash_tmp_path[1024];
-  char vhash_output_path[1024];
-  char legacy_tmp_path[1024];
-  char legacy_vhash_tmp_path[1024];
-  int fd = -1;
-  int rc = -1;
-  int delete_started = 0;
-  uint64_t stored_size = 0;
-  const uint64_t outer_file_start = 6 * PFS_BLOCK_SIZE;
-  int worker_count = clamp_worker_count(workers);
-  destructive_stream_ctx_t stream_ctx;
-  int stream_ctx_initialized = 0;
-  int destructive_stream = 0;
+pfs_compress_prepare_probed_to_ffpfsc_opts(pfs_compress_plan_t *plan,
+                                           const pfs_app_info_t *src_info,
+                                           int overwrite, int format,
+                                           int delete_policy,
+                                           int compression_profile,
+                                           const pfs_stream_options_t *stream_opts,
+                                           pfs_app_info_t *info_out,
+                                           char *err, size_t err_size) {
+  pfs_app_info_t *info;
+  if(!plan || !src_info) {
+    set_err(err, err_size, "bad compression plan");
+    errno = EINVAL;
+    return -1;
+  }
+  memset(plan, 0, sizeof(*plan));
+  plan->info = *src_info;
+  info = &plan->info;
 
-  if(!info || !info->source_path[0]) {
+  if(!info->source_path[0]) {
     set_err(err, err_size, "bad compression source");
     errno = EINVAL;
     return -1;
@@ -7199,15 +7617,98 @@ pfs_compress_probed_to_ffpfsc_opts(pfs_app_info_t *info, int overwrite,
     return -2;
   }
 
+  if(info->source_type == PFS_COMPRESS_SOURCE_IMAGE) {
+    job_set_current("Opening existing nested image");
+    if(build_layout_from_image_file(info, &plan->nested, err, err_size) != 0) {
+      goto fail;
+    }
+  } else if(format == PFS_COMPRESS_FORMAT_EXFAT) {
+    job_set_current("Building nested exFAT layout");
+    if(delete_policy == PFS_DELETE_STREAM) {
+      if(build_exfat_layout_from_files_stream(
+             info->source_path, info->title_id, &plan->nested, stream_opts, info,
+             err, err_size) != 0) {
+        goto fail;
+      }
+    } else if(build_exfat_layout_from_files(info->source_path, info->title_id,
+                                            &plan->nested, info, err,
+                                            err_size) != 0) {
+      goto fail;
+    }
+  } else {
+    job_set_current("Building nested PFS layout");
+    if(delete_policy == PFS_DELETE_STREAM) {
+      if(build_layout_from_files_stream(info->source_path, &plan->nested,
+                                        stream_opts, info,
+                                        err, err_size) != 0) {
+        goto fail;
+      }
+    } else if(build_layout_from_files(info->source_path, &plan->nested, info,
+                                      err, err_size) != 0) {
+      goto fail;
+    }
+  }
+  info->nested_size = plan->nested.image_size;
+  if(info_out) *info_out = *info;
+  return 0;
+
+fail:
+  layout_free(&plan->nested);
+  memset(&plan->nested, 0, sizeof(plan->nested));
+  return -1;
+}
+
+int
+pfs_compress_execute_prepared_to_ffpfsc(pfs_compress_plan_t *plan,
+                                        int workers,
+                                        pfs_app_info_t *info_out,
+                                        char *err, size_t err_size) {
+  pfs_app_info_t local_info;
+  pfs_app_info_t *info = &local_info;
+  pfs_layout_t nested = {0};
+  char tmp_path[1024] = {0};
+  char vhash_tmp_path[1024] = {0};
+  char vhash_output_path[1024] = {0};
+  char legacy_tmp_path[1024] = {0};
+  char legacy_vhash_tmp_path[1024] = {0};
+  int fd = -1;
+  int rc = -1;
+  int delete_started = 0;
+  uint64_t stored_size = 0;
+  const uint64_t outer_file_start = 6 * PFS_BLOCK_SIZE;
+  int worker_count = clamp_worker_count(workers);
+  destructive_stream_ctx_t stream_ctx;
+  int stream_ctx_initialized = 0;
+  int destructive_stream = 0;
+  int format;
+  int delete_policy;
+  struct stat output_st;
+
+  if(!plan || !plan->info.source_path[0] || plan->nested.image_size == 0) {
+    set_err(err, err_size, "bad prepared compression plan");
+    errno = EINVAL;
+    return -1;
+  }
+  local_info = plan->info;
+  nested = plan->nested;
+  memset(&plan->nested, 0, sizeof(plan->nested));
+  format = info->format;
+  delete_policy = info->delete_policy;
+  if(stat(info->output_path, &output_st) == 0) {
+    set_err(err, err_size, "output exists");
+    errno = EEXIST;
+    goto done;
+  }
+
   if(pfs_compress_temp_output_path(info->output_path, tmp_path,
                                    sizeof(tmp_path)) != 0) {
     set_err(err, err_size, "temporary output path too long");
-    return -1;
+    goto done;
   }
   if(snprintf(legacy_tmp_path, sizeof(legacy_tmp_path), "%s.tmp",
               info->output_path) >= (int)sizeof(legacy_tmp_path)) {
     set_err(err, err_size, "legacy temporary output path too long");
-    return -1;
+    goto done;
   }
   if(pfs_vhash_sidecar_path(tmp_path, vhash_tmp_path,
                             sizeof(vhash_tmp_path)) != 0 ||
@@ -7216,41 +7717,10 @@ pfs_compress_probed_to_ffpfsc_opts(pfs_app_info_t *info, int overwrite,
      pfs_vhash_sidecar_path(legacy_tmp_path, legacy_vhash_tmp_path,
                             sizeof(legacy_vhash_tmp_path)) != 0) {
     set_err(err, err_size, "validation hash path too long");
-    return -1;
+    goto done;
   }
   unlink(legacy_tmp_path);
   unlink(legacy_vhash_tmp_path);
-
-  if(info->source_type == PFS_COMPRESS_SOURCE_IMAGE) {
-    job_set_current("Opening existing nested image");
-    if(build_layout_from_image_file(info, &nested, err, err_size) != 0) {
-      goto done;
-    }
-  } else if(format == PFS_COMPRESS_FORMAT_EXFAT) {
-    job_set_current("Building nested exFAT layout");
-    if(delete_policy == PFS_DELETE_STREAM) {
-      if(build_exfat_layout_from_files_stream(
-             info->source_path, info->title_id, &nested, stream_opts, info,
-             err, err_size) != 0) {
-        goto done;
-      }
-    } else if(build_exfat_layout_from_files(info->source_path, info->title_id,
-                                            &nested, err, err_size) != 0) {
-      goto done;
-    }
-  } else {
-    job_set_current("Building nested PFS layout");
-    if(delete_policy == PFS_DELETE_STREAM) {
-      if(build_layout_from_files_stream(info->source_path, &nested,
-                                        stream_opts, info,
-                                        err, err_size) != 0) {
-        goto done;
-      }
-    } else if(build_layout_from_files(info->source_path, &nested,
-                                      err, err_size) != 0) {
-      goto done;
-    }
-  }
   destructive_stream = info->source_type == PFS_COMPRESS_SOURCE_APP &&
                        delete_policy == PFS_DELETE_STREAM;
   if(destructive_stream) {
@@ -7354,10 +7824,10 @@ done:
   if(rc != 0 &&
      (delete_policy != PFS_DELETE_STREAM ||
       (!delete_started && !destructive_started))) {
-    unlink(tmp_path);
-    unlink(vhash_tmp_path);
-    unlink(legacy_tmp_path);
-    unlink(legacy_vhash_tmp_path);
+    if(tmp_path[0]) unlink(tmp_path);
+    if(vhash_tmp_path[0]) unlink(vhash_tmp_path);
+    if(legacy_tmp_path[0]) unlink(legacy_tmp_path);
+    if(legacy_vhash_tmp_path[0]) unlink(legacy_vhash_tmp_path);
     if(stream_ctx_initialized && stream_ctx.journal_path[0]) {
       destructive_stream_remove_reverse_dir(&stream_ctx);
       unlink(stream_ctx.journal_path);
@@ -7365,7 +7835,92 @@ done:
   }
   if(stream_ctx_initialized) destructive_stream_free(&stream_ctx);
   layout_free(&nested);
+  if(info_out) *info_out = *info;
   return rc;
+}
+
+void
+pfs_compress_plan_free(pfs_compress_plan_t *plan) {
+  if(!plan) return;
+  layout_free(&plan->nested);
+  free(plan);
+}
+
+static int
+pfs_compress_probed_to_ffpfsc_opts(pfs_app_info_t *info, int overwrite,
+                                   int workers, int format,
+                                   int delete_policy,
+                                   int compression_profile,
+                                   const pfs_stream_options_t *stream_opts,
+                                   char *err, size_t err_size) {
+  pfs_compress_plan_t *plan = calloc(1, sizeof(*plan));
+  int rc;
+  if(!plan) {
+    set_err(err, err_size, "out of memory");
+    errno = ENOMEM;
+    return -1;
+  }
+  rc = pfs_compress_prepare_probed_to_ffpfsc_opts(
+      plan, info, overwrite, format, delete_policy, compression_profile,
+      stream_opts, info, err, err_size);
+  if(rc == 0) {
+    rc = pfs_compress_execute_prepared_to_ffpfsc(
+        plan, workers, info, err, err_size);
+  }
+  pfs_compress_plan_free(plan);
+  return rc;
+}
+
+int
+pfs_compress_prepare_source_to_ffpfsc_opts_profile_output_ex(
+                                           const char *path, int overwrite,
+                                           int format,
+                                           int delete_policy,
+                                           int compression_profile,
+                                           const char *output_path,
+                                           const pfs_stream_options_t *stream_opts,
+                                           pfs_compress_plan_t **plan_out,
+                                           pfs_app_info_t *info,
+                                           char *err, size_t err_size) {
+  pfs_app_info_t local_info;
+  pfs_compress_plan_t *plan = NULL;
+  struct stat st;
+  int rc;
+
+  if(!plan_out) {
+    set_err(err, err_size, "bad compression plan output");
+    errno = EINVAL;
+    return -1;
+  }
+  *plan_out = NULL;
+  if(!info) info = &local_info;
+  if(pfs_compress_probe(path, info, err, err_size) != 0) return -1;
+  if(output_path && output_path[0]) {
+    if(normalize_app_path(output_path, info->output_path,
+                          sizeof(info->output_path)) != 0 ||
+       !ends_with_ci(info->output_path, ".ffpfsc")) {
+      set_err(err, err_size, "bad compression output path");
+      errno = EINVAL;
+      return -1;
+    }
+    info->output_exists = stat(info->output_path, &st) == 0;
+  }
+
+  plan = calloc(1, sizeof(*plan));
+  if(!plan) {
+    set_err(err, err_size, "out of memory");
+    errno = ENOMEM;
+    return -1;
+  }
+  rc = pfs_compress_prepare_probed_to_ffpfsc_opts(
+      plan, info, overwrite, format, delete_policy, compression_profile,
+      stream_opts, info, err, err_size);
+  if(rc != 0) {
+    pfs_compress_plan_free(plan);
+    return rc;
+  }
+  *plan_out = plan;
+  return 0;
 }
 
 int

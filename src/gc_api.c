@@ -167,6 +167,12 @@ typedef struct gc_operation {
   uint64_t compression_source_size;
   uint64_t compressed_size;
   uint64_t saved_bytes;
+  uint64_t scan_bytes;
+  uint64_t scan_files;
+  uint64_t scan_dirs;
+  uint64_t scan_entries;
+  uint64_t scan_elapsed_ms;
+  uint64_t scan_workers;
   uint64_t read_bytes;
   uint64_t read_files;
   uint64_t read_dirs;
@@ -241,6 +247,12 @@ typedef struct gc_history_recovery_event {
   uint64_t compression_source_size;
   uint64_t compressed_size;
   uint64_t saved_bytes;
+  uint64_t scan_bytes;
+  uint64_t scan_files;
+  uint64_t scan_dirs;
+  uint64_t scan_entries;
+  uint64_t scan_elapsed_ms;
+  uint64_t scan_workers;
   uint64_t read_bytes;
   uint64_t read_files;
   uint64_t read_dirs;
@@ -2493,6 +2505,17 @@ operation_store_compression_stats(gc_operation_t *op, uint64_t source_size,
 }
 
 static void
+operation_store_scan_stats(gc_operation_t *op, const pfs_app_info_t *info) {
+  if(!op || !info) return;
+  op->scan_bytes = info->scan_bytes;
+  op->scan_files = info->scan_files;
+  op->scan_dirs = info->scan_dirs;
+  op->scan_entries = info->scan_entries;
+  op->scan_elapsed_ms = info->scan_elapsed_ms;
+  op->scan_workers = info->scan_workers;
+}
+
+static void
 operation_store_repair_success(gc_operation_t *op,
                                const pfs_repair_info_t *repair) {
   if(!op || !repair) return;
@@ -2596,11 +2619,14 @@ append_history_log(const gc_operation_t *op) {
 	     json_append(&b, ",\"readFirstError\":") == 0 &&
 	     json_string(&b, op->read_first_error) == 0 &&
 		     json_appendf(&b,
-			                  ",\"streamBudgetBytes\":%llu,"
-			                  "\"compressionSourceSize\":%llu,"
-			                  "\"compressedSize\":%llu,"
-			                  "\"savedBytes\":%llu,"
-			                  "\"readBytes\":%llu,\"readFiles\":%llu,"
+				                  ",\"streamBudgetBytes\":%llu,"
+				                  "\"compressionSourceSize\":%llu,"
+				                  "\"compressedSize\":%llu,"
+				                  "\"savedBytes\":%llu,"
+                          "\"scanBytes\":%llu,\"scanFiles\":%llu,"
+                          "\"scanDirs\":%llu,\"scanEntries\":%llu,"
+                          "\"scanElapsedMs\":%llu,\"scanWorkers\":%llu,"
+				                  "\"readBytes\":%llu,\"readFiles\":%llu,"
 			                  "\"readDirs\":%llu,\"readElapsedMs\":%llu,"
 			                  "\"readAvgBps\":%llu,\"readMinBps\":%llu,"
 			                  "\"readMaxBps\":%llu,\"readErrors\":%llu,"
@@ -2611,10 +2637,16 @@ append_history_log(const gc_operation_t *op) {
 		                  "\"hashMismatchedBlocks\":%llu,"
 		                  "\"softwareComparedBlocks\":%llu}\n",
 		                  (unsigned long long)op->stream_budget_bytes,
-			                  (unsigned long long)op->compression_source_size,
-			                  (unsigned long long)op->compressed_size,
-			                  (unsigned long long)op->saved_bytes,
-			                  (unsigned long long)op->read_bytes,
+				                  (unsigned long long)op->compression_source_size,
+				                  (unsigned long long)op->compressed_size,
+				                  (unsigned long long)op->saved_bytes,
+                          (unsigned long long)op->scan_bytes,
+                          (unsigned long long)op->scan_files,
+                          (unsigned long long)op->scan_dirs,
+                          (unsigned long long)op->scan_entries,
+                          (unsigned long long)op->scan_elapsed_ms,
+                          (unsigned long long)op->scan_workers,
+				                  (unsigned long long)op->read_bytes,
 			                  (unsigned long long)op->read_files,
 			                  (unsigned long long)op->read_dirs,
 			                  (unsigned long long)op->read_elapsed_ms,
@@ -3447,11 +3479,17 @@ recovery_event_from_history_line(const char *line,
                          sizeof(out->read_first_error_path));
   json_find_string_value(line, "readFirstError", out->read_first_error,
                          sizeof(out->read_first_error));
-		  out->compression_source_size =
-		      json_find_u64_value(line, "compressionSourceSize", 0);
-		  out->compressed_size = json_find_u64_value(line, "compressedSize", 0);
-		  out->saved_bytes = json_find_u64_value(line, "savedBytes", 0);
-  out->read_bytes = json_find_u64_value(line, "readBytes", 0);
+			  out->compression_source_size =
+			      json_find_u64_value(line, "compressionSourceSize", 0);
+			  out->compressed_size = json_find_u64_value(line, "compressedSize", 0);
+			  out->saved_bytes = json_find_u64_value(line, "savedBytes", 0);
+  out->scan_bytes = json_find_u64_value(line, "scanBytes", 0);
+  out->scan_files = json_find_u64_value(line, "scanFiles", 0);
+  out->scan_dirs = json_find_u64_value(line, "scanDirs", 0);
+  out->scan_entries = json_find_u64_value(line, "scanEntries", 0);
+  out->scan_elapsed_ms = json_find_u64_value(line, "scanElapsedMs", 0);
+  out->scan_workers = json_find_u64_value(line, "scanWorkers", 0);
+	  out->read_bytes = json_find_u64_value(line, "readBytes", 0);
   out->read_files = json_find_u64_value(line, "readFiles", 0);
   out->read_dirs = json_find_u64_value(line, "readDirs", 0);
   out->read_elapsed_ms = json_find_u64_value(line, "readElapsedMs", 0);
@@ -3528,10 +3566,16 @@ recovery_append_terminal_history(const gc_history_recovery_event_t *ev,
              ev->read_first_error_path);
     snprintf(op.read_first_error, sizeof(op.read_first_error), "%s",
              ev->read_first_error);
-		    op.compression_source_size = ev->compression_source_size;
-		    op.compressed_size = ev->compressed_size;
-		    op.saved_bytes = ev->saved_bytes;
-    op.read_bytes = ev->read_bytes;
+			    op.compression_source_size = ev->compression_source_size;
+			    op.compressed_size = ev->compressed_size;
+			    op.saved_bytes = ev->saved_bytes;
+    op.scan_bytes = ev->scan_bytes;
+    op.scan_files = ev->scan_files;
+    op.scan_dirs = ev->scan_dirs;
+    op.scan_entries = ev->scan_entries;
+    op.scan_elapsed_ms = ev->scan_elapsed_ms;
+    op.scan_workers = ev->scan_workers;
+	    op.read_bytes = ev->read_bytes;
     op.read_files = ev->read_files;
     op.read_dirs = ev->read_dirs;
     op.read_elapsed_ms = ev->read_elapsed_ms;
@@ -3590,10 +3634,16 @@ recovery_append_phase_history(const gc_history_recovery_event_t *ev,
            ev->read_first_error_path);
   snprintf(op.read_first_error, sizeof(op.read_first_error), "%s",
            ev->read_first_error);
-		  op.compression_source_size = ev->compression_source_size;
-		  op.compressed_size = ev->compressed_size;
-		  op.saved_bytes = ev->saved_bytes;
-  op.read_bytes = ev->read_bytes;
+			  op.compression_source_size = ev->compression_source_size;
+			  op.compressed_size = ev->compressed_size;
+			  op.saved_bytes = ev->saved_bytes;
+  op.scan_bytes = ev->scan_bytes;
+  op.scan_files = ev->scan_files;
+  op.scan_dirs = ev->scan_dirs;
+  op.scan_entries = ev->scan_entries;
+  op.scan_elapsed_ms = ev->scan_elapsed_ms;
+  op.scan_workers = ev->scan_workers;
+	  op.read_bytes = ev->read_bytes;
   op.read_files = ev->read_files;
   op.read_dirs = ev->read_dirs;
   op.read_elapsed_ms = ev->read_elapsed_ms;
@@ -3735,10 +3785,16 @@ recovery_enqueue_stream_resume(const gc_history_recovery_event_t *ev) {
 	  snprintf(op->stream_order, sizeof(op->stream_order), "%s",
 	           ev->stream_order[0] ? ev->stream_order : "budgeted-gain");
 	  op->stream_budget_bytes = ev->stream_budget_bytes;
-	  op->compression_source_size = ev->compression_source_size;
-	  op->compressed_size = ev->compressed_size;
-	  op->saved_bytes = ev->saved_bytes;
-	  op->recovery_direct = 1;
+		  op->compression_source_size = ev->compression_source_size;
+		  op->compressed_size = ev->compressed_size;
+		  op->saved_bytes = ev->saved_bytes;
+  op->scan_bytes = ev->scan_bytes;
+  op->scan_files = ev->scan_files;
+  op->scan_dirs = ev->scan_dirs;
+  op->scan_entries = ev->scan_entries;
+  op->scan_elapsed_ms = ev->scan_elapsed_ms;
+  op->scan_workers = ev->scan_workers;
+		  op->recovery_direct = 1;
 	  append_history_log(op);
   start_next_locked();
   pthread_mutex_unlock(&g_gc_lock);
@@ -3955,10 +4011,16 @@ recovery_restore_queued_op(const gc_history_recovery_event_t *ev) {
            ev->read_first_error_path);
   snprintf(op->read_first_error, sizeof(op->read_first_error), "%s",
            ev->read_first_error);
-		  op->compression_source_size = ev->compression_source_size;
-		  op->compressed_size = ev->compressed_size;
-		  op->saved_bytes = ev->saved_bytes;
-  op->read_bytes = ev->read_bytes;
+			  op->compression_source_size = ev->compression_source_size;
+			  op->compressed_size = ev->compressed_size;
+			  op->saved_bytes = ev->saved_bytes;
+  op->scan_bytes = ev->scan_bytes;
+  op->scan_files = ev->scan_files;
+  op->scan_dirs = ev->scan_dirs;
+  op->scan_entries = ev->scan_entries;
+  op->scan_elapsed_ms = ev->scan_elapsed_ms;
+  op->scan_workers = ev->scan_workers;
+	  op->read_bytes = ev->read_bytes;
   op->read_files = ev->read_files;
   op->read_dirs = ev->read_dirs;
   op->read_elapsed_ms = ev->read_elapsed_ms;
@@ -5246,6 +5308,7 @@ run_compress_op(gc_operation_t *op) {
   gc_game_t game = {0};
   char err[256] = {0};
   pfs_app_info_t info = {0};
+  pfs_compress_plan_t *compress_plan = NULL;
   pfs_repair_info_t repair = {0};
   gc_game_t compressed_game = {0};
   gc_hidden_instance_t hidden[GC_MAX_GAMES];
@@ -5257,6 +5320,7 @@ run_compress_op(gc_operation_t *op) {
   int preserve_hide = !strcmp(op->preserve_original, "hide");
   int delete_policy = stream_delete ?
       PFS_DELETE_STREAM : PFS_DELETE_KEEP;
+  int pfs_delete_policy = delete_policy;
   int compression_profile = compression_profile_value(op->compression_profile);
   uint64_t stream_budget_bytes = op->stream_budget_bytes ?
       op->stream_budget_bytes : PFS_STREAM_DEFAULT_BUDGET_BYTES;
@@ -5285,6 +5349,11 @@ run_compress_op(gc_operation_t *op) {
   int mount_missed = 0;
   struct stat st;
 
+#define COMPRESS_FAIL_RETURN() do { \
+    pfs_compress_plan_free(compress_plan); \
+    return -1; \
+  } while(0)
+
   gc_checkpoint("compress find game");
   snprintf(op->format, sizeof(op->format), "%s",
            format == PFS_COMPRESS_FORMAT_EXFAT ? "exfat" : "pfs");
@@ -5300,7 +5369,7 @@ run_compress_op(gc_operation_t *op) {
                                                sizeof(journal_path)) != 0) {
       snprintf(op->error, sizeof(op->error), "%s",
                "could not derive stream journal path");
-      return -1;
+      COMPRESS_FAIL_RETURN();
     }
     append_operation_phase(op, "compressing");
     atomic_store(&g_job.stream_min_free_bytes, 0);
@@ -5316,7 +5385,7 @@ run_compress_op(gc_operation_t *op) {
                err[0] ? err : "stream compression resume failed");
       gc_log("compress resume failed title=%s err=%s", op->title_id,
              op->error);
-      return -1;
+      COMPRESS_FAIL_RETURN();
     }
     snprintf(op->source_path, sizeof(op->source_path), "%s", info.source_path);
     snprintf(op->output_path, sizeof(op->output_path), "%s", info.output_path);
@@ -5325,10 +5394,10 @@ run_compress_op(gc_operation_t *op) {
     append_operation_phase(op, "source-deleted");
     goto post_compress;
   }
-  if(find_game_for_operation(op, &game, 1) != 0) {
+  if(find_game_for_operation(op, &game, 0) != 0) {
     snprintf(op->error, sizeof(op->error), "%s", "game is no longer mounted");
     gc_log("compress failed title=%s err=%s", op->title_id, op->error);
-    return -1;
+    COMPRESS_FAIL_RETURN();
   }
   snprintf(op->source_path, sizeof(op->source_path), "%s", game.source_path);
   if(op->target_root[0]) {
@@ -5337,7 +5406,7 @@ run_compress_op(gc_operation_t *op) {
       snprintf(op->error, sizeof(op->error), "%s",
                "destructive compression is not available while writing to target storage");
       gc_log("compress failed title=%s err=%s", op->title_id, op->error);
-      return -1;
+      COMPRESS_FAIL_RETURN();
     }
     if(build_compress_target_path(op->target_root, &game,
                                   compress_output_path,
@@ -5345,7 +5414,7 @@ run_compress_op(gc_operation_t *op) {
                                   err, sizeof(err)) != 0) {
       snprintf(op->error, sizeof(op->error), "%s", err);
       gc_log("compress failed title=%s err=%s", op->title_id, op->error);
-      return -1;
+      COMPRESS_FAIL_RETURN();
     }
     snprintf(op->output_path, sizeof(op->output_path), "%s",
              compress_output_path);
@@ -5361,10 +5430,48 @@ run_compress_op(gc_operation_t *op) {
              err[0] ? err : "could not close game");
     gc_log("compress close game failed title=%s err=%s", op->title_id,
            op->error);
-    return -1;
+    COMPRESS_FAIL_RETURN();
   }
   append_operation_phase(op, "compressing");
   job_set_phase("compressing", 0, 0, "Compressing game");
+  pfs_delete_policy = delete_policy;
+  if(delete_after && game.source_kind == GC_SOURCE_FOLDER) {
+    pfs_delete_policy = PFS_DELETE_AFTER;
+  }
+  if(game.source_kind == GC_SOURCE_FOLDER) {
+    gc_checkpoint("compress prepare scan");
+    if(pfs_compress_prepare_source_to_ffpfsc_opts_profile_output_ex(
+           game.source_path, 0, format, pfs_delete_policy, compression_profile,
+           moving_to_target ? compress_output_path : NULL,
+           stream_delete ? &stream_opts : NULL,
+           &compress_plan, &info, err, sizeof(err)) != 0) {
+      snprintf(op->error, sizeof(op->error), "%s",
+               err[0] ? err : "compression scan failed");
+      gc_log("compress scan failed title=%s err=%s", op->title_id, op->error);
+      COMPRESS_FAIL_RETURN();
+    }
+    operation_store_scan_stats(op, &info);
+    game.source_size = info.scan_bytes;
+    game.required_bytes = info.scan_bytes;
+    game.size_pending = 0;
+    if(!moving_to_target) {
+      if(free_bytes_for_output(compress_output_path, &game.free_bytes) != 0) {
+        game.free_bytes = 0;
+      }
+      game.extra_needed = game.free_bytes >= game.required_bytes
+          ? 0 : game.required_bytes - game.free_bytes;
+    }
+    size_cache_store(game.source_path, info.scan_bytes);
+    gc_log("compress scan title=%s storage=%s workers=%llu bytes=%llu files=%llu dirs=%llu entries=%llu elapsedMs=%llu path=%s",
+           op->title_id, storage_name_for_path(game.source_path),
+           (unsigned long long)info.scan_workers,
+           (unsigned long long)info.scan_bytes,
+           (unsigned long long)info.scan_files,
+           (unsigned long long)info.scan_dirs,
+           (unsigned long long)info.scan_entries,
+           (unsigned long long)info.scan_elapsed_ms,
+           game.source_path);
+  }
   gc_log("compress source title=%s kind=%s size=%llu free=%llu required=%llu path=%s output=%s targetRoot=%s",
          op->title_id, source_kind_name(game.source_kind),
          (unsigned long long)game.source_size,
@@ -5376,7 +5483,7 @@ run_compress_op(gc_operation_t *op) {
     snprintf(op->error, sizeof(op->error), "%s",
              "could not measure game size");
     gc_log("compress failed title=%s err=%s", op->title_id, op->error);
-    return -1;
+    COMPRESS_FAIL_RETURN();
   }
   if(moving_to_target) {
     if(path_parent(op->target_root, err, sizeof(err)) != 0 ||
@@ -5384,18 +5491,18 @@ run_compress_op(gc_operation_t *op) {
       snprintf(op->error, sizeof(op->error), "%s",
                "selected target storage is unavailable");
       gc_log("compress failed title=%s err=%s", op->title_id, op->error);
-      return -1;
+      COMPRESS_FAIL_RETURN();
     }
     if(mkdirs(op->target_root) != 0) {
       snprintf(op->error, sizeof(op->error), "create target root: %s",
                strerror(errno));
       gc_log("compress failed title=%s err=%s", op->title_id, op->error);
-      return -1;
+      COMPRESS_FAIL_RETURN();
     }
     if(stat(compress_output_path, &st) == 0) {
       snprintf(op->error, sizeof(op->error), "%s", "target already exists");
       gc_log("compress failed title=%s err=%s", op->title_id, op->error);
-      return -1;
+      COMPRESS_FAIL_RETURN();
     }
     if(space_for_path(op->target_root, &target_free_bytes, NULL) != 0 ||
        target_free_bytes < game.required_bytes) {
@@ -5406,7 +5513,7 @@ run_compress_op(gc_operation_t *op) {
                "not enough free storage on selected target storage; free %llu more bytes",
                (unsigned long long)need);
       gc_log("compress failed title=%s err=%s", op->title_id, op->error);
-      return -1;
+      COMPRESS_FAIL_RETURN();
     }
   }
   if(!moving_to_target && !stream_delete &&
@@ -5415,7 +5522,7 @@ run_compress_op(gc_operation_t *op) {
              "not enough free storage; free %llu more bytes",
              (unsigned long long)(game.required_bytes - game.free_bytes));
     gc_log("compress failed title=%s err=%s", op->title_id, op->error);
-    return -1;
+    COMPRESS_FAIL_RETURN();
   }
   if(stream_delete &&
      !stream_delete_allowed_by_space_budget(&game, stream_budget_bytes)) {
@@ -5427,7 +5534,7 @@ run_compress_op(gc_operation_t *op) {
              "not enough free storage for delete-while-processing; free %llu more bytes",
              (unsigned long long)need);
     gc_log("compress failed title=%s err=%s", op->title_id, op->error);
-    return -1;
+    COMPRESS_FAIL_RETURN();
   }
   if(stream_delete) {
     atomic_store(&g_job.stream_min_free_bytes,
@@ -5444,7 +5551,7 @@ run_compress_op(gc_operation_t *op) {
     snprintf(op->error, sizeof(op->error), "%s",
              "could not derive ShadowMount hints");
     gc_log("compress failed title=%s err=%s", op->title_id, op->error);
-    return -1;
+    COMPRESS_FAIL_RETURN();
   }
   if(gc_shadowmount_prepare_pfsc_hints_for_title(op->title_id,
                                                 compress_output_path,
@@ -5454,30 +5561,35 @@ run_compress_op(gc_operation_t *op) {
     snprintf(op->error, sizeof(op->error), "ShadowMount hint failed: %s",
              err[0] ? err : "unknown");
     gc_log("compress failed title=%s err=%s", op->title_id, op->error);
-    return -1;
+    COMPRESS_FAIL_RETURN();
   }
   gc_log("compress shadowmount hints title=%s outer=%s nested=%s type=%d",
          op->title_id, compress_output_path, planned_nested_name,
          planned_nested_type);
 
   gc_checkpoint("compress writing ffpfsc");
-  int pfs_delete_policy = delete_policy;
-  if(delete_after && game.source_kind == GC_SOURCE_FOLDER) {
-    pfs_delete_policy = PFS_DELETE_AFTER;
+  int compress_rc;
+  if(compress_plan) {
+    compress_rc = pfs_compress_execute_prepared_to_ffpfsc(
+        compress_plan, PFS_COMPRESS_DEFAULT_WORKERS, &info, err, sizeof(err));
+    pfs_compress_plan_free(compress_plan);
+    compress_plan = NULL;
+  } else {
+    compress_rc = pfs_compress_source_to_ffpfsc_opts_profile_output_ex(
+        game.source_path, 0, PFS_COMPRESS_DEFAULT_WORKERS,
+        format, pfs_delete_policy, compression_profile,
+        moving_to_target ? compress_output_path : NULL,
+        stream_delete ? &stream_opts : NULL,
+        &info, err, sizeof(err));
   }
-  int compress_rc = pfs_compress_source_to_ffpfsc_opts_profile_output_ex(
-      game.source_path, 0, PFS_COMPRESS_DEFAULT_WORKERS,
-      format, pfs_delete_policy, compression_profile,
-      moving_to_target ? compress_output_path : NULL,
-      stream_delete ? &stream_opts : NULL,
-      &info, err, sizeof(err));
   if(compress_rc != 0) {
     snprintf(op->error, sizeof(op->error), "%s",
              err[0] ? err : "compression failed");
     gc_log("compress failed title=%s err=%s", op->title_id, op->error);
-    return -1;
+    COMPRESS_FAIL_RETURN();
   }
-	  snprintf(op->output_path, sizeof(op->output_path), "%s", info.output_path);
+  operation_store_scan_stats(op, &info);
+  snprintf(op->output_path, sizeof(op->output_path), "%s", info.output_path);
 	  operation_store_compression_stats(op, game.source_size, info.output_path);
 	  gc_log("compress wrote title=%s output=%s nested=%s nestedSize=%llu storedSize=%llu",
 	         op->title_id, info.output_path, info.nested_name,
@@ -5512,7 +5624,7 @@ post_compress:
     if(!compressed_output_committed) {
       cleanup_failed_safe_compress_output(info.output_path, op->title_id);
     }
-    return -1;
+    COMPRESS_FAIL_RETURN();
   }
   if(mount_missed) {
     char restore_err[256] = {0};
@@ -5526,7 +5638,7 @@ post_compress:
              err[0] ? err : "ShadowMountPlus did not mount compressed output");
     gc_log("compress mount missed title=%s output=%s detail=%s",
            op->title_id, info.output_path, op->error);
-    return -1;
+    COMPRESS_FAIL_RETURN();
   }
 
   gc_checkpoint("compress wait repair");
@@ -5553,7 +5665,7 @@ post_compress:
     if(!compressed_output_committed) {
       cleanup_failed_safe_compress_output(info.output_path, op->title_id);
     }
-    return -1;
+    COMPRESS_FAIL_RETURN();
   }
 
   gc_checkpoint("compress force remount");
@@ -5577,7 +5689,7 @@ post_compress:
           (void)mount_switch_restore_after_operation(op, hidden, hidden_count,
                                                      restore_err,
                                                      sizeof(restore_err));
-          return -1;
+          COMPRESS_FAIL_RETURN();
         }
         gc_log("compress source deleted title=%s path=%s", op->title_id,
                game.source_path);
@@ -5593,7 +5705,7 @@ post_compress:
                    "could not restore duplicate instances");
           gc_log("compress restore failed title=%s err=%s", op->title_id,
                  op->error);
-          return -1;
+          COMPRESS_FAIL_RETURN();
         }
       }
       operation_mark_verified_not_mounted(op, err);
@@ -5614,7 +5726,7 @@ post_compress:
              err[0] ? err : "repair smoke verification failed");
     gc_log("compress smoke verify failed title=%s err=%s", op->title_id,
            op->error);
-    return -1;
+    COMPRESS_FAIL_RETURN();
   }
 
   (void)write_validation_marker_ex(op->title_id, info.output_path, &repair,
@@ -5637,7 +5749,7 @@ post_compress:
       (void)mount_switch_restore_after_operation(op, hidden, hidden_count,
                                                  restore_err,
                                                  sizeof(restore_err));
-      return -1;
+      COMPRESS_FAIL_RETURN();
     }
     gc_log("compress source deleted title=%s path=%s", op->title_id,
            game.source_path);
@@ -5660,7 +5772,7 @@ post_compress:
       (void)mount_switch_restore_after_operation(op, hidden, hidden_count,
                                                  restore_err,
                                                  sizeof(restore_err));
-      return -1;
+      COMPRESS_FAIL_RETURN();
     }
   }
   {
@@ -5673,22 +5785,23 @@ post_compress:
                "could not restore duplicate instances");
       gc_log("compress restore failed title=%s err=%s", op->title_id,
              op->error);
-      return -1;
+      COMPRESS_FAIL_RETURN();
     }
   }
-  snprintf(op->result, sizeof(op->result), "%s", final_result);
-		  uint64_t final_compressed_size =
-		      source_size_bytes_exact(info.output_path, GC_SOURCE_COMPRESSED);
-	  operation_store_compression_stats(op, game.source_size, info.output_path);
-	  uint64_t saved_bytes = game.source_size > final_compressed_size
-	      ? game.source_size - final_compressed_size
-	      : 0;
+	  snprintf(op->result, sizeof(op->result), "%s", final_result);
+  uint64_t final_compressed_size =
+      source_size_bytes_exact(info.output_path, GC_SOURCE_COMPRESSED);
+  operation_store_compression_stats(op, game.source_size, info.output_path);
+  uint64_t saved_bytes = game.source_size > final_compressed_size
+      ? game.source_size - final_compressed_size
+      : 0;
   gc_log("compress complete title=%s result=%s repaired=%llu saved=%llu",
          op->title_id, op->result,
          (unsigned long long)op->repaired_blocks,
          (unsigned long long)saved_bytes);
   return 0;
 }
+#undef COMPRESS_FAIL_RETURN
 
 static int
 run_uncompress_op(gc_operation_t *op) {
@@ -5815,11 +5928,11 @@ run_uncompress_op(gc_operation_t *op) {
                        sizeof(err)) != 0) {
       snprintf(op->error, sizeof(op->error), "%s",
                err[0] ? err : "uncompressed image is not valid");
-      gc_log("uncompress output verify failed title=%s path=%s err=%s",
-             op->title_id, info.output_path, op->error);
-      cleanup_failed_uncompress_output(info.output_path, op->title_id);
+	      gc_log("uncompress output verify failed title=%s path=%s err=%s",
+	             op->title_id, info.output_path, op->error);
+	      cleanup_failed_uncompress_output(info.output_path, op->title_id);
       return -1;
-    }
+	    }
     if(shadow_image_mount_point(info.output_path, output_probe.nested_type,
                                 expected_mount,
                                 sizeof(expected_mount)) != 0) {
@@ -8181,11 +8294,14 @@ append_op_summary(json_buf_t *b, const gc_operation_t *op) {
 	      json_append(b, ",\"readFirstError\":") == 0 &&
 	      json_string(b, op->read_first_error) == 0 &&
 	      json_appendf(b,
-		                   ",\"streamBudgetBytes\":%llu,"
-		                   "\"compressionSourceSize\":%llu,"
-		                   "\"compressedSize\":%llu,"
-		                   "\"savedBytes\":%llu,"
-		                   "\"readBytes\":%llu,\"readFiles\":%llu,"
+			                   ",\"streamBudgetBytes\":%llu,"
+			                   "\"compressionSourceSize\":%llu,"
+			                   "\"compressedSize\":%llu,"
+			                   "\"savedBytes\":%llu,"
+                         "\"scanBytes\":%llu,\"scanFiles\":%llu,"
+                         "\"scanDirs\":%llu,\"scanEntries\":%llu,"
+                         "\"scanElapsedMs\":%llu,\"scanWorkers\":%llu,"
+			                   "\"readBytes\":%llu,\"readFiles\":%llu,"
 		                   "\"readDirs\":%llu,\"readElapsedMs\":%llu,"
 		                   "\"readAvgBps\":%llu,\"readMinBps\":%llu,"
 		                   "\"readMaxBps\":%llu,\"readErrors\":%llu,"
@@ -8196,10 +8312,16 @@ append_op_summary(json_buf_t *b, const gc_operation_t *op) {
 	                   "\"hashMismatchedBlocks\":%llu,"
 	                   "\"softwareComparedBlocks\":%llu}",
 	                   (unsigned long long)op->stream_budget_bytes,
-		                   (unsigned long long)op->compression_source_size,
-		                   (unsigned long long)op->compressed_size,
-		                   (unsigned long long)op->saved_bytes,
-		                   (unsigned long long)op->read_bytes,
+			                   (unsigned long long)op->compression_source_size,
+			                   (unsigned long long)op->compressed_size,
+			                   (unsigned long long)op->saved_bytes,
+                         (unsigned long long)op->scan_bytes,
+                         (unsigned long long)op->scan_files,
+                         (unsigned long long)op->scan_dirs,
+                         (unsigned long long)op->scan_entries,
+                         (unsigned long long)op->scan_elapsed_ms,
+                         (unsigned long long)op->scan_workers,
+			                   (unsigned long long)op->read_bytes,
 		                   (unsigned long long)op->read_files,
 		                   (unsigned long long)op->read_dirs,
 		                   (unsigned long long)op->read_elapsed_ms,
@@ -8758,10 +8880,16 @@ job_request(const http_request_t *req) {
   long hash_checked = atomic_load(&g_job.hash_checked_blocks);
   long hash_matched = atomic_load(&g_job.hash_matched_blocks);
   long hash_mismatched = atomic_load(&g_job.hash_mismatched_blocks);
-  long software_compared = atomic_load(&g_job.software_compared_blocks);
-  long writer_wait_us = atomic_load(&g_job.writer_wait_us);
-  long worker_wait_us = atomic_load(&g_job.worker_wait_us);
-  long repair_read_bytes = atomic_load(&g_job.repair_read_bytes);
+	  long software_compared = atomic_load(&g_job.software_compared_blocks);
+	  long writer_wait_us = atomic_load(&g_job.writer_wait_us);
+	  long worker_wait_us = atomic_load(&g_job.worker_wait_us);
+  long scan_bytes = atomic_load(&g_job.scan_bytes);
+  long scan_files = atomic_load(&g_job.scan_files);
+  long scan_dirs = atomic_load(&g_job.scan_dirs);
+  long scan_entries = atomic_load(&g_job.scan_entries);
+  long scan_elapsed_ms = atomic_load(&g_job.scan_elapsed_ms);
+  long scan_workers = atomic_load(&g_job.scan_workers);
+	  long repair_read_bytes = atomic_load(&g_job.repair_read_bytes);
   long repair_written_bytes = atomic_load(&g_job.repair_written_bytes);
   long repair_copy_bytes = atomic_load(&g_job.repair_copy_bytes);
   long stream_min_free = atomic_load(&g_job.stream_min_free_bytes);
@@ -8821,10 +8949,16 @@ job_request(const http_request_t *req) {
     hash_checked = 0;
     hash_matched = 0;
     hash_mismatched = 0;
-    software_compared = 0;
-    writer_wait_us = 0;
-    worker_wait_us = 0;
-    repair_read_bytes = 0;
+	    software_compared = 0;
+	    writer_wait_us = 0;
+	    worker_wait_us = 0;
+    scan_bytes = 0;
+    scan_files = 0;
+    scan_dirs = 0;
+    scan_entries = 0;
+    scan_elapsed_ms = 0;
+    scan_workers = 0;
+	    repair_read_bytes = 0;
     repair_written_bytes = 0;
     repair_copy_bytes = 0;
     stream_min_free = 0;
@@ -8874,10 +9008,16 @@ job_request(const http_request_t *req) {
                   "\"hashCheckedBlocks\":%ld,"
                   "\"hashMatchedBlocks\":%ld,"
                   "\"hashMismatchedBlocks\":%ld,"
-                  "\"softwareComparedBlocks\":%ld,"
-                  "\"writerWaitUs\":%ld,"
-                  "\"workerWaitUs\":%ld,"
-	                  "\"repairReadBytes\":%ld,"
+	                  "\"softwareComparedBlocks\":%ld,"
+	                  "\"writerWaitUs\":%ld,"
+	                  "\"workerWaitUs\":%ld,"
+                    "\"scanBytes\":%ld,"
+                    "\"scanFiles\":%ld,"
+                    "\"scanDirs\":%ld,"
+                    "\"scanEntries\":%ld,"
+                    "\"scanElapsedMs\":%ld,"
+                    "\"scanWorkers\":%ld,"
+		                  "\"repairReadBytes\":%ld,"
 	                  "\"repairWrittenBytes\":%ld,"
 	                  "\"repairCopyBytes\":%ld,"
 	                  "\"streamMinFreeBytes\":%ld,"
@@ -8903,7 +9043,10 @@ job_request(const http_request_t *req) {
                   bad_blocks_found, bad_blocks_found, repaired_blocks,
                   hash_checked, hash_matched, hash_mismatched,
                   software_compared,
-	                  writer_wait_us, worker_wait_us, repair_read_bytes,
+		                  writer_wait_us, worker_wait_us,
+                  scan_bytes, scan_files, scan_dirs, scan_entries,
+                  scan_elapsed_ms, scan_workers,
+                  repair_read_bytes,
 	                  repair_written_bytes, repair_copy_bytes,
 	                  stream_min_free, stream_budget, stream_credit,
 	                  stream_deleted, stream_reverse_temp,

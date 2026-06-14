@@ -24,7 +24,15 @@ typedef struct pfs_app_info {
   uint64_t stream_reserve_bytes;
   uint64_t stream_forward_files;
   uint64_t stream_reverse_files;
+  uint64_t scan_bytes;
+  uint64_t scan_files;
+  uint64_t scan_dirs;
+  uint64_t scan_entries;
+  uint64_t scan_elapsed_ms;
+  uint64_t scan_workers;
 } pfs_app_info_t;
+
+typedef struct pfs_compress_plan pfs_compress_plan_t;
 
 typedef struct pfs_decompress_info {
   char source_path[1024];
@@ -119,6 +127,21 @@ int pfs_compress_source_to_ffpfsc_opts_profile_output_ex(
                                       const pfs_stream_options_t *stream_opts,
                                       pfs_app_info_t *info,
                                       char *err, size_t err_size);
+int pfs_compress_prepare_source_to_ffpfsc_opts_profile_output_ex(
+                                      const char *path, int overwrite,
+                                      int format,
+                                      int delete_policy,
+                                      int compression_profile,
+                                      const char *output_path,
+                                      const pfs_stream_options_t *stream_opts,
+                                      pfs_compress_plan_t **plan_out,
+                                      pfs_app_info_t *info,
+                                      char *err, size_t err_size);
+int pfs_compress_execute_prepared_to_ffpfsc(pfs_compress_plan_t *plan,
+                                            int workers,
+                                            pfs_app_info_t *info,
+                                            char *err, size_t err_size);
+void pfs_compress_plan_free(pfs_compress_plan_t *plan);
 int pfs_compress_temp_output_path(const char *output_path, char *out,
                                   size_t out_size);
 int pfs_compress_stream_journal_path(const char *output_path, char *out,

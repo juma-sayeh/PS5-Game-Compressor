@@ -60,6 +60,12 @@ struct job_state {
   atomic_long     phase_count;
   atomic_long     writer_wait_us;
   atomic_long     worker_wait_us;
+  atomic_long     scan_bytes;
+  atomic_long     scan_files;
+  atomic_long     scan_dirs;
+  atomic_long     scan_entries;
+  atomic_long     scan_elapsed_ms;
+  atomic_long     scan_workers;
   atomic_long     repair_read_bytes;
   atomic_long     repair_written_bytes;
   atomic_long     repair_copy_bytes;

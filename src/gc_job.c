@@ -317,6 +317,12 @@ job_begin(const char *verb) {
   atomic_store(&g_job.phase_count, 0);
   atomic_store(&g_job.writer_wait_us, 0);
   atomic_store(&g_job.worker_wait_us, 0);
+  atomic_store(&g_job.scan_bytes, 0);
+  atomic_store(&g_job.scan_files, 0);
+  atomic_store(&g_job.scan_dirs, 0);
+  atomic_store(&g_job.scan_entries, 0);
+  atomic_store(&g_job.scan_elapsed_ms, 0);
+  atomic_store(&g_job.scan_workers, 0);
   atomic_store(&g_job.repair_read_bytes, 0);
   atomic_store(&g_job.repair_written_bytes, 0);
   atomic_store(&g_job.repair_copy_bytes, 0);
