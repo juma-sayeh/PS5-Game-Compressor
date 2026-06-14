@@ -2002,10 +2002,6 @@
         null;
     }
 
-    function selectedKeyForGame(g) {
-      return gameInstanceId(g);
-    }
-
     function gameQuery(g) {
       let query = 'titleId=' + encodeURIComponent((g && g.titleId) || '');
       if (g && g.sourcePath) {

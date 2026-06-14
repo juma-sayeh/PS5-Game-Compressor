@@ -82,43 +82,6 @@ int pfs_app_probe(const char *path, pfs_app_info_t *info,
 int pfs_image_probe(const char *path, pfs_app_info_t *info,
                     char *err, size_t err_size);
 
-int pfs_compress_probe(const char *path, pfs_app_info_t *info,
-                       char *err, size_t err_size);
-
-int pfs_compress_app_to_ffpfsc(const char *path, int overwrite,
-                               pfs_app_info_t *info,
-                               char *err, size_t err_size);
-
-int pfs_compress_app_to_ffpfsc_ex(const char *path, int overwrite,
-                                  int workers, int convert,
-                                  pfs_app_info_t *info,
-                                  char *err, size_t err_size);
-
-int pfs_compress_app_to_ffpfsc_opts(const char *path, int overwrite,
-                                    int workers, int format,
-                                    int delete_policy,
-                                    pfs_app_info_t *info,
-                                    char *err, size_t err_size);
-
-int pfs_compress_source_to_ffpfsc_opts(const char *path, int overwrite,
-                                       int workers, int format,
-                                       int delete_policy,
-                                       pfs_app_info_t *info,
-                                       char *err, size_t err_size);
-int pfs_compress_source_to_ffpfsc_opts_profile(const char *path, int overwrite,
-                                               int workers, int format,
-                                               int delete_policy,
-                                               int compression_profile,
-                                               pfs_app_info_t *info,
-                                               char *err, size_t err_size);
-int pfs_compress_source_to_ffpfsc_opts_profile_output(
-                                      const char *path, int overwrite,
-                                      int workers, int format,
-                                      int delete_policy,
-                                      int compression_profile,
-                                      const char *output_path,
-                                      pfs_app_info_t *info,
-                                      char *err, size_t err_size);
 int pfs_compress_source_to_ffpfsc_opts_profile_output_ex(
                                       const char *path, int overwrite,
                                       int workers, int format,
@@ -153,24 +116,12 @@ int pfs_decompress_detect_nested(const char *path, pfs_decompress_info_t *info,
 int pfs_decompress_probe_image(const char *path, pfs_decompress_info_t *info,
                                char *err, size_t err_size);
 
-int pfs_decompress_ffpfsc_to_app(const char *path, int overwrite,
-                                 pfs_decompress_info_t *info,
-                                 char *err, size_t err_size);
-
-int pfs_decompress_ffpfsc_to_app_opts(const char *path, int overwrite,
-                                      int workers, int delete_policy,
-                                      pfs_decompress_info_t *info,
-                                      char *err, size_t err_size);
 int pfs_decompress_ffpfsc_to_app_opts_output(const char *path, int overwrite,
                                       int workers, int delete_policy,
                                       const char *output_path,
                                       pfs_decompress_info_t *info,
                                       char *err, size_t err_size);
 
-int pfs_decompress_ffpfsc_to_image_opts(const char *path, int overwrite,
-                                        int workers, int delete_policy,
-                                        pfs_decompress_info_t *info,
-                                        char *err, size_t err_size);
 int pfs_decompress_ffpfsc_to_image_opts_output(const char *path, int overwrite,
                                         int workers, int delete_policy,
                                         const char *output_path,

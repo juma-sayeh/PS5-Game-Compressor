@@ -184,7 +184,7 @@ extern "C"
             MZ_CLEAR_ARR(r->m_tree_2);
     }
 
-    tinfl_status tinfl_decompress(tinfl_decompressor *r, const mz_uint8 *pIn_buf_next, size_t *pIn_buf_size, mz_uint8 *pOut_buf_start, mz_uint8 *pOut_buf_next, size_t *pOut_buf_size, const mz_uint32 decomp_flags)
+    static tinfl_status tinfl_decompress(tinfl_decompressor *r, const mz_uint8 *pIn_buf_next, size_t *pIn_buf_size, mz_uint8 *pOut_buf_start, mz_uint8 *pOut_buf_next, size_t *pOut_buf_size, const mz_uint32 decomp_flags)
     {
         static const mz_uint16 s_length_base[31] = { 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258, 0, 0 };
         static const mz_uint8 s_length_extra[31] = { 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0, 0, 0 };
@@ -678,45 +678,6 @@ extern "C"
         return status;
     }
 
-    /* Higher level helper functions. */
-    void *tinfl_decompress_mem_to_heap(const void *pSrc_buf, size_t src_buf_len, size_t *pOut_len, int flags)
-    {
-        tinfl_decompressor decomp;
-        void *pBuf = NULL, *pNew_buf;
-        size_t src_buf_ofs = 0, out_buf_capacity = 0;
-        *pOut_len = 0;
-        tinfl_init(&decomp);
-        for (;;)
-        {
-            size_t src_buf_size = src_buf_len - src_buf_ofs, dst_buf_size = out_buf_capacity - *pOut_len, new_out_buf_capacity;
-            tinfl_status status = tinfl_decompress(&decomp, (const mz_uint8 *)pSrc_buf + src_buf_ofs, &src_buf_size, (mz_uint8 *)pBuf, pBuf ? (mz_uint8 *)pBuf + *pOut_len : NULL, &dst_buf_size,
-                                                   (flags & ~TINFL_FLAG_HAS_MORE_INPUT) | TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF);
-            if ((status < 0) || (status == TINFL_STATUS_NEEDS_MORE_INPUT))
-            {
-                MZ_FREE(pBuf);
-                *pOut_len = 0;
-                return NULL;
-            }
-            src_buf_ofs += src_buf_size;
-            *pOut_len += dst_buf_size;
-            if (status == TINFL_STATUS_DONE)
-                break;
-            new_out_buf_capacity = out_buf_capacity * 2;
-            if (new_out_buf_capacity < 128)
-                new_out_buf_capacity = 128;
-            pNew_buf = MZ_REALLOC(pBuf, new_out_buf_capacity);
-            if (!pNew_buf)
-            {
-                MZ_FREE(pBuf);
-                *pOut_len = 0;
-                return NULL;
-            }
-            pBuf = pNew_buf;
-            out_buf_capacity = new_out_buf_capacity;
-        }
-        return pBuf;
-    }
-
     size_t tinfl_decompress_mem_to_mem(void *pOut_buf, size_t out_buf_len, const void *pSrc_buf, size_t src_buf_len, int flags)
     {
         tinfl_decompressor decomp;
@@ -725,51 +686,6 @@ extern "C"
         status = tinfl_decompress(&decomp, (const mz_uint8 *)pSrc_buf, &src_buf_len, (mz_uint8 *)pOut_buf, (mz_uint8 *)pOut_buf, &out_buf_len, (flags & ~TINFL_FLAG_HAS_MORE_INPUT) | TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF);
         return (status != TINFL_STATUS_DONE) ? TINFL_DECOMPRESS_MEM_TO_MEM_FAILED : out_buf_len;
     }
-
-    int tinfl_decompress_mem_to_callback(const void *pIn_buf, size_t *pIn_buf_size, tinfl_put_buf_func_ptr pPut_buf_func, void *pPut_buf_user, int flags)
-    {
-        int result = 0;
-        tinfl_decompressor decomp;
-        mz_uint8 *pDict = (mz_uint8 *)MZ_MALLOC(TINFL_LZ_DICT_SIZE);
-        size_t in_buf_ofs = 0, dict_ofs = 0;
-        if (!pDict)
-            return TINFL_STATUS_FAILED;
-        memset(pDict, 0, TINFL_LZ_DICT_SIZE);
-        tinfl_init(&decomp);
-        for (;;)
-        {
-            size_t in_buf_size = *pIn_buf_size - in_buf_ofs, dst_buf_size = TINFL_LZ_DICT_SIZE - dict_ofs;
-            tinfl_status status = tinfl_decompress(&decomp, (const mz_uint8 *)pIn_buf + in_buf_ofs, &in_buf_size, pDict, pDict + dict_ofs, &dst_buf_size,
-                                                   (flags & ~(TINFL_FLAG_HAS_MORE_INPUT | TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF)));
-            in_buf_ofs += in_buf_size;
-            if ((dst_buf_size) && (!(*pPut_buf_func)(pDict + dict_ofs, (int)dst_buf_size, pPut_buf_user)))
-                break;
-            if (status != TINFL_STATUS_HAS_MORE_OUTPUT)
-            {
-                result = (status == TINFL_STATUS_DONE);
-                break;
-            }
-            dict_ofs = (dict_ofs + dst_buf_size) & (TINFL_LZ_DICT_SIZE - 1);
-        }
-        MZ_FREE(pDict);
-        *pIn_buf_size = in_buf_ofs;
-        return result;
-    }
-
-#ifndef MINIZ_NO_MALLOC
-    tinfl_decompressor *tinfl_decompressor_alloc(void)
-    {
-        tinfl_decompressor *pDecomp = (tinfl_decompressor *)MZ_MALLOC(sizeof(tinfl_decompressor));
-        if (pDecomp)
-            tinfl_init(pDecomp);
-        return pDecomp;
-    }
-
-    void tinfl_decompressor_free(tinfl_decompressor *pDecomp)
-    {
-        MZ_FREE(pDecomp);
-    }
-#endif
 
 #ifdef __cplusplus
 }

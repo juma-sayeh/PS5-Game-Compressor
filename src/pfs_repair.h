@@ -49,16 +49,7 @@ typedef struct pfs_repair_info {
 
 int pfs_repair_ffpfsc_auto(const char *path, pfs_repair_info_t *info,
                            char *err, size_t err_size);
-int pfs_repair_ffpfsc_inplace(const char *path, pfs_repair_info_t *info,
-                              char *err, size_t err_size);
 int pfs_repair_ffpfsc_scan_only(const char *path, pfs_repair_info_t *info,
                                 char *err, size_t err_size);
-int pfs_repair_ffpfsc_copy_replace_temp_only(const char *path,
-                                             pfs_repair_info_t *info,
-                                             char *err, size_t err_size);
 int pfs_repair_ffpfsc_smoke_verify(const char *path, pfs_repair_info_t *info,
                                    char *err, size_t err_size);
-void pfs_repair_set_benchmark_tuning(int workers, int read_ahead_blocks);
-void pfs_repair_set_benchmark_output_base(const char *path);
-void pfs_repair_set_benchmark_ignore_sidecar(int ignore_sidecar);
-void pfs_repair_set_benchmark_block_limit(uint64_t block_limit);

@@ -7424,7 +7424,7 @@ pfs_image_probe(const char *path, pfs_app_info_t *info,
   return 0;
 }
 
-int
+static int
 pfs_compress_probe(const char *path, pfs_app_info_t *info,
                    char *err, size_t err_size) {
   char clean[1024];
@@ -7873,22 +7873,6 @@ pfs_compress_prepare_source_to_ffpfsc_opts_profile_output_ex(
 }
 
 int
-pfs_compress_app_to_ffpfsc_opts(const char *path, int overwrite,
-                                int workers, int format,
-                                int delete_policy,
-                                pfs_app_info_t *info,
-                                char *err, size_t err_size) {
-  pfs_app_info_t local_info;
-  if(!info) info = &local_info;
-  if(pfs_app_probe(path, info, err, err_size) != 0) return -1;
-  return pfs_compress_probed_to_ffpfsc_opts(info, overwrite, workers,
-                                            format, delete_policy,
-                                            PFS_COMPRESS_PROFILE_SPACE,
-                                            NULL,
-                                            err, err_size);
-}
-
-int
 pfs_compress_source_to_ffpfsc_opts_profile_output_ex(
                                            const char *path, int overwrite,
                                            int workers, int format,
@@ -7917,64 +7901,4 @@ pfs_compress_source_to_ffpfsc_opts_profile_output_ex(
                                             compression_profile,
                                             stream_opts,
                                             err, err_size);
-}
-
-int
-pfs_compress_source_to_ffpfsc_opts_profile_output(
-                                           const char *path, int overwrite,
-                                           int workers, int format,
-                                           int delete_policy,
-                                           int compression_profile,
-                                           const char *output_path,
-                                           pfs_app_info_t *info,
-                                           char *err, size_t err_size) {
-  return pfs_compress_source_to_ffpfsc_opts_profile_output_ex(
-      path, overwrite, workers, format, delete_policy, compression_profile,
-      output_path, NULL, info, err, err_size);
-}
-
-int
-pfs_compress_source_to_ffpfsc_opts_profile(const char *path, int overwrite,
-                                           int workers, int format,
-                                           int delete_policy,
-                                           int compression_profile,
-                                           pfs_app_info_t *info,
-                                           char *err, size_t err_size) {
-  return pfs_compress_source_to_ffpfsc_opts_profile_output(
-      path, overwrite, workers, format, delete_policy, compression_profile,
-      NULL, info, err, err_size);
-}
-
-int
-pfs_compress_source_to_ffpfsc_opts(const char *path, int overwrite,
-                                   int workers, int format,
-                                   int delete_policy,
-                                   pfs_app_info_t *info,
-                                   char *err, size_t err_size) {
-  return pfs_compress_source_to_ffpfsc_opts_profile(
-      path, overwrite, workers, format, delete_policy,
-      PFS_COMPRESS_PROFILE_SPACE, info, err, err_size);
-}
-
-int
-pfs_compress_app_to_ffpfsc_ex(const char *path, int overwrite,
-                              int workers, int convert,
-                              pfs_app_info_t *info,
-                              char *err, size_t err_size) {
-  return pfs_compress_app_to_ffpfsc_opts(path, overwrite, workers,
-                                         PFS_COMPRESS_FORMAT_PFS,
-                                         convert ? PFS_DELETE_STREAM
-                                                 : PFS_DELETE_KEEP,
-                                         info, err, err_size);
-}
-
-int
-pfs_compress_app_to_ffpfsc(const char *path, int overwrite,
-                           pfs_app_info_t *info,
-                           char *err, size_t err_size) {
-  return pfs_compress_app_to_ffpfsc_opts(path, overwrite,
-                                         PFS_COMPRESS_DEFAULT_WORKERS,
-                                         PFS_COMPRESS_FORMAT_PFS,
-                                         PFS_DELETE_KEEP,
-                                         info, err, err_size);
 }

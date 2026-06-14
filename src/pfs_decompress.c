@@ -3958,16 +3958,6 @@ done:
 }
 
 int
-pfs_decompress_ffpfsc_to_image_opts(const char *path, int overwrite,
-                                    int workers, int delete_policy,
-                                    pfs_decompress_info_t *info,
-                                    char *err, size_t err_size) {
-  return pfs_decompress_ffpfsc_to_image_opts_output(path, overwrite, workers,
-                                                    delete_policy, NULL, info,
-                                                    err, err_size);
-}
-
-int
 pfs_decompress_ffpfsc_to_app_opts_output(const char *path, int overwrite,
                                   int workers, int delete_policy,
                                   const char *output_path,
@@ -4190,24 +4180,4 @@ done:
   }
   pfs_extract_plan_free(&plan);
   return rc;
-}
-
-int
-pfs_decompress_ffpfsc_to_app_opts(const char *path, int overwrite, int workers,
-                                  int delete_policy,
-                                  pfs_decompress_info_t *info,
-                                  char *err, size_t err_size) {
-  return pfs_decompress_ffpfsc_to_app_opts_output(path, overwrite, workers,
-                                                  delete_policy, NULL, info,
-                                                  err, err_size);
-}
-
-int
-pfs_decompress_ffpfsc_to_app(const char *path, int overwrite,
-                             pfs_decompress_info_t *info,
-                             char *err, size_t err_size) {
-  return pfs_decompress_ffpfsc_to_app_opts(path, overwrite,
-                                           PFS_DECOMPRESS_DEFAULT_WORKERS,
-                                           PFS_DELETE_KEEP,
-                                           info, err, err_size);
 }

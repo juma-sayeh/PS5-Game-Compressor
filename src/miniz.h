@@ -43,11 +43,6 @@
 #include "miniz_tdef.h"
 #include "miniz_tinfl.h"
 
-typedef unsigned long mz_ulong;
-
-#define MZ_ADLER32_INIT (1)
-#define MZ_CRC32_INIT (0)
-
 enum {
     MZ_DEFAULT_STRATEGY = 0,
     MZ_FILTERED = 1,
@@ -64,8 +59,3 @@ enum {
     MZ_DEFAULT_LEVEL = 6,
     MZ_DEFAULT_COMPRESSION = -1
 };
-
-MINIZ_EXPORT mz_ulong mz_adler32(mz_ulong adler, const unsigned char *ptr,
-                                 size_t buf_len);
-MINIZ_EXPORT mz_ulong mz_crc32(mz_ulong crc, const unsigned char *ptr,
-                               size_t buf_len);

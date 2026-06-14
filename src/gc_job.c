@@ -194,34 +194,6 @@ write_all_fd(int fd, const void *data, size_t size) {
   return 0;
 }
 
-void
-drain_body(int fd, size_t already_read, size_t content_size) {
-  char buf[4096];
-  size_t remaining = content_size > already_read ? content_size - already_read : 0;
-  while(remaining > 0) {
-    size_t want = remaining < sizeof(buf) ? remaining : sizeof(buf);
-    ssize_t n = read(fd, buf, want);
-    if(n < 0) {
-      if(errno == EINTR) continue;
-      break;
-    }
-    if(n == 0) break;
-    remaining -= (size_t)n;
-  }
-}
-
-int
-parse_upload_size_arg(const http_request_t *req, const char *name,
-                      uint64_t *out) {
-  char tmp[64];
-  if(!websrv_get_query_arg(req, name, tmp, sizeof(tmp))) return -1;
-  char *end = NULL;
-  unsigned long long v = strtoull(tmp, &end, 10);
-  if(!end || *end) return -1;
-  if(out) *out = (uint64_t)v;
-  return 0;
-}
-
 static int
 du_walk_should_stop(du_state_t *du, int honor_cancel) {
   if(!du) return 1;
@@ -294,18 +266,6 @@ job_set_phase(const char *phase, long step, long count, const char *current) {
   atomic_store(&g_job.phase_step, step);
   atomic_store(&g_job.phase_count, count);
   pthread_mutex_unlock(&g_job.lock);
-}
-
-void
-job_clear_countable_progress(void) {
-  atomic_store(&g_job.total_bytes, 0);
-  atomic_store(&g_job.copied_bytes, 0);
-  atomic_store(&g_job.total_blocks, 0);
-  atomic_store(&g_job.phase_step, 0);
-  atomic_store(&g_job.phase_count, 0);
-  atomic_store(&g_job.total_files, 0);
-  atomic_store(&g_job.done_files, 0);
-  atomic_store(&g_job.failed_files, 0);
 }
 
 void
@@ -387,46 +347,4 @@ job_end(int rc, const char *err) {
   g_job.cancel_disabled_reason[0] = 0;
   pthread_mutex_unlock(&g_job.lock);
   atomic_store(&g_job.busy, 0);
-}
-
-void
-job_log_name(char *out, size_t out_size) {
-  if(out && out_size) snprintf(out, out_size, "%ld-gc.log", (long)time(NULL));
-}
-
-int
-activity_validate_lease(const http_request_t *req, const char *kind,
-                        activity_request_ctx_t *out, char *err,
-                        size_t err_size) {
-  (void)req;
-  (void)kind;
-  (void)err;
-  (void)err_size;
-  if(out) memset(out, 0, sizeof(*out));
-  return 0;
-}
-
-void
-activity_finish_queue(const char *queue_id, int rc, const char *err,
-                      const char *target, long copied_bytes, int done_items,
-                      int failed_items, const char *log_name) {
-  (void)queue_id;
-  (void)rc;
-  (void)err;
-  (void)target;
-  (void)copied_bytes;
-  (void)done_items;
-  (void)failed_items;
-  (void)log_name;
-}
-
-void
-activity_defer_queue_success(const char *queue_id, const char *target,
-                             long copied_bytes, int done_items,
-                             const char *log_name) {
-  (void)queue_id;
-  (void)target;
-  (void)copied_bytes;
-  (void)done_items;
-  (void)log_name;
 }

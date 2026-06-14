@@ -354,7 +354,7 @@ init_ps5_services(void) {
   }
 }
 
-int
+static int
 gc_install_app_if_needed(void) {
   appinst_api_t api;
   char app_dir[256];

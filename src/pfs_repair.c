@@ -86,12 +86,6 @@
 #define JOURNAL_OFF_MOUNTED_PATH 0x500U
 #define JOURNAL_PATH_FIELD_SIZE 1024U
 
-static atomic_int g_repair_worker_override;
-static atomic_int g_repair_read_ahead_override;
-static atomic_int g_repair_ignore_vhash_override;
-static atomic_ullong g_repair_block_limit_override;
-static char g_repair_output_base_override[1024];
-
 typedef struct pfs_inode_info {
   uint16_t mode;
   uint32_t flags;
@@ -326,8 +320,7 @@ mkdir_p_local(const char *path) {
 
 static const char *
 repair_output_base(void) {
-  return g_repair_output_base_override[0] ?
-      g_repair_output_base_override : REPAIR_BASE;
+  return REPAIR_BASE;
 }
 
 static int
@@ -639,17 +632,12 @@ repair_mode_name(int mode) {
 
 static int
 repair_worker_count(void) {
-  int workers = atomic_load(&g_repair_worker_override);
-  if(workers <= 0) workers = REPAIR_DEFAULT_WORKERS;
-  if(workers < 1) workers = 1;
-  if(workers > REPAIR_MAX_WORKERS) workers = REPAIR_MAX_WORKERS;
-  return workers;
+  return REPAIR_DEFAULT_WORKERS;
 }
 
 static int
 repair_read_ahead_slots(int worker_count) {
-  int slots = atomic_load(&g_repair_read_ahead_override);
-  if(slots <= 0) slots = REPAIR_DEFAULT_READ_AHEAD;
+  int slots = REPAIR_DEFAULT_READ_AHEAD;
   if(slots < worker_count) slots = worker_count;
   if(slots > REPAIR_MAX_READ_AHEAD) slots = REPAIR_MAX_READ_AHEAD;
   return slots;
@@ -3451,8 +3439,6 @@ pfs_repair_ffpfsc_run(const char *path, const repair_options_t *opts,
   ctx.info.logical_size = img.logical_size;
   ctx.info.nested_size = img.nested_size;
   ctx.info.block_count = img.block_count;
-  ctx.block_limit = atomic_load(&g_repair_block_limit_override);
-  if(ctx.block_limit > img.block_count) ctx.block_limit = img.block_count;
   ctx.info.old_stored_size = img.stored_size;
   snprintf(ctx.info.nested_name, sizeof(ctx.info.nested_name), "%s",
            img.nested_name);
@@ -3462,14 +3448,10 @@ pfs_repair_ffpfsc_run(const char *path, const repair_options_t *opts,
   pfs_vhash_mode_t hash_mode = PFS_VHASH_MODE_MISSING;
   char hash_err[256] = {0};
   int hash_rc = 1;
-  if(atomic_load(&g_repair_ignore_vhash_override)) {
-    snprintf(hash_err, sizeof(hash_err), "%s", "benchmark sidecar ignored");
-  } else {
-    hash_rc = pfs_vhash_reader_open_for_image(
-        ctx.info.source_path, img.logical_size, img.nested_size,
-        img.block_count, img.nested_name, img.nested_type,
-        &ctx.vhash, &hash_mode, hash_err, sizeof(hash_err));
-  }
+  hash_rc = pfs_vhash_reader_open_for_image(
+      ctx.info.source_path, img.logical_size, img.nested_size,
+      img.block_count, img.nested_name, img.nested_type,
+      &ctx.vhash, &hash_mode, hash_err, sizeof(hash_err));
   if(hash_rc < 0) {
     set_err(err, err_size, "%s", hash_err[0] ? hash_err :
             "open validation hash failed");
@@ -3795,15 +3777,6 @@ pfs_repair_ffpfsc_auto(const char *path, pfs_repair_info_t *info,
 }
 
 int
-pfs_repair_ffpfsc_inplace(const char *path, pfs_repair_info_t *info,
-                          char *err, size_t err_size) {
-  repair_options_t opts;
-  memset(&opts, 0, sizeof(opts));
-  opts.mode = PFS_REPAIR_MODE_INPLACE;
-  return pfs_repair_ffpfsc_run(path, &opts, info, err, err_size);
-}
-
-int
 pfs_repair_ffpfsc_scan_only(const char *path, pfs_repair_info_t *info,
                             char *err, size_t err_size) {
   repair_options_t opts;
@@ -3811,45 +3784,4 @@ pfs_repair_ffpfsc_scan_only(const char *path, pfs_repair_info_t *info,
   opts.mode = PFS_REPAIR_MODE_INPLACE;
   opts.scan_only = 1;
   return pfs_repair_ffpfsc_run(path, &opts, info, err, err_size);
-}
-
-int
-pfs_repair_ffpfsc_copy_replace_temp_only(const char *path,
-                                         pfs_repair_info_t *info,
-                                         char *err, size_t err_size) {
-  repair_options_t opts;
-  memset(&opts, 0, sizeof(opts));
-  opts.mode = PFS_REPAIR_MODE_COPY_REPLACE;
-  opts.temp_only = 1;
-  opts.force_rebuild = 1;
-  return pfs_repair_ffpfsc_run(path, &opts, info, err, err_size);
-}
-
-void
-pfs_repair_set_benchmark_tuning(int workers, int read_ahead_blocks) {
-  if(workers < 0) workers = 0;
-  if(read_ahead_blocks < 0) read_ahead_blocks = 0;
-  atomic_store(&g_repair_worker_override, workers);
-  atomic_store(&g_repair_read_ahead_override, read_ahead_blocks);
-}
-
-void
-pfs_repair_set_benchmark_output_base(const char *path) {
-  if(!path || !path[0]) {
-    g_repair_output_base_override[0] = 0;
-    return;
-  }
-  snprintf(g_repair_output_base_override,
-           sizeof(g_repair_output_base_override), "%s", path);
-}
-
-void
-pfs_repair_set_benchmark_ignore_sidecar(int ignore_sidecar) {
-  atomic_store(&g_repair_ignore_vhash_override, ignore_sidecar ? 1 : 0);
-}
-
-void
-pfs_repair_set_benchmark_block_limit(uint64_t block_limit) {
-  atomic_store(&g_repair_block_limit_override,
-               (unsigned long long)block_limit);
 }

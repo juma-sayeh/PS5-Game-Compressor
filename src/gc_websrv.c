@@ -31,7 +31,6 @@ static int             g_websrv_srvfd = -1;
 static pthread_mutex_t g_websrv_lock = PTHREAD_MUTEX_INITIALIZER;
 static volatile sig_atomic_t g_websrv_exit_requested = 0;
 static time_t          g_started_at = 0;
-static int             g_launcher_runtime_disabled = 0;
 static gc_launcher_diag_t g_launcher_diag = {
   .launcher_enabled = 1,
   .launcher_attempted = 0,
@@ -75,7 +74,7 @@ json_tristate(int value) {
   return value ? "true" : "false";
 }
 
-int
+static int
 websrv_write_all(int fd, const void *data, size_t size) {
   const char *p = data;
   while(size > 0) {
@@ -91,7 +90,7 @@ websrv_write_all(int fd, const void *data, size_t size) {
   return 0;
 }
 
-int
+static int
 websrv_send_headers(int fd, int status, const char *mime, size_t size,
                     const char *extra) {
   char header[1024];
@@ -122,7 +121,7 @@ websrv_send(int fd, int status, const char *mime, const void *data,
   return websrv_write_all(fd, data, size);
 }
 
-int
+static int
 websrv_send_text(int fd, int status, const char *mime, const char *body) {
   return websrv_send(fd, status, mime, body ? body : "",
                      body ? strlen(body) : 0);
@@ -175,7 +174,7 @@ hex_value(int ch) {
   return -1;
 }
 
-void
+static void
 websrv_url_decode(char *out, size_t out_size, const char *in) {
   size_t pos = 0;
   if(out_size == 0) return;
@@ -217,7 +216,7 @@ websrv_get_query_arg(const http_request_t *req, const char *name, char *out,
   return 0;
 }
 
-void
+static void
 websrv_request_exit(void) {
   pthread_mutex_lock(&g_websrv_lock);
   g_websrv_exit_requested = 1;
@@ -227,27 +226,12 @@ websrv_request_exit(void) {
   if(srvfd >= 0) close(srvfd);
 }
 
-int
-websrv_exit_requested(void) {
-  return g_websrv_exit_requested ? 1 : 0;
-}
-
-void
-websrv_set_runtime_diag(int launcher_disabled) {
-  pthread_mutex_lock(&g_websrv_lock);
-  g_launcher_runtime_disabled = launcher_disabled ? 1 : 0;
-  g_launcher_diag.launcher_enabled = !g_launcher_runtime_disabled;
-  pthread_mutex_unlock(&g_websrv_lock);
-}
-
 void
 websrv_set_launcher_diag(const gc_launcher_diag_t *diag) {
   if(!diag) return;
 
   pthread_mutex_lock(&g_websrv_lock);
   g_launcher_diag = *diag;
-  g_launcher_diag.launcher_enabled =
-      !g_launcher_runtime_disabled && diag->launcher_enabled;
   pthread_mutex_unlock(&g_websrv_lock);
 }
 

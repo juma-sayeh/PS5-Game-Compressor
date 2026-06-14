@@ -33,30 +33,15 @@ typedef struct gc_launcher_diag {
 } gc_launcher_diag_t;
 
 
-int websrv_write_all(int fd, const void *data, size_t size);
-
-int websrv_send_headers(int fd, int status, const char *mime,
-                        size_t size, const char *extra);
-
 int websrv_send(int fd, int status, const char *mime,
                 const void *data, size_t size);
-
-int websrv_send_text(int fd, int status, const char *mime, const char *body);
 
 int websrv_send_error_json(int fd, int status, const char *message);
 
 int websrv_get_query_arg(const http_request_t *req, const char *name,
                          char *out, size_t out_size);
 
-void websrv_url_decode(char *out, size_t out_size, const char *in);
-
 int websrv_listen(unsigned short port, websrv_ready_cb_t ready_cb,
                   void *ready_arg);
 
-void websrv_set_runtime_diag(int launcher_disabled);
-
 void websrv_set_launcher_diag(const gc_launcher_diag_t *diag);
-
-void websrv_request_exit(void);
-
-int websrv_exit_requested(void);
