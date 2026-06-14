@@ -222,10 +222,24 @@ parse_upload_size_arg(const http_request_t *req, const char *name,
   return 0;
 }
 
+static int
+du_walk_should_stop(du_state_t *du, int honor_cancel) {
+  if(!du) return 1;
+  if(du->cancelled) return 1;
+  if(honor_cancel && job_cancelled()) {
+    du->cancelled = 1;
+    errno = EINTR;
+    return 1;
+  }
+  return 0;
+}
+
 static void
-du_walk_inner(const char *path, du_state_t *du) {
+du_walk_inner(const char *path, du_state_t *du, int honor_cancel) {
   struct stat st;
+  if(du_walk_should_stop(du, honor_cancel)) return;
   if(lstat(path, &st) != 0) return;
+  if(du_walk_should_stop(du, honor_cancel)) return;
   du->entries++;
   if(S_ISREG(st.st_mode)) {
     du->files++;
@@ -236,12 +250,17 @@ du_walk_inner(const char *path, du_state_t *du) {
   du->dirs++;
   DIR *d = opendir(path);
   if(!d) return;
+  if(du_walk_should_stop(du, honor_cancel)) {
+    closedir(d);
+    return;
+  }
   struct dirent *ent;
-  while((ent = readdir(d))) {
+  while(!du_walk_should_stop(du, honor_cancel) && (ent = readdir(d))) {
+    if(du_walk_should_stop(du, honor_cancel)) break;
     if(!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) continue;
     char child[1024];
     join_path(child, sizeof(child), path, ent->d_name);
-    du_walk_inner(child, du);
+    du_walk_inner(child, du, honor_cancel);
   }
   closedir(d);
 }
@@ -250,7 +269,14 @@ void
 du_walk(const char *path, du_state_t *du) {
   if(!du) return;
   memset(du, 0, sizeof(*du));
-  du_walk_inner(path, du);
+  du_walk_inner(path, du, 0);
+}
+
+void
+du_walk_cancelable(const char *path, du_state_t *du) {
+  if(!du) return;
+  memset(du, 0, sizeof(*du));
+  du_walk_inner(path, du, 1);
 }
 
 void

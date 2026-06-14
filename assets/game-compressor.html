@@ -2282,6 +2282,14 @@
       );
     }
 
+    function bytesNearlyEqual(a, b) {
+      const left = Math.max(0, Number(a || 0));
+      const right = Math.max(0, Number(b || 0));
+      if (left <= 0 || right <= 0) return false;
+      const tolerance = Math.max(8 * 1024 * 1024, Math.max(left, right) * 0.005);
+      return Math.abs(left - right) <= tolerance;
+    }
+
     function operationChangesGameState(op) {
       const action = String((op && op.action) || '').toLowerCase();
       return action === 'compress' ||
@@ -2300,6 +2308,7 @@
         if (String((op && op.titleId) || '') !== titleId) continue;
         if (!operationChangesGameState(op)) continue;
         if (String((op && op.status) || '').toLowerCase() !== 'success') continue;
+        if (!operationBelongsToCurrentGame(g, op)) continue;
         latest = Math.max(latest, operationTime(op));
       }
       return latest;
@@ -2366,13 +2375,38 @@
       return null;
     }
 
+    function compressionOpStats(op) {
+      const sourceSize = Math.max(0, Number((op && op.compressionSourceSize) || 0));
+      let compressedSize = Math.max(0, Number((op && op.compressedSize) || 0));
+      let savedBytes = Math.max(0, Number((op && op.savedBytes) || 0));
+      if (compressedSize <= 0 && sourceSize > savedBytes) {
+        compressedSize = sourceSize - savedBytes;
+      }
+      if (savedBytes <= 0 && sourceSize > compressedSize) {
+        savedBytes = sourceSize - compressedSize;
+      }
+      return { compressedSize, sourceSize, savedBytes };
+    }
+
+    function compressionStatsMatchCurrentFile(g, stats) {
+      const currentSize = Math.max(0, Number((g && g.sourceSize) || 0));
+      const compressedSize = Math.max(0, Number((stats && stats.compressedSize) || 0));
+      return compressedSize > 0 &&
+        (currentSize <= 0 || bytesNearlyEqual(compressedSize, currentSize));
+    }
+
     function latestCompressionOperationForGame(g) {
       const titleId = String((g && g.titleId) || '');
-      if (!g || g.sourceKind !== 'compressed') return null;
-      if (!titleId || !Array.isArray(state.history)) return null;
+      const current = normalizedPath(g && g.sourcePath);
+      if (!g || g.sourceKind !== 'compressed' || !titleId || !current || !Array.isArray(state.history)) {
+        return null;
+      }
+
       for (const op of state.history) {
         if (!operationIsCurrentForGame(g, op)) continue;
         if (!opCanShowCompressionStats(op)) continue;
+        const opStats = compressionOpStats(op);
+        if (!compressionStatsMatchCurrentFile(g, opStats)) continue;
         return op;
       }
       return null;
@@ -2383,20 +2417,19 @@
       const gameCompressedSize = Number(g.compressedSize || 0);
       const gameSourceSize = Number(g.compressionSourceSize || 0);
       const gameSaved = Number(g.savedBytes || 0);
-      if (gameCompressedSize > 0 || gameSaved > 0) {
-        return {
-          compressedSize: gameCompressedSize > 0 ? gameCompressedSize : Number(g.sourceSize || 0),
-          sourceSize: gameSourceSize,
-          savedBytes: gameSaved
-        };
+      const gameStats = {
+        compressedSize: gameCompressedSize,
+        sourceSize: gameSourceSize,
+        savedBytes: gameSaved,
+        key: 'game:' + gameCompressedSize + ':' + gameSourceSize + ':' + gameSaved
+      };
+      if (gameCompressedSize > 0 && compressionStatsMatchCurrentFile(g, gameStats)) {
+        return gameStats;
       }
       const op = latestCompressionOperationForGame(g);
-      if (!op) return null;
-      return {
-        compressedSize: Number(op.compressedSize || 0),
-        sourceSize: Number(op.compressionSourceSize || 0),
-        savedBytes: Number(op.savedBytes || 0)
-      };
+      return op ? Object.assign(compressionOpStats(op), {
+        key: String(op.id || '') + ':' + String(op.endedAt || op.createdAt || '')
+      }) : null;
     }
 
     function savedChip(g) {
@@ -2553,13 +2586,11 @@
 
     function compressionResultKeyForGame(g) {
       const stats = compressionStatsForGame(g) || {};
-      const op = latestCompressionOperationForGame(g);
       return [
         stats.compressedSize,
         stats.sourceSize,
         stats.savedBytes,
-        op && op.id,
-        op && op.endedAt
+        stats.key
       ].map(keyPart).join('|');
     }
 

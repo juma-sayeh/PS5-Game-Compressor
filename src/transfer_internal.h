@@ -37,6 +37,7 @@ typedef struct du_state {
   uint64_t  files;
   uint64_t  dirs;
   uint64_t  bytes;
+  int       cancelled;
 } du_state_t;
 
 struct job_state {
@@ -113,6 +114,7 @@ void drain_body(int fd, size_t already_read, size_t content_size);
 int parse_upload_size_arg(const http_request_t *req, const char *name,
                           uint64_t *out);
 void du_walk(const char *path, du_state_t *du);
+void du_walk_cancelable(const char *path, du_state_t *du);
 
 void job_set_current(const char *path);
 void job_set_phase(const char *phase, long step, long count,

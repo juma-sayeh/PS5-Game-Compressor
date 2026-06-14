@@ -29,6 +29,7 @@
 #define PFSC_WINDOW_LOG(...) do { } while(0)
 #endif
 #include "pfs_compress.h"
+#include "pfs_io_policy.h"
 #include "pfs_validate_hash.h"
 #include "transfer_internal.h"
 #include "exfat_upcase_standard.inc"
@@ -947,9 +948,38 @@ pwrite_all_local(int fd, const void *data, size_t size, off_t offset) {
 }
 
 static int
-write_all_local(int fd, const void *data, size_t size) {
+pwrite_all_local_cancelable(int fd, const void *data, size_t size,
+                            off_t offset) {
   const unsigned char *p = data;
   while(size > 0) {
+    if(job_cancelled()) {
+      errno = EINTR;
+      return -1;
+    }
+    ssize_t n = pwrite(fd, p, size, offset);
+    if(n < 0) {
+      if(errno == EINTR) continue;
+      return -1;
+    }
+    if(n == 0) {
+      errno = EIO;
+      return -1;
+    }
+    p += n;
+    size -= (size_t)n;
+    offset += n;
+  }
+  return 0;
+}
+
+static int
+write_all_local_cancelable(int fd, const void *data, size_t size) {
+  const unsigned char *p = data;
+  while(size > 0) {
+    if(job_cancelled()) {
+      errno = EINTR;
+      return -1;
+    }
     ssize_t n = write(fd, p, size);
     if(n < 0) {
       if(errno == EINTR) continue;
@@ -966,6 +996,8 @@ write_all_local(int fd, const void *data, size_t size) {
 }
 
 static uint64_t monotonic_us(void);
+static void cancel_poll_cond_wait(pthread_cond_t *cond,
+                                  pthread_mutex_t *lock);
 static void virtual_reader_close_file(virtual_reader_t *vr);
 static int virtual_reader_open_path(virtual_reader_t *vr, const char *path,
                                     ssize_t key, char *err,
@@ -1983,17 +2015,17 @@ destructive_stream_reverse_chunk_worker(void *arg) {
   if(!pool) return NULL;
   for(;;) {
     reverse_chunk_slot_t *slot = NULL;
-    pthread_mutex_lock(&pool->lock);
-    while(!pool->stop && !pool->error && pool->next_out < pool->original_size) {
-      for(int i = 0; i < pool->slot_count; i++) {
-        if(pool->slots[i].state == REVERSE_CHUNK_FREE) {
+	    pthread_mutex_lock(&pool->lock);
+	    while(!pool->stop && !pool->error && pool->next_out < pool->original_size) {
+	      for(int i = 0; i < pool->slot_count; i++) {
+	        if(pool->slots[i].state == REVERSE_CHUNK_FREE) {
           slot = &pool->slots[i];
           break;
         }
-      }
-      if(slot) break;
-      pthread_cond_wait(&pool->cond, &pool->lock);
-    }
+	      }
+	      if(slot) break;
+	      cancel_poll_cond_wait(&pool->cond, &pool->lock);
+	    }
     if(pool->stop || pool->error || pool->next_out >= pool->original_size) {
       pthread_mutex_unlock(&pool->lock);
       break;
@@ -2162,17 +2194,17 @@ destructive_stream_reverse_file(destructive_stream_ctx_t *ctx,
 
     reverse_chunk_slot_t *slot = NULL;
     pthread_mutex_lock(&pool.lock);
-    while(!pool.error) {
-      for(int i = 0; i < pool.slot_count; i++) {
-        if(pool.slots[i].state == REVERSE_CHUNK_READY &&
-           pool.slots[i].out_off == f->reverse_pos) {
+	    while(!pool.error) {
+	      for(int i = 0; i < pool.slot_count; i++) {
+	        if(pool.slots[i].state == REVERSE_CHUNK_READY &&
+	           pool.slots[i].out_off == f->reverse_pos) {
           slot = &pool.slots[i];
           break;
         }
-      }
-      if(slot) break;
-      pthread_cond_wait(&pool.cond, &pool.lock);
-    }
+	      }
+	      if(slot) break;
+	      cancel_poll_cond_wait(&pool.cond, &pool.lock);
+	    }
     int pool_error = pool.error;
     char pool_err[256];
     snprintf(pool_err, sizeof(pool_err), "%s", pool.err);
@@ -2450,7 +2482,8 @@ retry_scan:
       pthread_mutex_unlock(&ctx->reverse_ahead_lock);
       return 0;
     }
-    pthread_cond_wait(&ctx->reverse_ahead_cond, &ctx->reverse_ahead_lock);
+	    cancel_poll_cond_wait(&ctx->reverse_ahead_cond,
+	                          &ctx->reverse_ahead_lock);
   }
 }
 
@@ -2520,7 +2553,8 @@ destructive_stream_commit_reverse_chunk(destructive_stream_ctx_t *ctx,
   pthread_mutex_lock(&ctx->reverse_ahead_lock);
   while(!ctx->reverse_ahead_stop && !ctx->reverse_ahead_error &&
         f->reverse_pos != claim->out_off) {
-    pthread_cond_wait(&ctx->reverse_ahead_cond, &ctx->reverse_ahead_lock);
+	    cancel_poll_cond_wait(&ctx->reverse_ahead_cond,
+	                          &ctx->reverse_ahead_lock);
   }
   if(ctx->reverse_ahead_stop || ctx->reverse_ahead_error) {
     int saved = ctx->reverse_ahead_error ? ctx->reverse_ahead_error : EINTR;
@@ -2825,7 +2859,8 @@ destructive_stream_wait_reverse_pos(destructive_stream_ctx_t *ctx,
   }
   while(!destructive_stream_file_reversed(f) && f->reverse_pos < needed &&
         !ctx->reverse_ahead_error && !ctx->reverse_ahead_done) {
-    pthread_cond_wait(&ctx->reverse_ahead_cond, &ctx->reverse_ahead_lock);
+	    cancel_poll_cond_wait(&ctx->reverse_ahead_cond,
+	                          &ctx->reverse_ahead_lock);
   }
   int reverse_error = ctx->reverse_ahead_error;
   char reverse_err[256];
@@ -3093,6 +3128,18 @@ monotonic_us(void) {
 }
 
 static void
+cancel_poll_cond_wait(pthread_cond_t *cond, pthread_mutex_t *lock) {
+  struct timespec ts;
+  clock_gettime(CLOCK_REALTIME, &ts);
+  ts.tv_nsec += 100000000L;
+  if(ts.tv_nsec >= 1000000000L) {
+    ts.tv_sec += ts.tv_nsec / 1000000000L;
+    ts.tv_nsec %= 1000000000L;
+  }
+  (void)pthread_cond_timedwait(cond, lock, &ts);
+}
+
+static void
 job_add_wait_us(atomic_long *counter, uint64_t started_at) {
   uint64_t now = monotonic_us();
   if(now <= started_at) return;
@@ -3201,9 +3248,25 @@ scan_parallel_fail_locked(scan_parallel_ctx_t *ctx, const char *msg) {
 }
 
 static int
+scan_parallel_cancel(scan_parallel_ctx_t *ctx,
+                     char *local_err, size_t local_err_size) {
+  snprintf(local_err, local_err_size, "%s", "cancelled");
+  errno = EINTR;
+  pthread_mutex_lock(&ctx->lock);
+  scan_parallel_fail_locked(ctx, "cancelled");
+  pthread_mutex_unlock(&ctx->lock);
+  return -1;
+}
+
+static int
 scan_parallel_note_dir(scan_parallel_ctx_t *ctx, const char *rel,
                        char *local_err, size_t local_err_size) {
   int rc = 0;
+  if(job_cancelled()) {
+    snprintf(local_err, local_err_size, "%s", "cancelled");
+    errno = EINTR;
+    return -1;
+  }
   pthread_mutex_lock(&ctx->lock);
   ctx->stats.entries++;
   ctx->stats.dirs++;
@@ -3222,6 +3285,11 @@ scan_parallel_note_file(scan_parallel_ctx_t *ctx, const char *abs,
                         const char *rel, uint64_t size,
                         char *local_err, size_t local_err_size) {
   int rc = 0;
+  if(job_cancelled()) {
+    snprintf(local_err, local_err_size, "%s", "cancelled");
+    errno = EINTR;
+    return -1;
+  }
   pthread_mutex_lock(&ctx->lock);
   ctx->stats.entries++;
   ctx->stats.files++;
@@ -3241,6 +3309,7 @@ static int
 scan_process_dir_parallel(scan_parallel_ctx_t *ctx, const char *rel,
                           char *local_err, size_t local_err_size) {
   char dir_path[1024];
+  int rc = 0;
   if(rel && rel[0]) {
     if(join_abs(dir_path, sizeof(dir_path), ctx->root, rel) != 0) {
       snprintf(local_err, local_err_size, "%s", "path too long");
@@ -3251,23 +3320,34 @@ scan_process_dir_parallel(scan_parallel_ctx_t *ctx, const char *rel,
     snprintf(dir_path, sizeof(dir_path), "%s", ctx->root);
   }
 
+  if(job_cancelled()) {
+    return scan_parallel_cancel(ctx, local_err, local_err_size);
+  }
   DIR *d = opendir(dir_path);
   if(!d) {
     snprintf(local_err, local_err_size, "scan: %s", strerror(errno));
     return -1;
   }
+  if(job_cancelled()) {
+    rc = scan_parallel_cancel(ctx, local_err, local_err_size);
+    closedir(d);
+    return rc;
+  }
 
-  int rc = 0;
   struct dirent *ent;
-  while((ent = readdir(d))) {
+  while(1) {
     char child_abs[1024];
     char child_rel[1024];
     struct stat st;
 
     if(job_cancelled()) {
-      snprintf(local_err, local_err_size, "%s", "cancelled");
-      errno = EINTR;
-      rc = -1;
+      rc = scan_parallel_cancel(ctx, local_err, local_err_size);
+      break;
+    }
+    ent = readdir(d);
+    if(!ent) break;
+    if(job_cancelled()) {
+      rc = scan_parallel_cancel(ctx, local_err, local_err_size);
       break;
     }
     if(!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) continue;
@@ -3284,9 +3364,17 @@ scan_process_dir_parallel(scan_parallel_ctx_t *ctx, const char *rel,
       rc = -1;
       break;
     }
+    if(job_cancelled()) {
+      rc = scan_parallel_cancel(ctx, local_err, local_err_size);
+      break;
+    }
     if(lstat(child_abs, &st) != 0) {
       snprintf(local_err, local_err_size, "stat: %s", strerror(errno));
       rc = -1;
+      break;
+    }
+    if(job_cancelled()) {
+      rc = scan_parallel_cancel(ctx, local_err, local_err_size);
       break;
     }
     if(S_ISLNK(st.st_mode)) {
@@ -3328,9 +3416,15 @@ scan_worker_thread(void *arg) {
     scan_dir_task_t task;
     memset(&task, 0, sizeof(task));
 
-    pthread_mutex_lock(&ctx->lock);
-    while(ctx->task_count == 0 && ctx->active > 0 && !ctx->error && !ctx->stop) {
-      pthread_cond_wait(&ctx->cond, &ctx->lock);
+	    pthread_mutex_lock(&ctx->lock);
+	    while(ctx->task_count == 0 && ctx->active > 0 && !ctx->error && !ctx->stop) {
+	      cancel_poll_cond_wait(&ctx->cond, &ctx->lock);
+	    }
+    if(job_cancelled()) {
+      errno = EINTR;
+      scan_parallel_fail_locked(ctx, "cancelled");
+      pthread_mutex_unlock(&ctx->lock);
+      break;
     }
     if(ctx->stop || ctx->error ||
        (ctx->task_count == 0 && ctx->active == 0)) {
@@ -3456,19 +3550,38 @@ scan_collect_serial(const char *root, const char *rel, scan_list_t *files,
   if(rel && rel[0]) join_abs(dir_path, sizeof(dir_path), root, rel);
   else snprintf(dir_path, sizeof(dir_path), "%s", root);
 
+  if(job_cancelled()) {
+    set_err(err, err_size, "cancelled");
+    errno = EINTR;
+    return -1;
+  }
   DIR *d = opendir(dir_path);
   if(!d) {
     set_err(err, err_size, "scan: %s", strerror(errno));
     return -1;
   }
+  if(job_cancelled()) {
+    set_err(err, err_size, "cancelled");
+    errno = EINTR;
+    closedir(d);
+    return -1;
+  }
 
   int rc = 0;
   struct dirent *ent;
-  while((ent = readdir(d))) {
+  while(1) {
     char child_abs[1024];
     char child_rel[1024];
     struct stat st;
 
+    if(job_cancelled()) {
+      set_err(err, err_size, "cancelled");
+      errno = EINTR;
+      rc = -1;
+      break;
+    }
+    ent = readdir(d);
+    if(!ent) break;
     if(job_cancelled()) {
       set_err(err, err_size, "cancelled");
       errno = EINTR;
@@ -3487,8 +3600,20 @@ scan_collect_serial(const char *root, const char *rel, scan_list_t *files,
       rc = -1;
       break;
     }
+    if(job_cancelled()) {
+      set_err(err, err_size, "cancelled");
+      errno = EINTR;
+      rc = -1;
+      break;
+    }
     if(lstat(child_abs, &st) != 0) {
       set_err(err, err_size, "stat: %s", strerror(errno));
+      rc = -1;
+      break;
+    }
+    if(job_cancelled()) {
+      set_err(err, err_size, "cancelled");
+      errno = EINTR;
       rc = -1;
       break;
     }
@@ -5523,11 +5648,11 @@ pfsc_worker_main(void *arg) {
   for(;;) {
     pthread_mutex_lock(&pool->lock);
     int slot_index;
-    while(!pool->stop && (slot_index = pfsc_find_ready_slot(pool)) < 0) {
-      uint64_t wait_started = monotonic_us();
-      pthread_cond_wait(&pool->cond, &pool->lock);
-      job_add_wait_us(&g_job.worker_wait_us, wait_started);
-    }
+	    while(!pool->stop && (slot_index = pfsc_find_ready_slot(pool)) < 0) {
+	      uint64_t wait_started = monotonic_us();
+	      cancel_poll_cond_wait(&pool->cond, &pool->lock);
+	      job_add_wait_us(&g_job.worker_wait_us, wait_started);
+	    }
     if(pool->stop) {
       pthread_mutex_unlock(&pool->lock);
       break;
@@ -5915,12 +6040,17 @@ pfsc_window_write_task(pfsc_window_pool_t *pool, pfsc_window_task_t *task) {
   if(job_cancelled()) {
     saved_errno = EINTR;
     snprintf(local_err, sizeof(local_err), "%s", "cancelled");
-  } else if(pwrite_all_local(pool->fd, payload, (size_t)lane->packed_len,
-                             (off_t)(pool->file_start + lane->output_offset)) != 0) {
-    saved_errno = errno ? errno : EIO;
-    snprintf(local_err, sizeof(local_err), "write compressed payload: %s",
-             strerror(saved_errno));
-  }
+	  } else if(pwrite_all_local_cancelable(
+	                 pool->fd, payload, (size_t)lane->packed_len,
+	                 (off_t)(pool->file_start + lane->output_offset)) != 0) {
+	    saved_errno = errno ? errno : EIO;
+	    if(saved_errno == EINTR) {
+	      snprintf(local_err, sizeof(local_err), "%s", "cancelled");
+	    } else {
+	      snprintf(local_err, sizeof(local_err), "write compressed payload: %s",
+	               strerror(saved_errno));
+	    }
+	  }
   if(!saved_errno) {
     long raw_blocks = 0;
     long compressed_blocks = 0;
@@ -5942,11 +6072,16 @@ pfsc_window_write_task(pfsc_window_pool_t *pool, pfsc_window_task_t *task) {
       uint64_t off = PFS_VHASH_HEADER_SIZE +
           lane->start_block * (uint64_t)PFS_VHASH_HASH_SIZE;
       size_t bytes = (size_t)lane->block_count * (size_t)PFS_VHASH_HASH_SIZE;
-      if(pwrite_all_local(pool->vhash->fd, hashes, bytes, (off_t)off) != 0) {
-        saved_errno = errno ? errno : EIO;
-        snprintf(local_err, sizeof(local_err), "write validation hash: %s",
-                 strerror(saved_errno));
-      }
+	      if(pwrite_all_local_cancelable(pool->vhash->fd, hashes, bytes,
+	                                     (off_t)off) != 0) {
+	        saved_errno = errno ? errno : EIO;
+	        if(saved_errno == EINTR) {
+	          snprintf(local_err, sizeof(local_err), "%s", "cancelled");
+	        } else {
+	          snprintf(local_err, sizeof(local_err), "write validation hash: %s",
+	                   strerror(saved_errno));
+	        }
+	      }
     }
     free(hashes);
     if(raw_blocks) atomic_fetch_add(&g_job.raw_blocks, raw_blocks);
@@ -6013,11 +6148,12 @@ pfsc_window_write_lane_hashes_ordered(pfs_vhash_writer_t *vhash,
     else raw_blocks++;
   }
 
-  if(write_all_local(vhash->fd, hashes, bytes) != 0) {
-    set_err(err, err_size, "write validation hash: %s", strerror(errno));
-    free(hashes);
-    return -1;
-  }
+	  if(write_all_local_cancelable(vhash->fd, hashes, bytes) != 0) {
+	    if(errno == EINTR) set_err(err, err_size, "cancelled");
+	    else set_err(err, err_size, "write validation hash: %s", strerror(errno));
+	    free(hashes);
+	    return -1;
+	  }
   free(hashes);
 
   if(raw_blocks) atomic_fetch_add(&g_job.raw_blocks, raw_blocks);
@@ -6082,10 +6218,13 @@ pfsc_window_commit_lane_ordered(pfsc_window_pool_t *pool,
                   (unsigned long long)window->index,
                   (unsigned long long)lane->output_offset,
                   (unsigned long long)lane->packed_len, lane_index);
-  if(write_all_local(pool->fd, payload, (size_t)lane->packed_len) != 0) {
-    set_err(err, err_size, "write compressed payload: %s", strerror(errno));
-    return -1;
-  }
+	  if(write_all_local_cancelable(pool->fd, payload,
+	                                (size_t)lane->packed_len) != 0) {
+	    if(errno == EINTR) set_err(err, err_size, "cancelled");
+	    else set_err(err, err_size, "write compressed payload: %s",
+	                 strerror(errno));
+	    return -1;
+	  }
   if(pfsc_window_write_lane_hashes_ordered(pool->vhash, lane,
                                            err, err_size) != 0) {
     return -1;
@@ -6115,10 +6254,10 @@ pfsc_window_worker_main(void *arg) {
   pfsc_comp_state_t *comp = NULL;
   for(;;) {
     pthread_mutex_lock(&pool->lock);
-    pfsc_window_task_t *task = NULL;
-    while(!pool->stop && !(task = pfsc_window_pool_take_task_locked(pool))) {
-      pthread_cond_wait(&pool->cond, &pool->lock);
-    }
+	    pfsc_window_task_t *task = NULL;
+	    while(!pool->stop && !(task = pfsc_window_pool_take_task_locked(pool))) {
+	      cancel_poll_cond_wait(&pool->cond, &pool->lock);
+	    }
     if(pool->stop && !task) {
       pthread_mutex_unlock(&pool->lock);
       break;
@@ -6235,6 +6374,21 @@ pfsc_window_pool_check_error_locked(pfsc_window_pool_t *pool,
 }
 
 static int
+pfsc_window_pool_cancel_if_requested_locked(pfsc_window_pool_t *pool,
+                                            char *err, size_t err_size) {
+  if(!job_cancelled()) return 0;
+  if(!pool->error) {
+    pool->error = EINTR;
+    snprintf(pool->error_msg, sizeof(pool->error_msg), "%s", "cancelled");
+  }
+  pool->stop = 1;
+  pthread_cond_broadcast(&pool->cond);
+  set_err(err, err_size, "%s", "cancelled");
+  errno = EINTR;
+  return -1;
+}
+
+static int
 pfsc_window_alloc_windows(pfsc_window_t *windows, char *err, size_t err_size) {
   memset(windows, 0, sizeof(pfsc_window_t) * PFSC_WINDOW_SLOTS);
   for(int w = 0; w < PFSC_WINDOW_SLOTS; w++) {
@@ -6305,28 +6459,41 @@ pfsc_window_prepare(pfsc_window_t *window, uint64_t window_index,
 }
 
 static int
-pfsc_window_read_window(pfsc_window_pool_t *pool, pfsc_window_t *window,
-                        const pfsc_window_tuning_t *tuning,
-                        char *err, size_t err_size) {
-  int comp_permits = pfsc_window_comp_permits(tuning, tuning->read_permits);
-  uint64_t start = monotonic_us();
-  pfsc_window_pool_set_phase(pool, PFSC_WINDOW_PHASE_READ,
-                             tuning->read_permits, comp_permits, 0);
+pfsc_window_queue_read_window(pfsc_window_pool_t *pool,
+                              pfsc_window_t *window,
+                              char *err, size_t err_size) {
   pthread_mutex_lock(&pool->lock);
   for(int i = 0; i < window->lane_count; i++) {
     if(pfsc_window_pool_enqueue_locked(pool, PFSC_WINDOW_TASK_READ, window,
                                        i, 0, 0, 0) != 0) {
       pthread_mutex_unlock(&pool->lock);
+      set_err(err, err_size, "out of memory");
       return -1;
     }
   }
-  while(window->read_tasks_remaining > 0 ||
-        pool->running_read > 0) {
+  pthread_mutex_unlock(&pool->lock);
+  return 0;
+}
+
+static int
+pfsc_window_wait_read_window(pfsc_window_pool_t *pool,
+                             pfsc_window_t *window,
+                             const pfsc_window_tuning_t *tuning,
+                             uint64_t start,
+                             char *err, size_t err_size) {
+  int comp_permits = pfsc_window_comp_permits(tuning, tuning->read_permits);
+  pthread_mutex_lock(&pool->lock);
+  while(window->read_tasks_remaining > 0 || pool->running_read > 0) {
     if(pfsc_window_pool_check_error_locked(pool, err, err_size) != 0) {
       pthread_mutex_unlock(&pool->lock);
       return -1;
     }
-    pthread_cond_wait(&pool->cond, &pool->lock);
+    if(pfsc_window_pool_cancel_if_requested_locked(pool, err,
+                                                   err_size) != 0) {
+      pthread_mutex_unlock(&pool->lock);
+      return -1;
+    }
+    cancel_poll_cond_wait(&pool->cond, &pool->lock);
   }
   if(pfsc_window_pool_check_error_locked(pool, err, err_size) != 0) {
     pthread_mutex_unlock(&pool->lock);
@@ -6340,6 +6507,21 @@ pfsc_window_read_window(pfsc_window_pool_t *pool, pfsc_window_t *window,
                   tuning->read_permits, comp_permits,
                   (unsigned long long)elapsed);
   return 0;
+}
+
+static int
+pfsc_window_read_window(pfsc_window_pool_t *pool, pfsc_window_t *window,
+                        const pfsc_window_tuning_t *tuning,
+                        char *err, size_t err_size) {
+  int comp_permits = pfsc_window_comp_permits(tuning, tuning->read_permits);
+  uint64_t start = monotonic_us();
+  pfsc_window_pool_set_phase(pool, PFSC_WINDOW_PHASE_READ,
+                             tuning->read_permits, comp_permits, 0);
+  if(pfsc_window_queue_read_window(pool, window, err, err_size) != 0) {
+    return -1;
+  }
+  return pfsc_window_wait_read_window(pool, window, tuning, start,
+                                      err, err_size);
 }
 
 static int
@@ -6375,21 +6557,34 @@ pfsc_window_start_compression(pfsc_window_pool_t *pool,
 static int
 pfsc_window_write_window(pfsc_window_pool_t *pool, pfsc_window_t *window,
                          pfsc_window_tuning_t *tuning, uint64_t *data_pos,
-                         uint64_t *offsets, char *err, size_t err_size) {
-  int comp_permits = pfsc_window_comp_permits(tuning, tuning->write_permits);
+                         uint64_t *offsets, int allow_read_overlap,
+                         char *err, size_t err_size) {
+  int stage_permits = allow_read_overlap ? tuning->read_permits
+                                         : tuning->write_permits;
+  int comp_permits = pfsc_window_comp_permits(tuning, stage_permits);
   uint64_t start = monotonic_us();
   uint64_t wait_us = 0;
   int next_lane = 0;
-  pfsc_window_pool_set_phase(pool, PFSC_WINDOW_PHASE_WRITE,
-                             0, comp_permits, 0);
+  if(allow_read_overlap) {
+    pfsc_window_pool_set_phase(pool, PFSC_WINDOW_PHASE_READ,
+                               tuning->read_permits, comp_permits, 0);
+  } else {
+    pfsc_window_pool_set_phase(pool, PFSC_WINDOW_PHASE_WRITE,
+                               0, comp_permits, 0);
+  }
 
   pthread_mutex_lock(&pool->lock);
   while(next_lane < window->lane_count) {
-    if(pfsc_window_pool_check_error_locked(pool, err, err_size) != 0) {
-      pthread_mutex_unlock(&pool->lock);
-      return -1;
-    }
-    pfsc_window_lane_t *lane = &window->lanes[next_lane];
+	    if(pfsc_window_pool_check_error_locked(pool, err, err_size) != 0) {
+	      pthread_mutex_unlock(&pool->lock);
+	      return -1;
+	    }
+	    if(pfsc_window_pool_cancel_if_requested_locked(pool, err,
+	                                                   err_size) != 0) {
+	      pthread_mutex_unlock(&pool->lock);
+	      return -1;
+	    }
+	    pfsc_window_lane_t *lane = &window->lanes[next_lane];
     if(pfsc_window_lane_ready_locked(lane)) {
       pthread_mutex_unlock(&pool->lock);
       int commit_rc = pfsc_window_commit_lane_ordered(
@@ -6406,10 +6601,10 @@ pfsc_window_write_window(pfsc_window_pool_t *pool, pfsc_window_t *window,
       pthread_cond_broadcast(&pool->cond);
       next_lane++;
       continue;
-    }
-    uint64_t wait_start = monotonic_us();
-    pthread_cond_wait(&pool->cond, &pool->lock);
-    uint64_t now = monotonic_us();
+	    }
+	    uint64_t wait_start = monotonic_us();
+	    cancel_poll_cond_wait(&pool->cond, &pool->lock);
+	    uint64_t now = monotonic_us();
     if(now > wait_start) wait_us += now - wait_start;
     job_add_wait_us(&g_job.writer_wait_us, wait_start);
   }
@@ -6419,12 +6614,13 @@ pfsc_window_write_window(pfsc_window_pool_t *pool, pfsc_window_t *window,
   }
   pthread_mutex_unlock(&pool->lock);
 
-  uint64_t elapsed = monotonic_us() - start;
-  PFSC_WINDOW_LOG("pfsc window write index=%llu lanes=%d writePermits=0 orderedCommit=1 requestedWritePermits=%d compPermits=%d waitUs=%llu elapsedUs=%llu",
-                  (unsigned long long)window->index, window->lane_count,
-                  tuning->write_permits, comp_permits,
-                  (unsigned long long)wait_us, (unsigned long long)elapsed);
-  return 0;
+	  uint64_t elapsed = monotonic_us() - start;
+  PFSC_WINDOW_LOG("pfsc window write index=%llu lanes=%d writePermits=0 orderedCommit=1 requestedWritePermits=%d readOverlap=%d compPermits=%d waitUs=%llu elapsedUs=%llu",
+	                  (unsigned long long)window->index, window->lane_count,
+	                  tuning->write_permits, allow_read_overlap ? 1 : 0,
+                  comp_permits,
+	                  (unsigned long long)wait_us, (unsigned long long)elapsed);
+	  return 0;
 }
 
 static int
@@ -6433,10 +6629,11 @@ compress_nested_to_pfsc_windowed(int fd, uint64_t file_start,
                                  int requested_workers,
                                  const char *nested_name,
                                  int nested_type,
-                                 const char *vhash_path,
-                                 uint64_t *stored_size,
-                                 int compression_profile,
-                                 char *err, size_t err_size) {
+	                                 const char *vhash_path,
+	                                 uint64_t *stored_size,
+	                                 int compression_profile,
+                                 int allow_io_overlap,
+	                                 char *err, size_t err_size) {
   uint64_t block_count = ceil_div_u64(nested->image_size, PFS_BLOCK_SIZE);
   uint64_t logical_size = block_count * PFS_BLOCK_SIZE;
   uint64_t header_size = pfsc_header_span(block_count);
@@ -6538,7 +6735,8 @@ compress_nested_to_pfsc_windowed(int fd, uint64_t file_start,
                   comp_config.zlib_level, comp_config.threshold_gain,
                   comp_config.fast_deflate,
                   comp_config.raw_only, comp_config.entropy_skip);
-  PFSC_WINDOW_LOG("pfsc window mode=ordered-commit");
+  PFSC_WINDOW_LOG("pfsc window mode=ordered-commit ioPolicy=%s",
+                  allow_io_overlap ? "pipelined" : "serial");
 
   uint64_t next_block = 0;
   uint64_t next_window_index = 0;
@@ -6565,9 +6763,9 @@ compress_nested_to_pfsc_windowed(int fd, uint64_t file_start,
       PFSC_WINDOW_LOG("pfsc window raw first flush index=%llu",
                       (unsigned long long)current->index);
       if(pfsc_window_write_window(&pool, current, &tuning, &data_pos,
-                                  offsets, err, err_size) != 0) {
-        goto done;
-      }
+                                  offsets, 0, err, err_size) != 0) {
+	        goto done;
+	      }
       flushed_first_raw_window = 1;
       if(next_block >= block_count) {
         current = NULL;
@@ -6590,31 +6788,59 @@ compress_nested_to_pfsc_windowed(int fd, uint64_t file_start,
       continue;
     }
 
-    pfsc_window_t *next = NULL;
-    if(next_block < block_count) {
-      next = current == &windows[0] ? &windows[1] : &windows[0];
-      uint64_t nblocks = block_count - next_block;
-      if(nblocks > PFSC_WINDOW_BLOCKS) nblocks = PFSC_WINDOW_BLOCKS;
-      if(pfsc_window_prepare(next, next_window_index++, next_block,
-                             nblocks) != 0) {
-        set_err(err, err_size, "bad window state");
-        goto done;
+	    pfsc_window_t *next = NULL;
+    uint64_t next_read_start = 0;
+	    if(next_block < block_count) {
+	      next = current == &windows[0] ? &windows[1] : &windows[0];
+	      uint64_t nblocks = block_count - next_block;
+	      if(nblocks > PFSC_WINDOW_BLOCKS) nblocks = PFSC_WINDOW_BLOCKS;
+	      if(pfsc_window_prepare(next, next_window_index++, next_block,
+	                             nblocks) != 0) {
+	        set_err(err, err_size, "bad window state");
+	        goto done;
+	      }
+	      next_block += nblocks;
+      if(allow_io_overlap) {
+        int comp_permits =
+            pfsc_window_comp_permits(&tuning, tuning.read_permits);
+        next_read_start = monotonic_us();
+        pfsc_window_pool_set_phase(&pool, PFSC_WINDOW_PHASE_READ,
+                                   tuning.read_permits, comp_permits, 0);
+        if(pfsc_window_queue_read_window(&pool, next, err, err_size) != 0) {
+          goto done;
+        }
+      } else {
+        if(pfsc_window_read_window(&pool, next, &tuning, err, err_size) != 0) {
+          goto done;
+        }
+        if(pfsc_window_start_compression(&pool, next, err, err_size) != 0) {
+          goto done;
+        }
       }
-      next_block += nblocks;
-      if(pfsc_window_read_window(&pool, next, &tuning, err, err_size) != 0) {
+	    }
+
+	    if(pfsc_window_write_window(&pool, current, &tuning, &data_pos,
+                                offsets, allow_io_overlap && next,
+                                err, err_size) != 0) {
+	      goto done;
+	    }
+    if(allow_io_overlap && next) {
+      int comp_permits = pfsc_window_comp_permits(&tuning,
+                                                  tuning.read_permits);
+      pfsc_window_pool_set_phase(&pool, PFSC_WINDOW_PHASE_READ,
+                                 tuning.read_permits, comp_permits, 0);
+      if(pfsc_window_wait_read_window(&pool, next, &tuning,
+                                      next_read_start ? next_read_start
+                                                      : monotonic_us(),
+                                      err, err_size) != 0) {
         goto done;
       }
       if(pfsc_window_start_compression(&pool, next, err, err_size) != 0) {
         goto done;
       }
     }
-
-    if(pfsc_window_write_window(&pool, current, &tuning, &data_pos,
-                                offsets, err, err_size) != 0) {
-      goto done;
-    }
-    current = next;
-  }
+	    current = next;
+	  }
 
   pfsc_window_pool_set_phase(&pool, PFSC_WINDOW_PHASE_IDLE, 0,
                              pfsc_window_comp_permits(&tuning, 0), 0);
@@ -6652,7 +6878,7 @@ compress_nested_to_pfsc(int fd, uint64_t file_start, pfs_layout_t *nested,
                         destructive_stream_ctx_t *stream,
                         const char *source_root, int *delete_started,
                         uint64_t *stored_size, int compression_profile,
-                        char *err, size_t err_size) {
+                        int allow_io_overlap, char *err, size_t err_size) {
   uint64_t block_count = ceil_div_u64(nested->image_size, PFS_BLOCK_SIZE);
   uint64_t logical_size = block_count * PFS_BLOCK_SIZE;
   uint64_t header_size = pfsc_header_span(block_count);
@@ -6706,7 +6932,8 @@ compress_nested_to_pfsc(int fd, uint64_t file_start, pfs_layout_t *nested,
   if(!delete_stream) {
     int window_rc = compress_nested_to_pfsc_windowed(
         fd, file_start, nested, requested_workers, nested_name, nested_type,
-        vhash_path, stored_size, compression_profile, err, err_size);
+        vhash_path, stored_size, compression_profile, allow_io_overlap,
+        err, err_size);
     if(window_rc == 0) {
       rc = 0;
       goto done;
@@ -6858,13 +7085,23 @@ compress_nested_to_pfsc(int fd, uint64_t file_start, pfs_layout_t *nested,
 
       pthread_mutex_lock(&pool.lock);
       while(slot->state != PFSC_SLOT_FREE && !pool.error) {
-        pthread_cond_wait(&pool.cond, &pool.lock);
+        if(job_cancelled() && (!stream || !stream->mutation_started)) {
+          if(!pool.error) pool.error = EINTR;
+          pool.stop = 1;
+          pthread_cond_broadcast(&pool.cond);
+          break;
+        } else if(job_cancelled() && stream) {
+          atomic_store(&g_job.cancel, 0);
+        }
+        cancel_poll_cond_wait(&pool.cond, &pool.lock);
       }
       if(pool.error) {
         int saved = pool.error;
         pthread_mutex_unlock(&pool.lock);
         errno = saved;
-        set_err(err, err_size, "compression task failed: %s", strerror(saved));
+        if(saved == EINTR) set_err(err, err_size, "cancelled");
+        else set_err(err, err_size, "compression task failed: %s",
+                     strerror(saved));
         goto done;
       }
       slot->state = PFSC_SLOT_FILLING;
@@ -6915,14 +7152,24 @@ compress_nested_to_pfsc(int fd, uint64_t file_start, pfs_layout_t *nested,
     while((slot->state != PFSC_SLOT_DONE || slot->index != next_write) &&
           !pool.error) {
       uint64_t wait_started = monotonic_us();
-      pthread_cond_wait(&pool.cond, &pool.lock);
+      if(job_cancelled() && (!stream || !stream->mutation_started)) {
+        if(!pool.error) pool.error = EINTR;
+        pool.stop = 1;
+        pthread_cond_broadcast(&pool.cond);
+        break;
+      } else if(job_cancelled() && stream) {
+        atomic_store(&g_job.cancel, 0);
+      }
+      cancel_poll_cond_wait(&pool.cond, &pool.lock);
       job_add_wait_us(&g_job.writer_wait_us, wait_started);
     }
     if(pool.error) {
       int saved = pool.error;
       pthread_mutex_unlock(&pool.lock);
       errno = saved;
-      set_err(err, err_size, "compression task failed: %s", strerror(saved));
+      if(saved == EINTR) set_err(err, err_size, "cancelled");
+      else set_err(err, err_size, "compression task failed: %s",
+                   strerror(saved));
       goto done;
     }
     pthread_mutex_unlock(&pool.lock);
@@ -7680,6 +7927,8 @@ pfs_compress_execute_prepared_to_ffpfsc(pfs_compress_plan_t *plan,
   destructive_stream_ctx_t stream_ctx;
   int stream_ctx_initialized = 0;
   int destructive_stream = 0;
+  pfs_io_policy_info_t io_policy;
+  int allow_io_overlap = 0;
   int format;
   int delete_policy;
   struct stat output_st;
@@ -7726,6 +7975,13 @@ pfs_compress_execute_prepared_to_ffpfsc(pfs_compress_plan_t *plan,
   if(destructive_stream) {
     destructive_stream_init(&stream_ctx);
     stream_ctx_initialized = 1;
+  } else {
+    pfs_io_policy_for_paths(info->source_path, info->output_path, &io_policy);
+    allow_io_overlap = pfs_io_policy_allows_overlap(&io_policy);
+    PFSC_WINDOW_LOG("pfsc io policy action=compress ioPolicy=%s sourceDevice=\"%s\" destDevice=\"%s\" reason=%s source=\"%s\" dest=\"%s\"",
+                    pfs_io_policy_name(io_policy.policy),
+                    io_policy.source_key, io_policy.dest_key,
+                    io_policy.reason, info->source_path, info->output_path);
   }
 
   fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
@@ -7746,7 +8002,7 @@ pfs_compress_execute_prepared_to_ffpfsc(pfs_compress_plan_t *plan,
                              destructive_stream ? &stream_ctx : NULL,
                              info->source_path,
                              &delete_started, &stored_size,
-                             info->compression_profile,
+                             info->compression_profile, allow_io_overlap,
                              err, err_size) != 0) {
     goto done;
   }
@@ -7993,7 +8249,7 @@ pfs_compress_resume_stream_journal_profile(const char *journal_path,
                                stream_ctx.tmp_path, info,
                                stream_ctx.format, &stream_ctx,
                                stream_ctx.source_path, &delete_started,
-                               &stored_size, info->compression_profile,
+                               &stored_size, info->compression_profile, 0,
                                err, err_size) != 0) {
       goto done;
     }

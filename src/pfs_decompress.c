@@ -23,6 +23,7 @@
 #include "miniz.h"
 #include "pfs_block_pipeline.h"
 #include "pfs_compress.h"
+#include "pfs_io_policy.h"
 #include "transfer_internal.h"
 #if defined(GAME_COMPRESSOR_VERSION)
 #include "gc_diag.h"
@@ -52,6 +53,11 @@
 #define PFSC_OFFSET_ENTRY_SIZE 8
 
 #define PFSC_DECOMPRESS_SLOTS_PER_WORKER 32
+#define PFSC_DECOMPRESS_WINDOW_RC_FALLBACK 1
+#define PFSC_DECOMPRESS_WINDOW_SLOTS 2
+#define PFSC_DECOMPRESS_LANE_MAX_SIZE (32ULL * 1024ULL * 1024ULL)
+#define PFSC_DECOMPRESS_LANE_MIN_SIZE (8ULL * 1024ULL * 1024ULL)
+#define PFSC_DECOMPRESS_DECODE_CHUNK_BLOCKS 8U
 #define PFS_EXTRACT_OUTPUT_BUFFER_SIZE (64U * 1024U * 1024U)
 #define PFS_EXTRACT_OUTPUT_BUFFER_MIN_SIZE (64U * 1024U)
 #define PFS_IMAGE_OUTPUT_BUFFER_SIZE (128U * 1024U * 1024U)
@@ -108,6 +114,9 @@ typedef struct pfs_extract_entry {
   uint64_t first_block;
   uint64_t block_count;
   uint64_t size;
+  uint64_t written;
+  int fd;
+  int done;
 } pfs_extract_entry_t;
 
 typedef struct pfs_extract_plan {
@@ -127,6 +136,83 @@ typedef struct pfsc_decode_pool {
   int stop;
   int error;
 } pfsc_decode_pool_t;
+
+typedef enum pfsc_decomp_phase {
+  PFSC_DECOMP_PHASE_IDLE = 0,
+  PFSC_DECOMP_PHASE_READ,
+  PFSC_DECOMP_PHASE_WRITE,
+} pfsc_decomp_phase_t;
+
+typedef enum pfsc_decomp_task_type {
+  PFSC_DECOMP_TASK_READ = 1,
+  PFSC_DECOMP_TASK_DECODE,
+} pfsc_decomp_task_type_t;
+
+typedef struct pfsc_decomp_block {
+  uint32_t stored_len;
+  uint8_t ready;
+  uint8_t raw;
+} pfsc_decomp_block_t;
+
+typedef struct pfsc_decomp_lane {
+  uint64_t start_block;
+  uint64_t block_count;
+  uint64_t stored_offset;
+  uint64_t stored_size;
+  uint64_t decoded_size;
+  int read_done;
+  int decode_started;
+  unsigned char *stored;
+  unsigned char *decoded;
+  pfsc_decomp_block_t *blocks;
+} pfsc_decomp_lane_t;
+
+typedef struct pfsc_decomp_window {
+  uint64_t index;
+  uint64_t start_block;
+  uint64_t block_count;
+  int lane_count;
+  int read_tasks_remaining;
+  int decode_tasks_remaining;
+  int decode_started;
+  pfsc_decomp_lane_t *lanes;
+} pfsc_decomp_window_t;
+
+typedef struct pfsc_decomp_task {
+  pfsc_decomp_task_type_t type;
+  pfsc_decomp_window_t *window;
+  int lane_index;
+  uint32_t first_block;
+  uint32_t block_count;
+  struct pfsc_decomp_task *next;
+} pfsc_decomp_task_t;
+
+typedef struct pfsc_decomp_pool {
+  pthread_mutex_t lock;
+  pthread_cond_t cond;
+  pfsc_decomp_task_t *read_head;
+  pfsc_decomp_task_t *read_tail;
+  pfsc_decomp_task_t *decode_head;
+  pfsc_decomp_task_t *decode_tail;
+  pthread_t *threads;
+  int thread_count;
+  int workers_started;
+  int phase;
+  int stop;
+  int error;
+  char error_msg[256];
+  int read_permits;
+  int decode_permits;
+  int running_read;
+  int running_decode;
+  const pfsc_reader_t *reader;
+} pfsc_decomp_pool_t;
+
+typedef struct pfsc_decomp_plan_writer {
+  pfs_extract_plan_t *plan;
+  size_t entry_index;
+  int sync_files;
+} pfsc_decomp_plan_writer_t;
 
 static void
 set_err(char *err, size_t err_size, const char *fmt, ...) {
@@ -269,9 +355,18 @@ rd64(const unsigned char *p) {
 }
 
 static int
+pfs_decompress_cancel_requested(void) {
+  return atomic_load(&g_job.busy) && job_cancelled();
+}
+
+static int
 read_exact_at(int fd, void *data, size_t size, off_t offset) {
   unsigned char *p = data;
   while(size > 0) {
+    if(pfs_decompress_cancel_requested()) {
+      errno = EINTR;
+      return -1;
+    }
     ssize_t n = pread(fd, p, size, offset);
     if(n < 0) {
       if(errno == EINTR) continue;
@@ -284,6 +379,53 @@ read_exact_at(int fd, void *data, size_t size, off_t offset) {
     p += n;
     size -= (size_t)n;
     offset += n;
+  }
+  return 0;
+}
+
+static int
+write_exact_at(int fd, const void *data, size_t size, off_t offset) {
+  const unsigned char *p = data;
+  while(size > 0) {
+    if(pfs_decompress_cancel_requested()) {
+      errno = EINTR;
+      return -1;
+    }
+    ssize_t n = pwrite(fd, p, size, offset);
+    if(n < 0) {
+      if(errno == EINTR) continue;
+      return -1;
+    }
+    if(n == 0) {
+      errno = EIO;
+      return -1;
+    }
+    p += n;
+    size -= (size_t)n;
+    offset += n;
+  }
+  return 0;
+}
+
+static int
+write_all_fd_cancelable(int fd, const void *data, size_t size) {
+  const unsigned char *p = data;
+  while(size > 0) {
+    if(pfs_decompress_cancel_requested()) {
+      errno = EINTR;
+      return -1;
+    }
+    ssize_t n = write(fd, p, size);
+    if(n < 0) {
+      if(errno == EINTR) continue;
+      return -1;
+    }
+    if(n == 0) {
+      errno = EIO;
+      return -1;
+    }
+    p += n;
+    size -= (size_t)n;
   }
   return 0;
 }
@@ -344,6 +486,18 @@ monotonic_us(void) {
 }
 
 static void
+cancel_poll_cond_wait(pthread_cond_t *cond, pthread_mutex_t *lock) {
+  struct timespec ts;
+  clock_gettime(CLOCK_REALTIME, &ts);
+  ts.tv_nsec += 100000000L;
+  if(ts.tv_nsec >= 1000000000L) {
+    ts.tv_sec += ts.tv_nsec / 1000000000L;
+    ts.tv_nsec %= 1000000000L;
+  }
+  (void)pthread_cond_timedwait(cond, lock, &ts);
+}
+
+static void
 job_add_wait_us(atomic_long *counter, uint64_t started_at) {
   uint64_t now = monotonic_us();
   if(now <= started_at) return;
@@ -354,11 +508,6 @@ job_add_wait_us(atomic_long *counter, uint64_t started_at) {
 static long
 job_long_from_u64(uint64_t v) {
   return v > (uint64_t)LONG_MAX ? LONG_MAX : (long)v;
-}
-
-static uint64_t
-saturating_add_u64(uint64_t a, uint64_t b) {
-  return UINT64_MAX - a < b ? UINT64_MAX : a + b;
 }
 
 static uint32_t
@@ -470,57 +619,17 @@ pfsc_reader_disable_mounted(pfsc_reader_t *r, const char *reason) {
 static int
 pfsc_reader_try_open_mounted(pfsc_reader_t *r, const char *source_path) {
   char mounted_path[1024];
-  struct stat st;
-  int fd = -1;
 
   if(!r || r->mounted_enabled || r->mounted_fd >= 0) return 0;
   if(mounted_nested_path(source_path, r->nested_name, mounted_path,
                          sizeof(mounted_path)) != 0) {
-    PFS_DECOMPRESS_LOG("decompress mounted fast path unavailable source=%s nested=%s reason=path",
+    PFS_DECOMPRESS_LOG("decompress mounted fast path disabled source=%s nested=%s reason=path",
                        source_path ? source_path : "",
                        r->nested_name);
     return 0;
   }
-
-  fd = open(mounted_path, O_RDONLY);
-  if(fd < 0) {
-    PFS_DECOMPRESS_LOG("decompress mounted fast path unavailable path=%s reason=open:%s",
-                       mounted_path, strerror(errno));
-    return 0;
-  }
-  if(fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0 ||
-     (uint64_t)st.st_size < r->nested_size) {
-    PFS_DECOMPRESS_LOG("decompress mounted fast path unavailable path=%s reason=size",
-                       mounted_path);
-    close(fd);
-    return 0;
-  }
-
-  r->mounted_block = malloc((size_t)r->block_size);
-  r->last_mounted_block = malloc((size_t)r->block_size);
-  if(!r->mounted_block || !r->last_mounted_block) {
-    free(r->mounted_block);
-    free(r->last_mounted_block);
-    r->mounted_block = NULL;
-    r->last_mounted_block = NULL;
-    close(fd);
-    PFS_DECOMPRESS_LOG("decompress mounted fast path unavailable path=%s reason=memory",
-                       mounted_path);
-    return 0;
-  }
-
-  r->mounted_fd = fd;
-  r->mounted_enabled = 1;
-  r->mounted_calibrated = 0;
-  r->mounted_has_last = 0;
-  r->mounted_stale_blocks = 0;
-  r->mounted_calibration_misses = 0;
-  r->last_mounted_index = UINT64_MAX;
-  snprintf(r->mounted_path, sizeof(r->mounted_path), "%s", mounted_path);
-  PFS_DECOMPRESS_LOG("decompress mounted fast path enabled path=%s nested_size=%llu blocks=%llu",
-                     r->mounted_path,
-                     (unsigned long long)r->nested_size,
-                     (unsigned long long)r->block_count);
+  PFS_DECOMPRESS_LOG("decompress mounted fast path disabled path=%s reason=software-windowed-unpack",
+                     mounted_path);
   return 0;
 }
 
@@ -841,6 +950,38 @@ pfsc_reader_decode_block_software(pfsc_reader_t *r, uint64_t index,
 }
 
 static int
+pfsc_decode_block_from_memory(const pfsc_reader_t *r, uint64_t index,
+                              const unsigned char *stored, size_t stored_len,
+                              unsigned char *out,
+                              char *err, size_t err_size) {
+  if(!r || !stored || !out || index >= r->block_count) {
+    set_err(err, err_size, "PFSC read outside logical image");
+    errno = EINVAL;
+    return -1;
+  }
+  if(stored_len == 0 || stored_len > (size_t)r->block_size) {
+    set_err(err, err_size, "invalid PFSC block span");
+    errno = EINVAL;
+    return -1;
+  }
+  if(stored_len == (size_t)r->block_size) {
+    memcpy(out, stored, stored_len);
+    atomic_fetch_add(&g_job.raw_blocks, 1);
+    return 1;
+  }
+  size_t out_len = tinfl_decompress_mem_to_mem(
+      out, (size_t)r->block_size, stored, stored_len,
+      TINFL_FLAG_PARSE_ZLIB_HEADER);
+  if(out_len != (size_t)r->block_size) {
+    set_err(err, err_size, "decompress PFSC block failed");
+    errno = EINVAL;
+    return -1;
+  }
+  atomic_fetch_add(&g_job.compressed_blocks, 1);
+  return 0;
+}
+
+static int
 pfsc_reader_read_mounted_checked(pfsc_reader_t *r, uint64_t index) {
   size_t useful = pfsc_reader_block_useful_size(r, index);
   if(read_mounted_block(r->mounted_fd, r->mounted_block, useful,
@@ -1066,7 +1207,7 @@ pfsc_reader_write_buffered_range(pfsc_reader_t *r, uint64_t offset,
   if(size <= (size_t)r->block_size &&
      (offset % r->block_size) == 0) {
     unsigned char *dst = pfs_stream_buffer_reserve(
-        outbuf, out, write_all_fd, (size_t)r->block_size);
+        outbuf, out, write_all_fd_cancelable, (size_t)r->block_size);
     if(dst) {
       if(pfsc_reader_decode_block_direct(r, offset / r->block_size,
                                          dst, err, err_size) != 0) {
@@ -1077,7 +1218,7 @@ pfsc_reader_write_buffered_range(pfsc_reader_t *r, uint64_t offset,
     }
   }
   if(pfsc_reader_read(r, offset, fallback, size, err, err_size) != 0 ||
-     pfs_stream_buffer_write(outbuf, out, write_all_fd,
+     pfs_stream_buffer_write(outbuf, out, write_all_fd_cancelable,
                              fallback, size) != 0) {
     if(!err[0]) set_err(err, err_size, "write output file: %s", strerror(errno));
     return -1;
@@ -1292,9 +1433,6 @@ pfs_find_child_inode(pfs_nested_reader_t *nr, uint32_t dir_inode_num,
   return -1;
 }
 
-static int pfs_count_dir(pfs_nested_reader_t *nr, uint32_t inode_num,
-                         uint64_t *files, uint64_t *bytes, uint64_t *blocks,
-                         char *err, size_t err_size);
 static int pfs_extract_file(pfs_nested_reader_t *nr, uint32_t inode_num,
                             const char *out_path, const char *rel,
                             int workers, int sync_file,
@@ -1307,6 +1445,12 @@ static int pfs_extract_dir(pfs_nested_reader_t *nr, uint32_t inode_num,
 static void
 pfs_extract_plan_free(pfs_extract_plan_t *plan) {
   if(!plan) return;
+  for(size_t i = 0; i < plan->count; i++) {
+    if(plan->items[i].fd >= 0) {
+      close(plan->items[i].fd);
+      plan->items[i].fd = -1;
+    }
+  }
   free(plan->items);
   memset(plan, 0, sizeof(*plan));
 }
@@ -1340,6 +1484,7 @@ pfs_extract_plan_push(pfs_extract_plan_t *plan, uint32_t inode_num,
   }
   pfs_extract_entry_t *e = &plan->items[plan->count++];
   memset(e, 0, sizeof(*e));
+  e->fd = -1;
   snprintf(e->rel, sizeof(e->rel), "%s", rel);
   snprintf(e->out_path, sizeof(e->out_path), "%s", out_path);
   e->inode_num = inode_num;
@@ -1353,12 +1498,14 @@ pfs_extract_plan_push(pfs_extract_plan_t *plan, uint32_t inode_num,
 }
 
 static int
-pfs_extract_entry_cmp_desc(const void *a, const void *b) {
+pfs_extract_entry_cmp_asc(const void *a, const void *b) {
   const pfs_extract_entry_t *ea = a;
   const pfs_extract_entry_t *eb = b;
-  if(ea->first_block < eb->first_block) return 1;
-  if(ea->first_block > eb->first_block) return -1;
-  return strcmp(eb->rel, ea->rel);
+  if(ea->image_offset < eb->image_offset) return -1;
+  if(ea->image_offset > eb->image_offset) return 1;
+  if(ea->size < eb->size) return -1;
+  if(ea->size > eb->size) return 1;
+  return strcmp(ea->rel, eb->rel);
 }
 
 static int
@@ -1449,70 +1596,744 @@ pfs_collect_extract_plan(pfs_nested_reader_t *nr, uint32_t inode_num,
   return 0;
 }
 
+static uint64_t
+pfs_extract_entry_end(const pfs_extract_entry_t *e) {
+  if(!e) return 0;
+  return UINT64_MAX - e->image_offset < e->size
+      ? UINT64_MAX
+      : e->image_offset + e->size;
+}
+
 static int
-pfsc_truncate_source_after_block(pfsc_reader_t *r, uint64_t first_block,
-                                 char *err, size_t err_size) {
-  if(first_block >= r->block_count) {
-    set_err(err, err_size, "truncate outside PFSC image");
+pfsc_decomp_worker_count(int requested_workers) {
+  int workers = requested_workers;
+  if(workers <= 0) workers = PFS_DECOMPRESS_DEFAULT_WORKERS;
+  if(workers > PFS_COMPRESS_MAX_WORKERS) workers = PFS_COMPRESS_MAX_WORKERS;
+  if(workers < 1) workers = 1;
+  return workers;
+}
+
+static void
+pfsc_decomp_push_task(pfsc_decomp_task_t **head, pfsc_decomp_task_t **tail,
+                      pfsc_decomp_task_t *task) {
+  task->next = NULL;
+  if(*tail) (*tail)->next = task;
+  else *head = task;
+  *tail = task;
+}
+
+static pfsc_decomp_task_t *
+pfsc_decomp_pop_task(pfsc_decomp_task_t **head, pfsc_decomp_task_t **tail) {
+  pfsc_decomp_task_t *task = *head;
+  if(!task) return NULL;
+  *head = task->next;
+  if(!*head) *tail = NULL;
+  task->next = NULL;
+  return task;
+}
+
+static void
+pfsc_decomp_pool_set_error(pfsc_decomp_pool_t *pool, int err,
+                           const char *msg) {
+  pthread_mutex_lock(&pool->lock);
+  if(!pool->error) {
+    pool->error = err ? err : EIO;
+    snprintf(pool->error_msg, sizeof(pool->error_msg), "%s",
+             msg && msg[0] ? msg : strerror(pool->error));
+  }
+  pool->stop = 1;
+  pthread_cond_broadcast(&pool->cond);
+  pthread_mutex_unlock(&pool->lock);
+}
+
+static int
+pfsc_decomp_pool_check_error_locked(pfsc_decomp_pool_t *pool,
+                                    char *err, size_t err_size) {
+  if(!pool->error) return 0;
+  set_err(err, err_size, "%s",
+          pool->error_msg[0] ? pool->error_msg : strerror(pool->error));
+  errno = pool->error;
+  return -1;
+}
+
+static int
+pfsc_decomp_pool_cancel_if_requested_locked(pfsc_decomp_pool_t *pool,
+                                            char *err, size_t err_size) {
+  if(!job_cancelled()) return 0;
+  if(!pool->error) {
+    pool->error = EINTR;
+    snprintf(pool->error_msg, sizeof(pool->error_msg), "%s", "cancelled");
+  }
+  pool->stop = 1;
+  pthread_cond_broadcast(&pool->cond);
+  set_err(err, err_size, "%s", "cancelled");
+  errno = EINTR;
+  return -1;
+}
+
+static void
+pfsc_decomp_pool_set_phase(pfsc_decomp_pool_t *pool, int phase,
+                           int read_permits, int decode_permits) {
+  pthread_mutex_lock(&pool->lock);
+  pool->phase = phase;
+  pool->read_permits = read_permits;
+  pool->decode_permits = decode_permits;
+  pthread_cond_broadcast(&pool->cond);
+  pthread_mutex_unlock(&pool->lock);
+}
+
+static int
+pfsc_decomp_pool_enqueue_locked(pfsc_decomp_pool_t *pool,
+                                pfsc_decomp_task_type_t type,
+                                pfsc_decomp_window_t *window,
+                                int lane_index,
+                                uint32_t first_block,
+                                uint32_t block_count) {
+  pfsc_decomp_task_t *task = malloc(sizeof(*task));
+  if(!task) {
+    if(!pool->error) {
+      pool->error = ENOMEM;
+      snprintf(pool->error_msg, sizeof(pool->error_msg), "%s",
+               "out of memory");
+      pool->stop = 1;
+    }
+    pthread_cond_broadcast(&pool->cond);
+    return -1;
+  }
+  memset(task, 0, sizeof(*task));
+  task->type = type;
+  task->window = window;
+  task->lane_index = lane_index;
+  task->first_block = first_block;
+  task->block_count = block_count;
+  if(type == PFSC_DECOMP_TASK_READ) {
+    window->read_tasks_remaining++;
+    pfsc_decomp_push_task(&pool->read_head, &pool->read_tail, task);
+  } else {
+    window->decode_tasks_remaining++;
+    pfsc_decomp_push_task(&pool->decode_head, &pool->decode_tail, task);
+  }
+  pthread_cond_broadcast(&pool->cond);
+  return 0;
+}
+
+static pfsc_decomp_task_t *
+pfsc_decomp_pool_take_task_locked(pfsc_decomp_pool_t *pool) {
+  if(pool->phase == PFSC_DECOMP_PHASE_READ) {
+    if(pool->read_head && pool->running_read < pool->read_permits) {
+      pool->running_read++;
+      return pfsc_decomp_pop_task(&pool->read_head, &pool->read_tail);
+    }
+    if(pool->decode_head && pool->running_decode < pool->decode_permits) {
+      pool->running_decode++;
+      return pfsc_decomp_pop_task(&pool->decode_head, &pool->decode_tail);
+    }
+  } else {
+    if(pool->decode_head && pool->running_decode < pool->decode_permits) {
+      pool->running_decode++;
+      return pfsc_decomp_pop_task(&pool->decode_head, &pool->decode_tail);
+    }
+  }
+  return NULL;
+}
+
+static void
+pfsc_decomp_pool_finish_task_locked(pfsc_decomp_pool_t *pool,
+                                    const pfsc_decomp_task_t *task) {
+  if(task->type == PFSC_DECOMP_TASK_READ) {
+    if(pool->running_read > 0) pool->running_read--;
+    if(task->window->read_tasks_remaining > 0) {
+      task->window->read_tasks_remaining--;
+    }
+  } else {
+    if(pool->running_decode > 0) pool->running_decode--;
+    if(task->window->decode_tasks_remaining > 0) {
+      task->window->decode_tasks_remaining--;
+    }
+  }
+  pthread_cond_broadcast(&pool->cond);
+}
+
+static void
+pfsc_decomp_read_task(pfsc_decomp_pool_t *pool, pfsc_decomp_task_t *task) {
+  pfsc_decomp_lane_t *lane = &task->window->lanes[task->lane_index];
+  char local_err[256] = {0};
+  int saved_errno = 0;
+  if(job_cancelled()) {
+    saved_errno = EINTR;
+    snprintf(local_err, sizeof(local_err), "%s", "cancelled");
+  } else if(lane->block_count == 0 || lane->stored_size == 0 ||
+            read_exact_at(pool->reader->fd, lane->stored,
+                          (size_t)lane->stored_size,
+                          (off_t)(pool->reader->file_start +
+                                  lane->stored_offset)) != 0) {
+    saved_errno = errno ? errno : EIO;
+    snprintf(local_err, sizeof(local_err), "read PFSC window: %s",
+             strerror(saved_errno));
+  }
+  if(saved_errno) {
+    pfsc_decomp_pool_set_error(pool, saved_errno, local_err);
+    return;
+  }
+  pthread_mutex_lock(&pool->lock);
+  lane->read_done = 1;
+  pthread_cond_broadcast(&pool->cond);
+  pthread_mutex_unlock(&pool->lock);
+}
+
+static void
+pfsc_decomp_decode_task(pfsc_decomp_pool_t *pool, pfsc_decomp_task_t *task) {
+  pfsc_decomp_lane_t *lane = &task->window->lanes[task->lane_index];
+  char local_err[256] = {0};
+  int saved_errno = 0;
+
+  if(!lane->read_done) {
+    pfsc_decomp_pool_set_error(pool, EIO, "decode before read");
+    return;
+  }
+  for(uint32_t i = 0; i < task->block_count; i++) {
+    if(job_cancelled()) {
+      saved_errno = EINTR;
+      snprintf(local_err, sizeof(local_err), "%s", "cancelled");
+      break;
+    }
+    uint64_t local_block = (uint64_t)task->first_block + i;
+    uint64_t global_block = lane->start_block + local_block;
+    if(local_block >= lane->block_count ||
+       global_block >= pool->reader->block_count) {
+      saved_errno = EINVAL;
+      snprintf(local_err, sizeof(local_err), "%s",
+               "PFSC decode outside window");
+      break;
+    }
+    uint64_t start = pool->reader->offsets[global_block];
+    uint64_t end = pool->reader->offsets[global_block + 1];
+    if(end < start || start < lane->stored_offset ||
+       end - lane->stored_offset > lane->stored_size ||
+       end - start > pool->reader->block_size) {
+      saved_errno = EINVAL;
+      snprintf(local_err, sizeof(local_err), "%s",
+               "invalid PFSC block span");
+      break;
+    }
+    size_t stored_len = (size_t)(end - start);
+    const unsigned char *stored =
+        lane->stored + (size_t)(start - lane->stored_offset);
+    unsigned char *decoded =
+        lane->decoded + (size_t)local_block * (size_t)pool->reader->block_size;
+    int decode_rc = pfsc_decode_block_from_memory(
+        pool->reader, global_block, stored, stored_len, decoded,
+        local_err, sizeof(local_err));
+    if(decode_rc < 0) {
+      saved_errno = errno ? errno : EIO;
+      break;
+    }
+    pthread_mutex_lock(&pool->lock);
+    pfsc_decomp_block_t *block = &lane->blocks[local_block];
+    block->stored_len = (uint32_t)stored_len;
+    block->raw = decode_rc > 0 ? 1 : 0;
+    block->ready = 1;
+    pthread_cond_broadcast(&pool->cond);
+    pthread_mutex_unlock(&pool->lock);
+  }
+
+  if(saved_errno) {
+    pfsc_decomp_pool_set_error(pool, saved_errno, local_err);
+  }
+}
+
+static void *
+pfsc_decomp_worker_main(void *arg) {
+  pfsc_decomp_pool_t *pool = arg;
+  for(;;) {
+    pthread_mutex_lock(&pool->lock);
+	    pfsc_decomp_task_t *task = NULL;
+	    while(!pool->stop && !(task = pfsc_decomp_pool_take_task_locked(pool))) {
+	      uint64_t wait_started = monotonic_us();
+	      cancel_poll_cond_wait(&pool->cond, &pool->lock);
+	      job_add_wait_us(&g_job.worker_wait_us, wait_started);
+	    }
+    if(pool->stop && !task) {
+      pthread_mutex_unlock(&pool->lock);
+      break;
+    }
+    pthread_mutex_unlock(&pool->lock);
+
+    if(task->type == PFSC_DECOMP_TASK_READ) {
+      pfsc_decomp_read_task(pool, task);
+    } else {
+      pfsc_decomp_decode_task(pool, task);
+    }
+
+    pthread_mutex_lock(&pool->lock);
+    pfsc_decomp_pool_finish_task_locked(pool, task);
+    pthread_mutex_unlock(&pool->lock);
+    free(task);
+  }
+  return NULL;
+}
+
+static void
+pfsc_decomp_free_task_list(pfsc_decomp_task_t *task) {
+  while(task) {
+    pfsc_decomp_task_t *next = task->next;
+    free(task);
+    task = next;
+  }
+}
+
+static void
+pfsc_decomp_pool_stop(pfsc_decomp_pool_t *pool) {
+  pthread_mutex_lock(&pool->lock);
+  pool->stop = 1;
+  pthread_cond_broadcast(&pool->cond);
+  pthread_mutex_unlock(&pool->lock);
+}
+
+static int
+pfsc_decomp_pool_start(pfsc_decomp_pool_t *pool,
+                       const pfsc_reader_t *reader,
+                       int decode_workers) {
+  memset(pool, 0, sizeof(*pool));
+  pool->reader = reader;
+  pool->decode_permits = decode_workers;
+  pool->read_permits = 1;
+  pool->thread_count = decode_workers + 1;
+  pool->threads = calloc((size_t)pool->thread_count, sizeof(*pool->threads));
+  if(!pool->threads) return -1;
+  if(pthread_mutex_init(&pool->lock, NULL) != 0 ||
+     pthread_cond_init(&pool->cond, NULL) != 0) {
+    free(pool->threads);
+    pool->threads = NULL;
+    return -1;
+  }
+  for(int i = 0; i < pool->thread_count; i++) {
+    int trc = pthread_create(&pool->threads[i], NULL,
+                             pfsc_decomp_worker_main, pool);
+    if(trc != 0) {
+      pool->error = trc;
+      snprintf(pool->error_msg, sizeof(pool->error_msg),
+               "start decompression window worker: %s", strerror(trc));
+      pfsc_decomp_pool_stop(pool);
+      for(int j = 0; j < pool->workers_started; j++) {
+        pthread_join(pool->threads[j], NULL);
+      }
+      pthread_cond_destroy(&pool->cond);
+      pthread_mutex_destroy(&pool->lock);
+      free(pool->threads);
+      pool->threads = NULL;
+      return -1;
+    }
+    pool->workers_started++;
+  }
+  return 0;
+}
+
+static void
+pfsc_decomp_pool_destroy(pfsc_decomp_pool_t *pool) {
+  if(!pool) return;
+  if(pool->threads) {
+    pfsc_decomp_pool_stop(pool);
+    for(int i = 0; i < pool->workers_started; i++) {
+      pthread_join(pool->threads[i], NULL);
+    }
+    free(pool->threads);
+  }
+  pfsc_decomp_free_task_list(pool->read_head);
+  pfsc_decomp_free_task_list(pool->decode_head);
+  pthread_cond_destroy(&pool->cond);
+  pthread_mutex_destroy(&pool->lock);
+  memset(pool, 0, sizeof(*pool));
+}
+
+static void
+pfsc_decomp_free_windows(pfsc_decomp_window_t *windows, int worker_count) {
+  if(!windows) return;
+  for(int w = 0; w < PFSC_DECOMPRESS_WINDOW_SLOTS; w++) {
+    if(!windows[w].lanes) continue;
+    for(int i = 0; i < worker_count; i++) {
+      free(windows[w].lanes[i].stored);
+      free(windows[w].lanes[i].decoded);
+      free(windows[w].lanes[i].blocks);
+    }
+    free(windows[w].lanes);
+  }
+  free(windows);
+}
+
+static int
+pfsc_decomp_alloc_windows(pfsc_decomp_window_t **windows_out,
+                          int worker_count, size_t lane_size,
+                          uint64_t lane_blocks,
+                          char *err, size_t err_size) {
+  pfsc_decomp_window_t *windows =
+      calloc(PFSC_DECOMPRESS_WINDOW_SLOTS, sizeof(*windows));
+  if(!windows) {
+    set_err(err, err_size, "window buffers unavailable");
+    return -1;
+  }
+  for(int w = 0; w < PFSC_DECOMPRESS_WINDOW_SLOTS; w++) {
+    windows[w].lanes = calloc((size_t)worker_count, sizeof(*windows[w].lanes));
+    if(!windows[w].lanes) {
+      set_err(err, err_size, "window buffers unavailable");
+      pfsc_decomp_free_windows(windows, worker_count);
+      return -1;
+    }
+    for(int i = 0; i < worker_count; i++) {
+      windows[w].lanes[i].stored = malloc(lane_size);
+      windows[w].lanes[i].decoded = malloc(lane_size);
+      windows[w].lanes[i].blocks =
+          calloc((size_t)lane_blocks, sizeof(*windows[w].lanes[i].blocks));
+      if(!windows[w].lanes[i].stored ||
+         !windows[w].lanes[i].decoded ||
+         !windows[w].lanes[i].blocks) {
+        set_err(err, err_size, "window buffers unavailable");
+        pfsc_decomp_free_windows(windows, worker_count);
+        return -1;
+      }
+    }
+  }
+  *windows_out = windows;
+  return 0;
+}
+
+static int
+pfsc_decomp_window_prepare(pfsc_decomp_window_t *window,
+                           const pfsc_reader_t *reader,
+                           uint64_t window_index,
+                           uint64_t start_block,
+                           uint64_t requested_blocks,
+                           uint64_t lane_blocks,
+                           int worker_count,
+                           char *err, size_t err_size) {
+  if(!window || !reader || start_block >= reader->block_count ||
+     requested_blocks == 0) {
+    set_err(err, err_size, "bad decompression window");
     errno = EINVAL;
     return -1;
   }
-  uint64_t new_size = r->file_start + r->offsets[first_block];
-  if(ftruncate(r->fd, (off_t)new_size) != 0) {
-    set_err(err, err_size, "truncate compressed image: %s", strerror(errno));
-    return -1;
+  pfsc_decomp_lane_t *lanes = window->lanes;
+  memset(window, 0, sizeof(*window));
+  window->lanes = lanes;
+  window->index = window_index;
+  window->start_block = start_block;
+
+  uint64_t remaining = requested_blocks;
+  if(remaining > reader->block_count - start_block) {
+    remaining = reader->block_count - start_block;
   }
-  r->cache_valid = 0;
+  for(int i = 0; i < worker_count && remaining > 0; i++) {
+    uint64_t count = remaining > lane_blocks ? lane_blocks : remaining;
+    pfsc_decomp_lane_t *lane = &window->lanes[i];
+    unsigned char *stored = lane->stored;
+    unsigned char *decoded = lane->decoded;
+    pfsc_decomp_block_t *blocks = lane->blocks;
+    memset(lane, 0, sizeof(*lane));
+    lane->stored = stored;
+    lane->decoded = decoded;
+    lane->blocks = blocks;
+    lane->start_block = start_block + window->block_count;
+    lane->block_count = count;
+    lane->stored_offset = reader->offsets[lane->start_block];
+    uint64_t stored_end = reader->offsets[lane->start_block + count];
+    if(stored_end < lane->stored_offset ||
+       stored_end - lane->stored_offset > count * reader->block_size) {
+      set_err(err, err_size, "invalid PFSC window span");
+      errno = EINVAL;
+      return -1;
+    }
+    lane->stored_size = stored_end - lane->stored_offset;
+    lane->decoded_size = count * reader->block_size;
+    memset(lane->blocks, 0, (size_t)lane_blocks * sizeof(*lane->blocks));
+    window->block_count += count;
+    window->lane_count++;
+    remaining -= count;
+  }
+  return window->lane_count > 0 ? 0 : -1;
+}
+
+static int
+pfsc_decomp_queue_read_window(pfsc_decomp_pool_t *pool,
+                              pfsc_decomp_window_t *window,
+                              char *err, size_t err_size) {
+  pthread_mutex_lock(&pool->lock);
+  for(int i = 0; i < window->lane_count; i++) {
+    if(pfsc_decomp_pool_enqueue_locked(pool, PFSC_DECOMP_TASK_READ,
+                                       window, i, 0, 0) != 0) {
+      pthread_mutex_unlock(&pool->lock);
+      set_err(err, err_size, "out of memory");
+      return -1;
+    }
+  }
+  pthread_mutex_unlock(&pool->lock);
   return 0;
 }
 
 static int
-pfsc_stream_group_consumed(const pfsc_reader_t *r, uint64_t first_block,
-                           int *consumed, char *err, size_t err_size) {
-  struct stat st;
-  if(consumed) *consumed = 0;
-  if(!r || first_block >= r->block_count) return 0;
-  if(fstat(r->fd, &st) != 0) {
-    set_err(err, err_size, "stat compressed image: %s", strerror(errno));
+pfsc_decomp_wait_read_window(pfsc_decomp_pool_t *pool,
+                             pfsc_decomp_window_t *window,
+                             char *err, size_t err_size) {
+  pthread_mutex_lock(&pool->lock);
+  while(window->read_tasks_remaining > 0 || pool->running_read > 0) {
+    if(pfsc_decomp_pool_check_error_locked(pool, err, err_size) != 0) {
+      pthread_mutex_unlock(&pool->lock);
+      return -1;
+    }
+    if(pfsc_decomp_pool_cancel_if_requested_locked(pool, err,
+                                                   err_size) != 0) {
+      pthread_mutex_unlock(&pool->lock);
+      return -1;
+    }
+    cancel_poll_cond_wait(&pool->cond, &pool->lock);
+  }
+  if(pfsc_decomp_pool_check_error_locked(pool, err, err_size) != 0) {
+    pthread_mutex_unlock(&pool->lock);
     return -1;
   }
-  uint64_t source_size = st.st_size < 0 ? 0 : (uint64_t)st.st_size;
-  uint64_t committed_size = r->file_start + r->offsets[first_block];
-  if(consumed) *consumed = source_size <= committed_size;
+  pthread_mutex_unlock(&pool->lock);
   return 0;
 }
 
 static int
-extract_output_complete(const pfs_extract_entry_t *e) {
-  struct stat st;
-  if(!e || stat(e->out_path, &st) != 0 || !S_ISREG(st.st_mode)) return 0;
-  return st.st_size >= 0 && (uint64_t)st.st_size == e->size;
+pfsc_decomp_read_window(pfsc_decomp_pool_t *pool,
+                        pfsc_decomp_window_t *window,
+                        int decode_workers,
+                        char *err, size_t err_size) {
+  pfsc_decomp_pool_set_phase(pool, PFSC_DECOMP_PHASE_READ, 1,
+                             decode_workers);
+  if(pfsc_decomp_queue_read_window(pool, window, err, err_size) != 0) {
+    return -1;
+  }
+  return pfsc_decomp_wait_read_window(pool, window, err, err_size);
 }
 
 static int
-extract_group_outputs_complete(const pfs_extract_plan_t *plan, size_t first,
-                               size_t last) {
-  if(!plan || first >= last || last > plan->count) return 0;
-  for(size_t i = first; i < last; i++) {
-    if(!extract_output_complete(&plan->items[i])) return 0;
+pfsc_decomp_start_decode(pfsc_decomp_pool_t *pool,
+                         pfsc_decomp_window_t *window,
+                         char *err, size_t err_size) {
+  if(window->decode_started) return 0;
+  pthread_mutex_lock(&pool->lock);
+  window->decode_started = 1;
+  for(int i = 0; i < window->lane_count; i++) {
+    pfsc_decomp_lane_t *lane = &window->lanes[i];
+    lane->decode_started = 1;
+    for(uint32_t first = 0; first < lane->block_count;
+        first += PFSC_DECOMPRESS_DECODE_CHUNK_BLOCKS) {
+      uint64_t left = lane->block_count - first;
+      uint32_t count = left > PFSC_DECOMPRESS_DECODE_CHUNK_BLOCKS
+          ? PFSC_DECOMPRESS_DECODE_CHUNK_BLOCKS
+          : (uint32_t)left;
+      if(pfsc_decomp_pool_enqueue_locked(pool, PFSC_DECOMP_TASK_DECODE,
+                                         window, i, first, count) != 0) {
+        pthread_mutex_unlock(&pool->lock);
+        set_err(err, err_size, "out of memory");
+        return -1;
+      }
+    }
+  }
+  pthread_mutex_unlock(&pool->lock);
+  return 0;
+}
+
+static int
+pfsc_decomp_lane_ready_locked(const pfsc_decomp_lane_t *lane) {
+  for(uint64_t i = 0; i < lane->block_count; i++) {
+    if(!lane->blocks[i].ready) return 0;
   }
   return 1;
 }
 
 static int
-require_extract_group_outputs_complete(const pfs_extract_plan_t *plan,
-                                       size_t first, size_t last,
-                                       char *err, size_t err_size) {
-  if(!plan || first >= last || last > plan->count) {
-    errno = EINVAL;
+pfsc_decomp_wait_lane_ready(pfsc_decomp_pool_t *pool,
+                            const pfsc_decomp_lane_t *lane,
+                            char *err, size_t err_size) {
+  pthread_mutex_lock(&pool->lock);
+  while(!pfsc_decomp_lane_ready_locked(lane)) {
+	    if(pfsc_decomp_pool_check_error_locked(pool, err, err_size) != 0) {
+	      pthread_mutex_unlock(&pool->lock);
+	      return -1;
+	    }
+	    if(pfsc_decomp_pool_cancel_if_requested_locked(pool, err,
+	                                                   err_size) != 0) {
+	      pthread_mutex_unlock(&pool->lock);
+	      return -1;
+	    }
+	    uint64_t wait_started = monotonic_us();
+	    cancel_poll_cond_wait(&pool->cond, &pool->lock);
+	    job_add_wait_us(&g_job.writer_wait_us, wait_started);
+	  }
+  if(pfsc_decomp_pool_check_error_locked(pool, err, err_size) != 0) {
+    pthread_mutex_unlock(&pool->lock);
     return -1;
   }
-  for(size_t i = first; i < last; i++) {
-    if(!extract_output_complete(&plan->items[i])) {
-      set_err(err, err_size,
-              "stream restore output missing after source truncation: %s",
-              plan->items[i].rel[0] ? plan->items[i].rel :
-                                      plan->items[i].out_path);
+  pthread_mutex_unlock(&pool->lock);
+  return 0;
+}
+
+static int
+pfsc_decomp_write_image_window(pfsc_decomp_pool_t *pool,
+                               pfsc_decomp_window_t *window,
+                               int decode_workers, int out,
+                               uint64_t nested_size,
+                               int allow_read_overlap,
+                               char *err, size_t err_size) {
+  if(allow_read_overlap) {
+    pfsc_decomp_pool_set_phase(pool, PFSC_DECOMP_PHASE_READ, 1,
+                               decode_workers);
+  } else {
+    pfsc_decomp_pool_set_phase(pool, PFSC_DECOMP_PHASE_WRITE, 0,
+                               decode_workers);
+  }
+  for(int i = 0; i < window->lane_count; i++) {
+    pfsc_decomp_lane_t *lane = &window->lanes[i];
+    if(pfsc_decomp_wait_lane_ready(pool, lane, err, err_size) != 0) {
+      return -1;
+    }
+    uint64_t lane_start = lane->start_block * PFS_BLOCK_SIZE;
+    if(lane_start >= nested_size) continue;
+    uint64_t left = nested_size - lane_start;
+    size_t useful = left < lane->decoded_size ? (size_t)left
+                                              : (size_t)lane->decoded_size;
+    if(useful > 0 && write_all_fd_cancelable(out, lane->decoded, useful) != 0) {
+      set_err(err, err_size, "write output image: %s", strerror(errno));
+      return -1;
+    }
+    atomic_fetch_add(&g_job.copied_bytes,
+                     useful > (size_t)LONG_MAX ? LONG_MAX : (long)useful);
+  }
+  return 0;
+}
+
+static int
+pfs_extract_plan_prepare_outputs(pfs_extract_plan_t *plan, int sync_files,
+                                 char *err, size_t err_size) {
+  for(size_t i = 0; i < plan->count; i++) {
+    pfs_extract_entry_t *e = &plan->items[i];
+    e->fd = -1;
+    e->written = 0;
+    e->done = 0;
+    if(e->size != 0) continue;
+    int fd = open(e->out_path, O_WRONLY | O_CREAT | O_TRUNC, 0777);
+    if(fd < 0) {
+      set_err(err, err_size, "create output file: %s", strerror(errno));
+      return -1;
+    }
+    chmod(e->out_path, 0777);
+    if(sync_files && fsync(fd) != 0) {
+      set_err(err, err_size, "sync output file: %s", strerror(errno));
+      close(fd);
+      return -1;
+    }
+    if(close(fd) != 0) {
+      set_err(err, err_size, "close output file: %s", strerror(errno));
+      return -1;
+    }
+    e->done = 1;
+    atomic_fetch_add(&g_job.done_files, 1);
+  }
+  return 0;
+}
+
+static int
+pfsc_decomp_open_plan_file(pfs_extract_entry_t *e,
+                           char *err, size_t err_size) {
+  if(e->fd >= 0) return 0;
+  job_set_current(e->rel[0] ? e->rel : e->out_path);
+  e->fd = open(e->out_path, O_WRONLY | O_CREAT | O_TRUNC, 0777);
+  if(e->fd < 0) {
+    set_err(err, err_size, "create output file: %s", strerror(errno));
+    return -1;
+  }
+  return 0;
+}
+
+static int
+pfsc_decomp_finish_plan_file(pfs_extract_entry_t *e, int sync_file,
+                             char *err, size_t err_size) {
+  chmod(e->out_path, 0777);
+  if(sync_file && fsync(e->fd) != 0) {
+    set_err(err, err_size, "sync output file: %s", strerror(errno));
+    return -1;
+  }
+  if(close(e->fd) != 0) {
+    e->fd = -1;
+    set_err(err, err_size, "close output file: %s", strerror(errno));
+    return -1;
+  }
+  e->fd = -1;
+  e->done = 1;
+  atomic_fetch_add(&g_job.done_files, 1);
+  return 0;
+}
+
+static void
+pfsc_decomp_plan_advance(pfsc_decomp_plan_writer_t *writer) {
+  while(writer->entry_index < writer->plan->count) {
+    pfs_extract_entry_t *e = &writer->plan->items[writer->entry_index];
+    if(e->size == 0 || e->done) writer->entry_index++;
+    else break;
+  }
+}
+
+static int
+pfsc_decomp_write_plan_lane(pfsc_decomp_plan_writer_t *writer,
+                            const pfsc_decomp_lane_t *lane,
+                            char *err, size_t err_size) {
+  pfs_extract_plan_t *plan = writer->plan;
+  uint64_t lane_start = lane->start_block * PFS_BLOCK_SIZE;
+  uint64_t lane_end = lane_start + lane->decoded_size;
+  pfsc_decomp_plan_advance(writer);
+  for(size_t i = writer->entry_index; i < plan->count; i++) {
+    pfs_extract_entry_t *e = &plan->items[i];
+    if(e->size == 0 || e->done) continue;
+    uint64_t entry_end = pfs_extract_entry_end(e);
+    if(entry_end <= lane_start) {
+      if(e->written < e->size) {
+        set_err(err, err_size, "output file missed decoded range: %s",
+                e->rel[0] ? e->rel : e->out_path);
+        errno = EIO;
+        return -1;
+      }
+      continue;
+    }
+    if(e->image_offset >= lane_end) break;
+    uint64_t overlap_start =
+        e->image_offset > lane_start ? e->image_offset : lane_start;
+    uint64_t overlap_end = entry_end < lane_end ? entry_end : lane_end;
+    if(overlap_end <= overlap_start) continue;
+    if(overlap_start < lane_start ||
+       overlap_end - lane_start > lane->decoded_size) {
+      set_err(err, err_size, "bad decoded output span");
+      errno = EINVAL;
+      return -1;
+    }
+    size_t n = (size_t)(overlap_end - overlap_start);
+    const unsigned char *src =
+        lane->decoded + (size_t)(overlap_start - lane_start);
+    off_t out_off = (off_t)(overlap_start - e->image_offset);
+    if((uint64_t)out_off != e->written) {
+      set_err(err, err_size, "output file write order mismatch: %s",
+              e->rel[0] ? e->rel : e->out_path);
+      errno = EIO;
+      return -1;
+    }
+    if(pfsc_decomp_open_plan_file(e, err, err_size) != 0) return -1;
+    if(write_exact_at(e->fd, src, n, out_off) != 0) {
+      set_err(err, err_size, "write output file: %s", strerror(errno));
+      return -1;
+    }
+    e->written += n;
+    atomic_fetch_add(&g_job.copied_bytes,
+                     n > (size_t)LONG_MAX ? LONG_MAX : (long)n);
+    if(e->written == e->size) {
+      if(pfsc_decomp_finish_plan_file(e, writer->sync_files,
+                                      err, err_size) != 0) {
+        return -1;
+      }
+      if(i == writer->entry_index) pfsc_decomp_plan_advance(writer);
+    } else if(e->written > e->size) {
+      set_err(err, err_size, "output file overrun: %s",
+              e->rel[0] ? e->rel : e->out_path);
       errno = EIO;
       return -1;
     }
@@ -1520,140 +2341,339 @@ require_extract_group_outputs_complete(const pfs_extract_plan_t *plan,
   return 0;
 }
 
-static void
-account_skipped_extract_group(const pfs_extract_plan_t *plan, size_t first,
-                              size_t last) {
-  if(!plan || first >= last || last > plan->count) return;
-  for(size_t i = first; i < last; i++) {
-    uint64_t size = plan->items[i].size;
-    atomic_fetch_add(&g_job.copied_bytes,
-                     size > (uint64_t)LONG_MAX ? LONG_MAX : (long)size);
-    atomic_fetch_add(&g_job.done_files, 1);
+static int
+pfsc_decomp_write_plan_window(pfsc_decomp_pool_t *pool,
+                              pfsc_decomp_window_t *window,
+                              int decode_workers,
+                              pfsc_decomp_plan_writer_t *writer,
+                              int allow_read_overlap,
+                              char *err, size_t err_size) {
+  if(allow_read_overlap) {
+    pfsc_decomp_pool_set_phase(pool, PFSC_DECOMP_PHASE_READ, 1,
+                               decode_workers);
+  } else {
+    pfsc_decomp_pool_set_phase(pool, PFSC_DECOMP_PHASE_WRITE, 0,
+                               decode_workers);
   }
+  for(int i = 0; i < window->lane_count; i++) {
+    pfsc_decomp_lane_t *lane = &window->lanes[i];
+    if(pfsc_decomp_wait_lane_ready(pool, lane, err, err_size) != 0) {
+      return -1;
+    }
+    if(pfsc_decomp_write_plan_lane(writer, lane, err, err_size) != 0) {
+      return -1;
+    }
+  }
+  return 0;
 }
 
 static int
-pfs_extract_reverse_plan(pfs_nested_reader_t *nr, pfs_extract_plan_t *plan,
-                         int workers, char *err, size_t err_size) {
+pfsc_decomp_plan_next_block(const pfs_extract_plan_t *plan,
+                            size_t start_entry,
+                            uint64_t min_block,
+                            uint64_t *block_out) {
+  for(size_t i = start_entry; i < plan->count; i++) {
+    const pfs_extract_entry_t *e = &plan->items[i];
+    if(e->size == 0 || e->done) continue;
+    uint64_t entry_end = pfs_extract_entry_end(e);
+    uint64_t end_block = ceil_div_u64(entry_end, PFS_BLOCK_SIZE);
+    if(end_block <= min_block) continue;
+    uint64_t first = e->image_offset / PFS_BLOCK_SIZE;
+    *block_out = first > min_block ? first : min_block;
+    return 0;
+  }
+  return -1;
+}
+
+static int
+pfsc_decomp_run_image_with_lane(pfsc_reader_t *reader, int out,
+                                int decode_workers, size_t lane_size,
+                                int allow_io_overlap,
+                                char *err, size_t err_size) {
+  uint64_t lane_blocks = lane_size / (size_t)PFS_BLOCK_SIZE;
+  uint64_t window_blocks = lane_blocks * (uint64_t)decode_workers;
+  uint64_t total_blocks = ceil_div_u64(reader->nested_size, PFS_BLOCK_SIZE);
+  pfsc_decomp_window_t *windows = NULL;
+  pfsc_decomp_pool_t pool;
+  int pool_started = 0;
+  int rc = -1;
+
+  if(total_blocks == 0) return 0;
+  memset(&pool, 0, sizeof(pool));
+  if(lane_blocks == 0 || window_blocks == 0 ||
+     pfsc_decomp_alloc_windows(&windows, decode_workers, lane_size,
+                               lane_blocks, err, err_size) != 0) {
+    return PFSC_DECOMPRESS_WINDOW_RC_FALLBACK;
+  }
+  if(pfsc_decomp_pool_start(&pool, reader, decode_workers) != 0) {
+    rc = PFSC_DECOMPRESS_WINDOW_RC_FALLBACK;
+    goto done;
+  }
+  pool_started = 1;
+  PFS_DECOMPRESS_LOG("decompress window start mode=image blocks=%llu workers=%d readPermits=1 laneBytes=%llu ioPolicy=%s",
+                     (unsigned long long)total_blocks, decode_workers,
+                     (unsigned long long)lane_size,
+                     allow_io_overlap ? "pipelined" : "serial");
+
+  uint64_t next_block = 0;
+  uint64_t next_window_index = 0;
+  pfsc_decomp_window_t *current = &windows[0];
+  uint64_t nblocks = total_blocks > window_blocks ? window_blocks
+                                                  : total_blocks;
+  if(pfsc_decomp_window_prepare(current, reader, next_window_index++,
+                                next_block, nblocks, lane_blocks,
+                                decode_workers, err, err_size) != 0 ||
+     pfsc_decomp_read_window(&pool, current, decode_workers,
+                             err, err_size) != 0) {
+    goto done;
+  }
+  next_block += current->block_count;
+
+  while(current) {
+    if(pfsc_decomp_start_decode(&pool, current, err, err_size) != 0) {
+      goto done;
+    }
+    pfsc_decomp_window_t *next = NULL;
+    int next_read_queued = 0;
+    if(next_block < total_blocks) {
+      next = current == &windows[0] ? &windows[1] : &windows[0];
+      nblocks = total_blocks - next_block;
+      if(nblocks > window_blocks) nblocks = window_blocks;
+      if(pfsc_decomp_window_prepare(next, reader, next_window_index++,
+                                    next_block, nblocks, lane_blocks,
+                                    decode_workers, err, err_size) != 0) {
+        goto done;
+      }
+      next_block += next->block_count;
+      if(allow_io_overlap) {
+        pfsc_decomp_pool_set_phase(&pool, PFSC_DECOMP_PHASE_READ, 1,
+                                   decode_workers);
+        if(pfsc_decomp_queue_read_window(&pool, next, err, err_size) != 0) {
+          goto done;
+        }
+        next_read_queued = 1;
+      } else {
+        if(pfsc_decomp_read_window(&pool, next, decode_workers,
+                                   err, err_size) != 0 ||
+           pfsc_decomp_start_decode(&pool, next, err, err_size) != 0) {
+          goto done;
+        }
+      }
+    }
+    if(pfsc_decomp_write_image_window(&pool, current, decode_workers, out,
+                                      reader->nested_size,
+                                      allow_io_overlap && next_read_queued,
+                                      err,
+                                      err_size) != 0) {
+      goto done;
+    }
+    if(next_read_queued) {
+      pfsc_decomp_pool_set_phase(&pool, PFSC_DECOMP_PHASE_READ, 1,
+                                 decode_workers);
+      if(pfsc_decomp_wait_read_window(&pool, next, err, err_size) != 0 ||
+         pfsc_decomp_start_decode(&pool, next, err, err_size) != 0) {
+        goto done;
+      }
+    }
+    current = next;
+  }
+  rc = 0;
+
+done:
+  if(pool_started) {
+    pfsc_decomp_pool_set_phase(&pool, PFSC_DECOMP_PHASE_IDLE, 0,
+                               decode_workers);
+    pfsc_decomp_pool_destroy(&pool);
+  }
+  pfsc_decomp_free_windows(windows, decode_workers);
+  return rc;
+}
+
+static int
+pfsc_decomp_run_plan_with_lane(pfsc_reader_t *reader,
+                               pfs_extract_plan_t *plan,
+                               int decode_workers, size_t lane_size,
+                               int sync_files,
+                               int allow_io_overlap,
+                               char *err, size_t err_size) {
+  uint64_t lane_blocks = lane_size / (size_t)PFS_BLOCK_SIZE;
+  uint64_t window_blocks = lane_blocks * (uint64_t)decode_workers;
+  pfsc_decomp_window_t *windows = NULL;
+  pfsc_decomp_pool_t pool;
+  pfsc_decomp_plan_writer_t writer;
+  int pool_started = 0;
+  int rc = -1;
+
+  memset(&pool, 0, sizeof(pool));
+  memset(&writer, 0, sizeof(writer));
+  if(lane_blocks == 0 || window_blocks == 0 ||
+     pfsc_decomp_alloc_windows(&windows, decode_workers, lane_size,
+                               lane_blocks, err, err_size) != 0) {
+    return PFSC_DECOMPRESS_WINDOW_RC_FALLBACK;
+  }
+  if(pfsc_decomp_pool_start(&pool, reader, decode_workers) != 0) {
+    rc = PFSC_DECOMPRESS_WINDOW_RC_FALLBACK;
+    goto done;
+  }
+  pool_started = 1;
   qsort(plan->items, plan->count, sizeof(plan->items[0]),
-        pfs_extract_entry_cmp_desc);
-  for(size_t i = 0; i < plan->count;) {
-    size_t group_start = i;
-    uint64_t group_first_block = plan->items[i].first_block;
-    int truncate_group = 0;
-    int group_consumed = 0;
-    size_t group_end = i;
-    while(group_end < plan->count &&
-          plan->items[group_end].first_block == group_first_block) {
-      if(plan->items[group_end].block_count > 0) truncate_group = 1;
-      group_end++;
-    }
-    if(pfsc_stream_group_consumed(&nr->pfsc, group_first_block,
-                                  &group_consumed, err, err_size) != 0) {
-      return -1;
-    }
-    if(group_consumed) {
-      if(require_extract_group_outputs_complete(plan, group_start, group_end,
-                                                err, err_size) != 0) {
-        return -1;
-      }
-      account_skipped_extract_group(plan, group_start, group_end);
-      i = group_end;
-      continue;
-    }
-    if(extract_group_outputs_complete(plan, group_start, group_end)) {
-      account_skipped_extract_group(plan, group_start, group_end);
-      if(truncate_group &&
-         pfsc_truncate_source_after_block(&nr->pfsc, group_first_block,
-                                          err, err_size) != 0) {
-        return -1;
-      }
-      i = group_end;
-      continue;
-    }
-    do {
-      pfs_extract_entry_t *e = &plan->items[i];
-      if(job_cancelled()) {
-        set_err(err, err_size, "cancelled");
-        errno = EINTR;
-        return -1;
-      }
-      if(pfs_extract_file(nr, e->inode_num, e->out_path, e->rel,
-                          workers, 1, err, err_size) != 0) {
-        return -1;
-      }
-      if(e->block_count > 0) truncate_group = 1;
-      i++;
-    } while(i < plan->count && plan->items[i].first_block == group_first_block);
-
-    if(truncate_group &&
-       pfsc_truncate_source_after_block(&nr->pfsc, group_first_block,
-                                        err, err_size) != 0) {
-      return -1;
-    }
+        pfs_extract_entry_cmp_asc);
+  if(pfs_extract_plan_prepare_outputs(plan, sync_files,
+                                      err, err_size) != 0) {
+    goto done;
   }
-  return 0;
+  writer.plan = plan;
+  writer.sync_files = sync_files;
+  pfsc_decomp_plan_advance(&writer);
+  PFS_DECOMPRESS_LOG("decompress window start mode=app files=%llu blocks=%llu workers=%d readPermits=1 laneBytes=%llu ioPolicy=%s",
+                     (unsigned long long)plan->count,
+                     (unsigned long long)plan->total_blocks,
+                     decode_workers,
+                     (unsigned long long)lane_size,
+                     allow_io_overlap ? "pipelined" : "serial");
+
+  uint64_t next_block = 0;
+  uint64_t next_window_index = 0;
+  if(pfsc_decomp_plan_next_block(plan, writer.entry_index, next_block,
+                                 &next_block) != 0) {
+    rc = 0;
+    goto done;
+  }
+  pfsc_decomp_window_t *current = &windows[0];
+  uint64_t nblocks = reader->block_count - next_block;
+  if(nblocks > window_blocks) nblocks = window_blocks;
+  if(pfsc_decomp_window_prepare(current, reader, next_window_index++,
+                                next_block, nblocks, lane_blocks,
+                                decode_workers, err, err_size) != 0 ||
+     pfsc_decomp_read_window(&pool, current, decode_workers,
+                             err, err_size) != 0) {
+    goto done;
+  }
+  next_block = current->start_block + current->block_count;
+
+  while(current) {
+    if(pfsc_decomp_start_decode(&pool, current, err, err_size) != 0) {
+      goto done;
+    }
+    pfsc_decomp_window_t *next = NULL;
+    int next_read_queued = 0;
+    uint64_t wanted = 0;
+    if(pfsc_decomp_plan_next_block(plan, writer.entry_index, next_block,
+                                   &wanted) == 0) {
+      next = current == &windows[0] ? &windows[1] : &windows[0];
+      nblocks = reader->block_count - wanted;
+      if(nblocks > window_blocks) nblocks = window_blocks;
+      if(pfsc_decomp_window_prepare(next, reader, next_window_index++,
+                                    wanted, nblocks, lane_blocks,
+                                    decode_workers, err, err_size) != 0) {
+        goto done;
+      }
+      next_block = next->start_block + next->block_count;
+      if(allow_io_overlap) {
+        pfsc_decomp_pool_set_phase(&pool, PFSC_DECOMP_PHASE_READ, 1,
+                                   decode_workers);
+        if(pfsc_decomp_queue_read_window(&pool, next, err, err_size) != 0) {
+          goto done;
+        }
+        next_read_queued = 1;
+      } else {
+        if(pfsc_decomp_read_window(&pool, next, decode_workers,
+                                   err, err_size) != 0 ||
+           pfsc_decomp_start_decode(&pool, next, err, err_size) != 0) {
+          goto done;
+        }
+      }
+    }
+    if(pfsc_decomp_write_plan_window(&pool, current, decode_workers,
+                                     &writer,
+                                     allow_io_overlap && next_read_queued,
+                                     err, err_size) != 0) {
+      goto done;
+    }
+    if(next_read_queued) {
+      pfsc_decomp_pool_set_phase(&pool, PFSC_DECOMP_PHASE_READ, 1,
+                                 decode_workers);
+      if(pfsc_decomp_wait_read_window(&pool, next, err, err_size) != 0 ||
+         pfsc_decomp_start_decode(&pool, next, err, err_size) != 0) {
+        goto done;
+      }
+    }
+    current = next;
+  }
+  pfsc_decomp_plan_advance(&writer);
+  if(writer.entry_index != plan->count) {
+    set_err(err, err_size, "not all output files were written");
+    errno = EIO;
+    goto done;
+  }
+  rc = 0;
+
+done:
+  if(pool_started) {
+    pfsc_decomp_pool_set_phase(&pool, PFSC_DECOMP_PHASE_IDLE, 0,
+                               decode_workers);
+    pfsc_decomp_pool_destroy(&pool);
+  }
+  pfsc_decomp_free_windows(windows, decode_workers);
+  return rc;
 }
 
 static int
-pfs_count_dir(pfs_nested_reader_t *nr, uint32_t inode_num,
-              uint64_t *files, uint64_t *bytes, uint64_t *blocks,
-              char *err, size_t err_size) {
-  pfs_inode_info_t dir_ino;
-  if(pfs_nested_read_inode(nr, inode_num, &dir_ino, err, err_size) != 0) {
-    return -1;
+pfsc_decomp_write_image_windowed(pfsc_reader_t *reader, int out,
+                                 int requested_workers,
+                                 int allow_io_overlap,
+                                 char *err, size_t err_size) {
+  int workers = pfsc_decomp_worker_count(requested_workers);
+  for(size_t lane_size = (size_t)PFSC_DECOMPRESS_LANE_MAX_SIZE;
+      lane_size >= (size_t)PFSC_DECOMPRESS_LANE_MIN_SIZE;
+      lane_size /= 2) {
+    char local_err[256] = {0};
+    int rc = pfsc_decomp_run_image_with_lane(reader, out, workers,
+                                             lane_size, allow_io_overlap,
+                                             local_err,
+                                             sizeof(local_err));
+    if(rc == 0) return 0;
+    if(rc != PFSC_DECOMPRESS_WINDOW_RC_FALLBACK) {
+      set_err(err, err_size, "%s",
+              local_err[0] ? local_err : "windowed decompression failed");
+      return -1;
+    }
+    PFS_DECOMPRESS_LOG("decompress window fallback candidate failed mode=image workers=%d laneBytes=%llu reason=%s",
+                       workers, (unsigned long long)lane_size,
+                       local_err[0] ? local_err : "unavailable");
+    if(lane_size == (size_t)PFSC_DECOMPRESS_LANE_MIN_SIZE) break;
   }
-  if((dir_ino.mode & PFS_INODE_MODE_DIR) == 0) {
-    set_err(err, err_size, "expected directory inode");
-    errno = EINVAL;
-    return -1;
-  }
+  return PFSC_DECOMPRESS_WINDOW_RC_FALLBACK;
+}
 
-  for(uint64_t off = 0; off + 16 <= dir_ino.size;) {
-    unsigned char hdr[16];
-    if(pfs_nested_read_inode_data(nr, &dir_ino, off, hdr, sizeof(hdr),
-                                  err, err_size) != 0) {
+static int
+pfsc_decomp_extract_plan_windowed(pfsc_reader_t *reader,
+                                  pfs_extract_plan_t *plan,
+                                  int requested_workers,
+                                  int sync_files,
+                                  int allow_io_overlap,
+                                  char *err, size_t err_size) {
+  int workers = pfsc_decomp_worker_count(requested_workers);
+  for(size_t lane_size = (size_t)PFSC_DECOMPRESS_LANE_MAX_SIZE;
+      lane_size >= (size_t)PFSC_DECOMPRESS_LANE_MIN_SIZE;
+      lane_size /= 2) {
+    char local_err[256] = {0};
+    int rc = pfsc_decomp_run_plan_with_lane(reader, plan, workers, lane_size,
+                                            sync_files, allow_io_overlap,
+                                            local_err,
+                                            sizeof(local_err));
+    if(rc == 0) return 0;
+    if(rc != PFSC_DECOMPRESS_WINDOW_RC_FALLBACK) {
+      set_err(err, err_size, "%s",
+              local_err[0] ? local_err : "windowed decompression failed");
       return -1;
     }
-    uint32_t child_inode = rd32(hdr + 0);
-    uint32_t type = rd32(hdr + 4);
-    uint32_t name_len = rd32(hdr + 8);
-    uint32_t ent_size = rd32(hdr + 12);
-    if(ent_size == 0) break;
-    if(ent_size < 16 || ent_size > PFS_BLOCK_SIZE ||
-       name_len == 0 || name_len >= 256 ||
-       16ULL + name_len > ent_size ||
-       off + ent_size > dir_ino.size) {
-      set_err(err, err_size, "invalid PFS dirent");
-      errno = EINVAL;
-      return -1;
-    }
-    char name[256];
-    if(pfs_nested_read_inode_data(nr, &dir_ino, off + 16, name, name_len,
-                                  err, err_size) != 0) {
-      return -1;
-    }
-    name[name_len] = 0;
-    if(strcmp(name, ".") != 0 && strcmp(name, "..") != 0) {
-      if(type == PFS_DIRENT_TYPE_DIRECTORY) {
-        if(pfs_count_dir(nr, child_inode, files, bytes, blocks,
-                         err, err_size) != 0) {
-          return -1;
-        }
-      } else if(type == PFS_DIRENT_TYPE_FILE) {
-        pfs_inode_info_t file_ino;
-        if(pfs_nested_read_inode(nr, child_inode, &file_ino,
-                                 err, err_size) != 0) {
-          return -1;
-        }
-        (*files)++;
-        *bytes += file_ino.size;
-        *blocks += ceil_div_u64(file_ino.size, PFS_BLOCK_SIZE);
-      }
-    }
-    off += ent_size;
+    PFS_DECOMPRESS_LOG("decompress window fallback candidate failed mode=app workers=%d laneBytes=%llu reason=%s",
+                       workers, (unsigned long long)lane_size,
+                       local_err[0] ? local_err : "unavailable");
+    if(lane_size == (size_t)PFSC_DECOMPRESS_LANE_MIN_SIZE) break;
   }
-  return 0;
+  return PFSC_DECOMPRESS_WINDOW_RC_FALLBACK;
 }
 
 static int
@@ -1702,12 +2722,12 @@ pfsc_decode_worker_main(void *arg) {
   pfsc_decode_pool_t *pool = arg;
   for(;;) {
     pthread_mutex_lock(&pool->lock);
-    int slot_index;
-    while(!pool->stop && (slot_index = pfsc_decode_find_ready_slot(pool)) < 0) {
-      uint64_t wait_started = monotonic_us();
-      pthread_cond_wait(&pool->cond, &pool->lock);
-      job_add_wait_us(&g_job.worker_wait_us, wait_started);
-    }
+	    int slot_index;
+	    while(!pool->stop && (slot_index = pfsc_decode_find_ready_slot(pool)) < 0) {
+	      uint64_t wait_started = monotonic_us();
+	      cancel_poll_cond_wait(&pool->cond, &pool->lock);
+	      job_add_wait_us(&g_job.worker_wait_us, wait_started);
+	    }
     if(pool->stop) {
       pthread_mutex_unlock(&pool->lock);
       break;
@@ -1781,7 +2801,7 @@ pfs_extract_file_serial(pfs_nested_reader_t *nr, const pfs_inode_info_t *ino,
     atomic_fetch_add(&g_job.copied_bytes,
                      n > (size_t)LONG_MAX ? LONG_MAX : (long)n);
   }
-  if(pfs_stream_buffer_flush(&outbuf, out, write_all_fd) != 0) {
+  if(pfs_stream_buffer_flush(&outbuf, out, write_all_fd_cancelable) != 0) {
     set_err(err, err_size, "write output file: %s", strerror(errno));
     goto done;
   }
@@ -1874,13 +2894,21 @@ pfs_extract_file_parallel(pfs_nested_reader_t *nr, const pfs_inode_info_t *ino,
 
       pthread_mutex_lock(&pool.lock);
       while(slot->state != PFS_BLOCK_SLOT_FREE && !pool.error) {
-        pthread_cond_wait(&pool.cond, &pool.lock);
+        if(job_cancelled()) {
+          if(!pool.error) pool.error = EINTR;
+          pool.stop = 1;
+          pthread_cond_broadcast(&pool.cond);
+          break;
+        }
+        cancel_poll_cond_wait(&pool.cond, &pool.lock);
       }
       if(pool.error) {
         int saved = pool.error;
         pthread_mutex_unlock(&pool.lock);
         errno = saved;
-        set_err(err, err_size, "decompression task failed: %s", strerror(saved));
+        if(saved == EINTR) set_err(err, err_size, "cancelled");
+        else set_err(err, err_size, "decompression task failed: %s",
+                     strerror(saved));
         goto done;
       }
       slot->state = PFS_BLOCK_SLOT_FILLING;
@@ -1915,19 +2943,27 @@ pfs_extract_file_parallel(pfs_nested_reader_t *nr, const pfs_inode_info_t *ino,
            slot->index != base_block + next_write) &&
           !pool.error) {
       uint64_t wait_started = monotonic_us();
-      pthread_cond_wait(&pool.cond, &pool.lock);
+      if(job_cancelled()) {
+        if(!pool.error) pool.error = EINTR;
+        pool.stop = 1;
+        pthread_cond_broadcast(&pool.cond);
+        break;
+      }
+      cancel_poll_cond_wait(&pool.cond, &pool.lock);
       job_add_wait_us(&g_job.writer_wait_us, wait_started);
     }
     if(pool.error) {
       int saved = pool.error;
       pthread_mutex_unlock(&pool.lock);
       errno = saved;
-      set_err(err, err_size, "decompression task failed: %s", strerror(saved));
+      if(saved == EINTR) set_err(err, err_size, "cancelled");
+      else set_err(err, err_size, "decompression task failed: %s",
+                   strerror(saved));
       goto done;
     }
     pthread_mutex_unlock(&pool.lock);
 
-    if(pfs_stream_buffer_write(&outbuf, out, write_all_fd,
+    if(pfs_stream_buffer_write(&outbuf, out, write_all_fd_cancelable,
                                slot->output, slot->output_len) != 0) {
       set_err(err, err_size, "write output file: %s", strerror(errno));
       goto done;
@@ -1943,7 +2979,7 @@ pfs_extract_file_parallel(pfs_nested_reader_t *nr, const pfs_inode_info_t *ino,
     next_write++;
   }
 
-  if(pfs_stream_buffer_flush(&outbuf, out, write_all_fd) != 0) {
+  if(pfs_stream_buffer_flush(&outbuf, out, write_all_fd_cancelable) != 0) {
     set_err(err, err_size, "write output file: %s", strerror(errno));
     goto done;
   }
@@ -2266,6 +3302,7 @@ exfat_plan_push(pfs_extract_plan_t *plan, uint64_t image_offset,
   }
   pfs_extract_entry_t *e = &plan->items[plan->count++];
   memset(e, 0, sizeof(*e));
+  e->fd = -1;
   snprintf(e->rel, sizeof(e->rel), "%s", rel);
   snprintf(e->out_path, sizeof(e->out_path), "%s", out_path);
   e->image_offset = image_offset;
@@ -2464,7 +3501,7 @@ exfat_extract_file(exfat_reader_t *er, const pfs_extract_entry_t *e,
     atomic_fetch_add(&g_job.copied_bytes,
                      n > (size_t)LONG_MAX ? LONG_MAX : (long)n);
   }
-  if(pfs_stream_buffer_flush(&outbuf, out, write_all_fd) != 0) {
+  if(pfs_stream_buffer_flush(&outbuf, out, write_all_fd_cancelable) != 0) {
     set_err(err, err_size, "write output file: %s", strerror(errno));
     goto done;
   }
@@ -2486,69 +3523,15 @@ done:
 
 static int
 exfat_extract_plan(exfat_reader_t *er, pfs_extract_plan_t *plan,
-                   int delete_stream, char *err, size_t err_size) {
-  if(delete_stream) {
-    qsort(plan->items, plan->count, sizeof(plan->items[0]),
-          pfs_extract_entry_cmp_desc);
-  }
-  for(size_t i = 0; i < plan->count;) {
-    uint64_t group_first_block = plan->items[i].first_block;
-    int truncate_group = 0;
-    size_t group_start = i;
-    size_t group_end = i + 1;
-    if(delete_stream) {
-      int group_consumed = 0;
-      while(group_end < plan->count &&
-            plan->items[group_end].first_block == group_first_block) {
-        group_end++;
-      }
-      for(size_t j = group_start; j < group_end; j++) {
-        if(plan->items[j].block_count > 0) truncate_group = 1;
-      }
-      if(pfsc_stream_group_consumed(&er->pfsc, group_first_block,
-                                    &group_consumed, err, err_size) != 0) {
-        return -1;
-      }
-      if(group_consumed) {
-        if(require_extract_group_outputs_complete(plan, group_start, group_end,
-                                                  err, err_size) != 0) {
-          return -1;
-        }
-        account_skipped_extract_group(plan, group_start, group_end);
-        i = group_end;
-        continue;
-      }
-      if(extract_group_outputs_complete(plan, group_start, group_end)) {
-        account_skipped_extract_group(plan, group_start, group_end);
-        if(truncate_group &&
-           pfsc_truncate_source_after_block(&er->pfsc, group_first_block,
-                                            err, err_size) != 0) {
-          return -1;
-        }
-        i = group_end;
-        continue;
-      }
-    }
-    do {
-      if(job_cancelled()) {
-        set_err(err, err_size, "cancelled");
-        errno = EINTR;
-        return -1;
-      }
-      if(exfat_extract_file(er, &plan->items[i], 1, err, err_size) != 0) {
-        return -1;
-      }
-      if(plan->items[i].block_count > 0) truncate_group = 1;
-      i++;
-    } while(delete_stream && i < plan->count &&
-            plan->items[i].first_block == group_first_block);
-    if(delete_stream && truncate_group &&
-       pfsc_truncate_source_after_block(&er->pfsc, group_first_block,
-                                        err, err_size) != 0) {
+                   char *err, size_t err_size) {
+  for(size_t i = 0; i < plan->count; i++) {
+    if(job_cancelled()) {
+      set_err(err, err_size, "cancelled");
+      errno = EINTR;
       return -1;
     }
-    if(!delete_stream) {
-      /* In forward mode each iteration is a single file. */
+    if(exfat_extract_file(er, &plan->items[i], 1, err, err_size) != 0) {
+      return -1;
     }
   }
   return 0;
@@ -2758,7 +3741,7 @@ pfsc_reader_write_image_to_fd(pfsc_reader_t *r, int out,
     size_t useful = pfsc_reader_block_useful_size(r, index);
     if(useful == 0) break;
     if(used + (size_t)r->block_size > buffer_size) {
-      if(write_all_fd(out, buffer, used) != 0) {
+      if(write_all_fd_cancelable(out, buffer, used) != 0) {
         set_err(err, err_size, "write output image: %s", strerror(errno));
         goto done;
       }
@@ -2775,7 +3758,7 @@ pfsc_reader_write_image_to_fd(pfsc_reader_t *r, int out,
                      useful > (size_t)LONG_MAX ? LONG_MAX : (long)useful);
   }
 
-  if(used > 0 && write_all_fd(out, buffer, used) != 0) {
+  if(used > 0 && write_all_fd_cancelable(out, buffer, used) != 0) {
     set_err(err, err_size, "write output image: %s", strerror(errno));
     goto done;
   }
@@ -2799,8 +3782,9 @@ pfs_decompress_ffpfsc_to_image_opts_output(const char *path, int overwrite,
   int fd = -1;
   int out = -1;
   int rc = -1;
+  pfs_io_policy_info_t io_policy;
+  int allow_io_overlap = 0;
 
-  (void)workers;
   memset(&reader, 0, sizeof(reader));
   reader.fd = -1;
   reader.mounted_fd = -1;
@@ -2865,6 +3849,12 @@ pfs_decompress_ffpfsc_to_image_opts_output(const char *path, int overwrite,
     goto done;
   }
   pfsc_reader_try_open_mounted(&reader, info->source_path);
+  pfs_io_policy_for_paths(info->source_path, info->output_path, &io_policy);
+  allow_io_overlap = pfs_io_policy_allows_overlap(&io_policy);
+  PFS_DECOMPRESS_LOG("pfsc io policy action=uncompress mode=image ioPolicy=%s sourceDevice=\"%s\" destDevice=\"%s\" reason=%s source=\"%s\" dest=\"%s\"",
+                     pfs_io_policy_name(io_policy.policy),
+                     io_policy.source_key, io_policy.dest_key,
+                     io_policy.reason, info->source_path, info->output_path);
 
   atomic_store(&g_job.total_bytes, job_long_from_u64(reader.nested_size));
   atomic_store(&g_job.copied_bytes, 0);
@@ -2893,7 +3883,16 @@ pfs_decompress_ffpfsc_to_image_opts_output(const char *path, int overwrite,
     set_err(err, err_size, "create output image: %s", strerror(errno));
     goto done;
   }
-  if(pfsc_reader_write_image_to_fd(&reader, out, err, err_size) != 0) {
+  int image_rc = pfsc_decomp_write_image_windowed(&reader, out, workers,
+                                                  allow_io_overlap,
+                                                  err, err_size);
+  if(image_rc == PFSC_DECOMPRESS_WINDOW_RC_FALLBACK) {
+    if(err && err_size > 0) err[0] = 0;
+    PFS_DECOMPRESS_LOG("decompress window unavailable mode=image fallback=serial");
+    if(pfsc_reader_write_image_to_fd(&reader, out, err, err_size) != 0) {
+      goto done;
+    }
+  } else if(image_rc != 0) {
     goto done;
   }
   if(fsync(out) != 0) {
@@ -2980,7 +3979,8 @@ pfs_decompress_ffpfsc_to_app_opts_output(const char *path, int overwrite,
   int exfat_opened = 0;
   int rc = -1;
   int nested_type = PFS_NESTED_UNKNOWN;
-  int stream_delete = delete_policy == PFS_DELETE_STREAM;
+  pfs_io_policy_info_t io_policy;
+  int allow_io_overlap = 0;
 
   memset(&nr, 0, sizeof(nr));
   nr.pfsc.fd = -1;
@@ -2988,8 +3988,7 @@ pfs_decompress_ffpfsc_to_app_opts_output(const char *path, int overwrite,
   er.pfsc.fd = -1;
   if(!info) info = &local_info;
   if(delete_policy != PFS_DELETE_KEEP &&
-     delete_policy != PFS_DELETE_AFTER &&
-     delete_policy != PFS_DELETE_STREAM) {
+     delete_policy != PFS_DELETE_AFTER) {
     set_err(err, err_size, "unsupported delete policy");
     errno = EINVAL;
     return -1;
@@ -3005,7 +4004,7 @@ pfs_decompress_ffpfsc_to_app_opts_output(const char *path, int overwrite,
     return -2;
   }
 
-  if(workers <= 0) workers = PFS_COMPRESS_DEFAULT_WORKERS;
+  if(workers <= 0) workers = PFS_DECOMPRESS_DEFAULT_WORKERS;
   if(workers > PFS_COMPRESS_MAX_WORKERS) workers = PFS_COMPRESS_MAX_WORKERS;
 
   if(hidden_tmp_path_for_output(info->output_path, "gc-unpack",
@@ -3021,13 +4020,11 @@ pfs_decompress_ffpfsc_to_app_opts_output(const char *path, int overwrite,
 
   job_set_target(info->output_path);
   job_set_current("Opening compressed image");
-  int preserve_stream_tmp = stream_delete &&
-      atomic_load(&g_job.rollback_requested);
-  if(!preserve_stream_tmp && remove_tree_local(tmp_path) != 0) {
+  if(remove_tree_local(tmp_path) != 0) {
     set_err(err, err_size, "remove old temp output: %s", strerror(errno));
     goto done;
   }
-  if(!preserve_stream_tmp && remove_tree_local(legacy_tmp_path) != 0) {
+  if(remove_tree_local(legacy_tmp_path) != 0) {
     set_err(err, err_size, "remove old legacy temp output: %s",
             strerror(errno));
     goto done;
@@ -3043,7 +4040,7 @@ pfs_decompress_ffpfsc_to_app_opts_output(const char *path, int overwrite,
   nested_type = info->nested_type;
 
   if(nested_type == PFS_NESTED_PFS) {
-    if(pfs_nested_open(info->source_path, &nr, stream_delete,
+    if(pfs_nested_open(info->source_path, &nr, 0,
                        err, err_size) != 0) {
       goto done;
     }
@@ -3056,22 +4053,15 @@ pfs_decompress_ffpfsc_to_app_opts_output(const char *path, int overwrite,
     }
 
     job_set_current("Scanning nested PFS");
-    if(stream_delete) {
-      if(pfs_collect_extract_plan(&nr, nr.uroot_inode, tmp_path, "", &plan,
-                                  err, err_size) != 0) {
-        goto done;
-      }
-      file_count = plan.count;
-      data_bytes = plan.total_bytes;
-      data_blocks = plan.total_blocks;
-    } else {
-      if(pfs_count_dir(&nr, nr.uroot_inode, &file_count, &data_bytes,
-                       &data_blocks, err, err_size) != 0) {
-        goto done;
-      }
+    if(pfs_collect_extract_plan(&nr, nr.uroot_inode, tmp_path, "", &plan,
+                                err, err_size) != 0) {
+      goto done;
     }
+    file_count = plan.count;
+    data_bytes = plan.total_bytes;
+    data_blocks = plan.total_blocks;
   } else if(nested_type == PFS_NESTED_EXFAT) {
-    if(exfat_reader_open(info->source_path, &er, stream_delete,
+    if(exfat_reader_open(info->source_path, &er, 0,
                          err, err_size) != 0) {
       goto done;
     }
@@ -3091,16 +4081,15 @@ pfs_decompress_ffpfsc_to_app_opts_output(const char *path, int overwrite,
     errno = EINVAL;
     goto done;
   }
+  pfs_io_policy_for_paths(info->source_path, info->output_path, &io_policy);
+  allow_io_overlap = pfs_io_policy_allows_overlap(&io_policy);
+  PFS_DECOMPRESS_LOG("pfsc io policy action=uncompress mode=app ioPolicy=%s sourceDevice=\"%s\" destDevice=\"%s\" reason=%s source=\"%s\" dest=\"%s\"",
+                     pfs_io_policy_name(io_policy.policy),
+                     io_policy.source_key, io_policy.dest_key,
+                     io_policy.reason, info->source_path, info->output_path);
 
-  uint64_t progress_base = 0;
-  if(preserve_stream_tmp) {
-    long copied_now = atomic_load(&g_job.copied_bytes);
-    if(copied_now > 0) progress_base = (uint64_t)copied_now;
-  }
-  atomic_store(&g_job.total_bytes,
-               job_long_from_u64(saturating_add_u64(progress_base,
-                                                    data_bytes)));
-  atomic_store(&g_job.copied_bytes, job_long_from_u64(progress_base));
+  atomic_store(&g_job.total_bytes, job_long_from_u64(data_bytes));
+  atomic_store(&g_job.copied_bytes, 0);
   atomic_store(&g_job.compressed_output_bytes, 0);
   atomic_store(&g_job.raw_blocks, 0);
   atomic_store(&g_job.compressed_blocks, 0);
@@ -3124,27 +4113,26 @@ pfs_decompress_ffpfsc_to_app_opts_output(const char *path, int overwrite,
     errno = EINTR;
     goto done;
   }
-  if(nested_type == PFS_NESTED_PFS && !stream_delete &&
-     mkdir_one_local(tmp_path) != 0) {
-    set_err(err, err_size, "create temp output: %s", strerror(errno));
+  job_set_current("Decompressing app folder");
+  pfsc_reader_t *reader = nested_type == PFS_NESTED_PFS ? &nr.pfsc : &er.pfsc;
+  int plan_rc = pfsc_decomp_extract_plan_windowed(reader, &plan, workers, 1,
+                                                  allow_io_overlap,
+                                                  err, err_size);
+  if(plan_rc == PFSC_DECOMPRESS_WINDOW_RC_FALLBACK) {
+    if(err && err_size > 0) err[0] = 0;
+    PFS_DECOMPRESS_LOG("decompress window unavailable mode=app fallback=serial");
+    if(nested_type == PFS_NESTED_PFS) {
+      if(pfs_extract_dir(&nr, nr.uroot_inode, tmp_path, "", 1,
+                         1, err, err_size) != 0) {
+        goto done;
+      }
+    } else if(nested_type == PFS_NESTED_EXFAT) {
+      if(exfat_extract_plan(&er, &plan, err, err_size) != 0) {
+        goto done;
+      }
+    }
+  } else if(plan_rc != 0) {
     goto done;
-  }
-
-  job_set_current(stream_delete ? "Converting to app folder" :
-                                  "Decompressing app folder");
-  if(nested_type == PFS_NESTED_PFS && stream_delete) {
-    if(pfs_extract_reverse_plan(&nr, &plan, workers, err, err_size) != 0) {
-      goto done;
-    }
-  } else if(nested_type == PFS_NESTED_PFS) {
-    if(pfs_extract_dir(&nr, nr.uroot_inode, tmp_path, "", workers,
-                       1, err, err_size) != 0) {
-      goto done;
-    }
-  } else if(nested_type == PFS_NESTED_EXFAT) {
-    if(exfat_extract_plan(&er, &plan, stream_delete, err, err_size) != 0) {
-      goto done;
-    }
   }
   if(job_cancelled()) {
     set_err(err, err_size, "cancelled");
@@ -3186,7 +4174,7 @@ pfs_decompress_ffpfsc_to_app_opts_output(const char *path, int overwrite,
 done:
   if(opened) pfs_nested_close(&nr);
   if(exfat_opened) exfat_reader_close(&er);
-  if(rc != 0 && !stream_delete) {
+  if(rc != 0) {
     remove_tree_local(tmp_path);
     remove_tree_local(legacy_tmp_path);
     if(err && err_size > 0 && !err[0]) {
@@ -3208,21 +4196,11 @@ pfs_decompress_ffpfsc_to_app_opts(const char *path, int overwrite, int workers,
 }
 
 int
-pfs_decompress_ffpfsc_to_app_ex(const char *path, int overwrite, int workers,
-                                int convert, pfs_decompress_info_t *info,
-                                char *err, size_t err_size) {
-  return pfs_decompress_ffpfsc_to_app_opts(path, overwrite, workers,
-                                           convert ? PFS_DELETE_STREAM
-                                                   : PFS_DELETE_KEEP,
-                                           info, err, err_size);
-}
-
-int
 pfs_decompress_ffpfsc_to_app(const char *path, int overwrite,
                              pfs_decompress_info_t *info,
                              char *err, size_t err_size) {
   return pfs_decompress_ffpfsc_to_app_opts(path, overwrite,
-                                           PFS_COMPRESS_DEFAULT_WORKERS,
+                                           PFS_DECOMPRESS_DEFAULT_WORKERS,
                                            PFS_DELETE_KEEP,
                                            info, err, err_size);
 }

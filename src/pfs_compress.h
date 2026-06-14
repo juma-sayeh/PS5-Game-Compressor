@@ -74,6 +74,7 @@ typedef struct pfs_stream_options {
 
 #define PFS_COMPRESS_DEFAULT_WORKERS 4
 #define PFS_COMPRESS_MAX_WORKERS 64
+#define PFS_DECOMPRESS_DEFAULT_WORKERS 12
 
 int pfs_app_probe(const char *path, pfs_app_info_t *info,
                   char *err, size_t err_size);
@@ -167,11 +168,6 @@ int pfs_decompress_probe_image(const char *path, pfs_decompress_info_t *info,
 int pfs_decompress_ffpfsc_to_app(const char *path, int overwrite,
                                  pfs_decompress_info_t *info,
                                  char *err, size_t err_size);
-
-int pfs_decompress_ffpfsc_to_app_ex(const char *path, int overwrite,
-                                    int workers, int convert,
-                                    pfs_decompress_info_t *info,
-                                    char *err, size_t err_size);
 
 int pfs_decompress_ffpfsc_to_app_opts(const char *path, int overwrite,
                                       int workers, int delete_policy,
