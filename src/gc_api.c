@@ -138,8 +138,7 @@ typedef enum gc_action {
 } gc_action_t;
 
 typedef enum gc_op_status {
-  GC_OP_UNUSED = 0,
-  GC_OP_QUEUED,
+  GC_OP_QUEUED = 1,
   GC_OP_RUNNING,
   GC_OP_SUCCESS,
   GC_OP_FAILED,
@@ -149,7 +148,6 @@ typedef enum gc_op_status {
 typedef enum gc_validation_state {
   GC_VALIDATION_NONE = 0,
   GC_VALIDATION_VALIDATED,
-  GC_VALIDATION_CHANGED,
 } gc_validation_state_t;
 
 typedef struct gc_game {
@@ -2772,6 +2770,111 @@ operation_mark_verified_not_mounted(gc_operation_t *op, const char *detail) {
          op->title_id, detail && detail[0] ? detail : "ShadowMountPlus did not mount");
 }
 
+static int
+append_operation_json(json_buf_t *b, const gc_operation_t *op,
+                      const char *id, int newline) {
+  uint64_t bad_blocks_found = op->bad_blocks_found;
+  uint64_t hash_mismatched_blocks = op->hash_mismatched_blocks;
+  uint64_t software_compared_blocks = op->software_compared_blocks;
+  if(op->status == GC_OP_SUCCESS && op->repaired_blocks > 0) {
+    bad_blocks_found = 0;
+    software_compared_blocks = 0;
+  }
+  return json_append(b, "{\"id\":") == 0 &&
+      json_string(b, id) == 0 &&
+      json_append(b, ",\"titleId\":") == 0 &&
+      json_string(b, op->title_id) == 0 &&
+      json_append(b, ",\"displayName\":") == 0 &&
+      json_string(b, op->display_name) == 0 &&
+      json_append(b, ",\"action\":") == 0 &&
+      json_string(b, action_name(op->action)) == 0 &&
+      json_append(b, ",\"status\":") == 0 &&
+      json_string(b, status_name(op->status)) == 0 &&
+      json_append(b, ",\"phase\":") == 0 &&
+      json_string(b, op->phase) == 0 &&
+      json_append(b, ",\"result\":") == 0 &&
+      json_string(b, op->result) == 0 &&
+      json_append(b, ",\"error\":") == 0 &&
+      json_string(b, op->error) == 0 &&
+      json_append(b, ",\"sourcePath\":") == 0 &&
+      json_string(b, op->source_path) == 0 &&
+      json_append(b, ",\"outputPath\":") == 0 &&
+      json_string(b, op->output_path) == 0 &&
+      json_append(b, ",\"sourceKind\":") == 0 &&
+      json_string(b, op->source_kind) == 0 &&
+      json_append(b, ",\"format\":") == 0 &&
+      json_string(b, op->format) == 0 &&
+      json_append(b, ",\"deletePolicy\":") == 0 &&
+      json_string(b, op->delete_policy) == 0 &&
+      json_append(b, ",\"compressionProfile\":") == 0 &&
+      json_string(b, compression_profile_or_default(op->compression_profile)) == 0 &&
+      json_append(b, ",\"streamOrder\":") == 0 &&
+      json_string(b, op->stream_order[0] ? op->stream_order : "budgeted-gain") == 0 &&
+      json_append(b, ",\"targetRoot\":") == 0 &&
+      json_string(b, op->target_root) == 0 &&
+      json_append(b, ",\"preserveOriginal\":") == 0 &&
+      json_string(b, op->preserve_original) == 0 &&
+      json_append(b, ",\"preservedOriginalPath\":") == 0 &&
+      json_string(b, op->preserved_original_path) == 0 &&
+      json_append(b, ",\"preservedHiddenPath\":") == 0 &&
+      json_string(b, op->preserved_hidden_path) == 0 &&
+      json_append(b, ",\"repairSummary\":") == 0 &&
+      json_string(b, op->repair_summary) == 0 &&
+      json_append(b, ",\"readRoot\":") == 0 &&
+      json_string(b, op->read_root) == 0 &&
+      json_append(b, ",\"readStorage\":") == 0 &&
+      json_string(b, op->read_storage) == 0 &&
+      json_append(b, ",\"readFirstErrorPath\":") == 0 &&
+      json_string(b, op->read_first_error_path) == 0 &&
+      json_append(b, ",\"readFirstError\":") == 0 &&
+      json_string(b, op->read_first_error) == 0 &&
+      json_appendf(b,
+                   ",\"streamBudgetBytes\":%llu,"
+                   "\"compressionSourceSize\":%llu,"
+                   "\"compressedSize\":%llu,"
+                   "\"savedBytes\":%llu,"
+                   "\"scanBytes\":%llu,\"scanFiles\":%llu,"
+                   "\"scanDirs\":%llu,\"scanEntries\":%llu,"
+                   "\"scanElapsedMs\":%llu,\"scanWorkers\":%llu,"
+                   "\"readBytes\":%llu,\"readFiles\":%llu,"
+                   "\"readDirs\":%llu,\"readElapsedMs\":%llu,"
+                   "\"readAvgBps\":%llu,\"readMinBps\":%llu,"
+                   "\"readMaxBps\":%llu,\"readErrors\":%llu,"
+                   "\"readSkipped\":%llu,"
+                   "\"createdAt\":%ld,\"startedAt\":%ld,\"endedAt\":%ld,"
+                   "\"repairedBlocks\":%llu,\"badBlocksFound\":%llu,"
+                   "\"hashCheckedBlocks\":%llu,"
+                   "\"hashMismatchedBlocks\":%llu,"
+                   "\"softwareComparedBlocks\":%llu}%s",
+                   (unsigned long long)op->stream_budget_bytes,
+                   (unsigned long long)op->compression_source_size,
+                   (unsigned long long)op->compressed_size,
+                   (unsigned long long)op->saved_bytes,
+                   (unsigned long long)op->scan_bytes,
+                   (unsigned long long)op->scan_files,
+                   (unsigned long long)op->scan_dirs,
+                   (unsigned long long)op->scan_entries,
+                   (unsigned long long)op->scan_elapsed_ms,
+                   (unsigned long long)op->scan_workers,
+                   (unsigned long long)op->read_bytes,
+                   (unsigned long long)op->read_files,
+                   (unsigned long long)op->read_dirs,
+                   (unsigned long long)op->read_elapsed_ms,
+                   (unsigned long long)op->read_avg_bps,
+                   (unsigned long long)op->read_min_bps,
+                   (unsigned long long)op->read_max_bps,
+                   (unsigned long long)op->read_errors,
+                   (unsigned long long)op->read_skipped,
+                   (long)op->created_at, (long)op->started_at,
+                   (long)op->ended_at,
+                   (unsigned long long)op->repaired_blocks,
+                   (unsigned long long)bad_blocks_found,
+                   (unsigned long long)op->hash_checked_blocks,
+                   (unsigned long long)hash_mismatched_blocks,
+                   (unsigned long long)software_compared_blocks,
+                   newline ? "\n" : "") == 0 ? 0 : -1;
+}
+
 static void
 append_operation_log_file(const gc_operation_t *op, const char *dir,
                           const char *path) {
@@ -2781,110 +2884,12 @@ append_operation_log_file(const gc_operation_t *op, const char *dir,
   if(fd < 0) return;
   json_buf_t b = {0};
   char row_id[64];
-  uint64_t bad_blocks_found = op->bad_blocks_found;
-  uint64_t hash_mismatched_blocks = op->hash_mismatched_blocks;
-  uint64_t software_compared_blocks = op->software_compared_blocks;
-  if(op->status == GC_OP_SUCCESS && op->repaired_blocks > 0) {
-    bad_blocks_found = 0;
-    software_compared_blocks = 0;
-  }
   if(op->status == GC_OP_RUNNING && op->phase[0]) {
     snprintf(row_id, sizeof(row_id), "%s:%s", op->id, op->phase);
   } else {
     snprintf(row_id, sizeof(row_id), "%s", op->id);
   }
-  if(json_append(&b, "{\"id\":") == 0 &&
-     json_string(&b, row_id) == 0 &&
-     json_append(&b, ",\"titleId\":") == 0 &&
-     json_string(&b, op->title_id) == 0 &&
-     json_append(&b, ",\"displayName\":") == 0 &&
-     json_string(&b, op->display_name) == 0 &&
-     json_append(&b, ",\"action\":") == 0 &&
-     json_string(&b, action_name(op->action)) == 0 &&
-     json_append(&b, ",\"status\":") == 0 &&
-     json_string(&b, status_name(op->status)) == 0 &&
-     json_append(&b, ",\"phase\":") == 0 &&
-     json_string(&b, op->phase) == 0 &&
-     json_append(&b, ",\"result\":") == 0 &&
-     json_string(&b, op->result) == 0 &&
-     json_append(&b, ",\"error\":") == 0 &&
-     json_string(&b, op->error) == 0 &&
-     json_append(&b, ",\"sourcePath\":") == 0 &&
-     json_string(&b, op->source_path) == 0 &&
-     json_append(&b, ",\"outputPath\":") == 0 &&
-     json_string(&b, op->output_path) == 0 &&
-     json_append(&b, ",\"sourceKind\":") == 0 &&
-     json_string(&b, op->source_kind) == 0 &&
-     json_append(&b, ",\"format\":") == 0 &&
-     json_string(&b, op->format) == 0 &&
-     json_append(&b, ",\"deletePolicy\":") == 0 &&
-     json_string(&b, op->delete_policy) == 0 &&
-     json_append(&b, ",\"compressionProfile\":") == 0 &&
-     json_string(&b, compression_profile_or_default(op->compression_profile)) == 0 &&
-     json_append(&b, ",\"streamOrder\":") == 0 &&
-     json_string(&b, op->stream_order[0] ? op->stream_order : "budgeted-gain") == 0 &&
-	     json_append(&b, ",\"targetRoot\":") == 0 &&
-	     json_string(&b, op->target_root) == 0 &&
-	     json_append(&b, ",\"preserveOriginal\":") == 0 &&
-	     json_string(&b, op->preserve_original) == 0 &&
-	     json_append(&b, ",\"preservedOriginalPath\":") == 0 &&
-	     json_string(&b, op->preserved_original_path) == 0 &&
-	     json_append(&b, ",\"preservedHiddenPath\":") == 0 &&
-	     json_string(&b, op->preserved_hidden_path) == 0 &&
-	     json_append(&b, ",\"repairSummary\":") == 0 &&
-	     json_string(&b, op->repair_summary) == 0 &&
-	     json_append(&b, ",\"readRoot\":") == 0 &&
-	     json_string(&b, op->read_root) == 0 &&
-	     json_append(&b, ",\"readStorage\":") == 0 &&
-	     json_string(&b, op->read_storage) == 0 &&
-	     json_append(&b, ",\"readFirstErrorPath\":") == 0 &&
-	     json_string(&b, op->read_first_error_path) == 0 &&
-	     json_append(&b, ",\"readFirstError\":") == 0 &&
-	     json_string(&b, op->read_first_error) == 0 &&
-		     json_appendf(&b,
-				                  ",\"streamBudgetBytes\":%llu,"
-				                  "\"compressionSourceSize\":%llu,"
-				                  "\"compressedSize\":%llu,"
-				                  "\"savedBytes\":%llu,"
-                          "\"scanBytes\":%llu,\"scanFiles\":%llu,"
-                          "\"scanDirs\":%llu,\"scanEntries\":%llu,"
-                          "\"scanElapsedMs\":%llu,\"scanWorkers\":%llu,"
-				                  "\"readBytes\":%llu,\"readFiles\":%llu,"
-			                  "\"readDirs\":%llu,\"readElapsedMs\":%llu,"
-			                  "\"readAvgBps\":%llu,\"readMinBps\":%llu,"
-			                  "\"readMaxBps\":%llu,\"readErrors\":%llu,"
-			                  "\"readSkipped\":%llu,"
-			                  "\"createdAt\":%ld,\"startedAt\":%ld,\"endedAt\":%ld,"
-			                  "\"repairedBlocks\":%llu,\"badBlocksFound\":%llu,"
-			                  "\"hashCheckedBlocks\":%llu,"
-		                  "\"hashMismatchedBlocks\":%llu,"
-		                  "\"softwareComparedBlocks\":%llu}\n",
-		                  (unsigned long long)op->stream_budget_bytes,
-				                  (unsigned long long)op->compression_source_size,
-				                  (unsigned long long)op->compressed_size,
-				                  (unsigned long long)op->saved_bytes,
-                          (unsigned long long)op->scan_bytes,
-                          (unsigned long long)op->scan_files,
-                          (unsigned long long)op->scan_dirs,
-                          (unsigned long long)op->scan_entries,
-                          (unsigned long long)op->scan_elapsed_ms,
-                          (unsigned long long)op->scan_workers,
-				                  (unsigned long long)op->read_bytes,
-			                  (unsigned long long)op->read_files,
-			                  (unsigned long long)op->read_dirs,
-			                  (unsigned long long)op->read_elapsed_ms,
-			                  (unsigned long long)op->read_avg_bps,
-			                  (unsigned long long)op->read_min_bps,
-			                  (unsigned long long)op->read_max_bps,
-			                  (unsigned long long)op->read_errors,
-			                  (unsigned long long)op->read_skipped,
-			                  (long)op->created_at, (long)op->started_at,
-		                  (long)op->ended_at,
-	                  (unsigned long long)op->repaired_blocks,
-	                  (unsigned long long)bad_blocks_found,
-	                  (unsigned long long)op->hash_checked_blocks,
-	                  (unsigned long long)hash_mismatched_blocks,
-	                  (unsigned long long)software_compared_blocks) == 0) {
+  if(append_operation_json(&b, op, row_id, 1) == 0) {
     write_all_fd(fd, b.data, b.len);
     fsync(fd);
   }
@@ -3421,6 +3426,58 @@ delete_quarantined_uncompress_source(gc_source_quarantine_t *q,
   return 0;
 }
 
+static int
+uncompress_delete_quarantined_source_or_fail(gc_operation_t *op,
+                                             gc_source_quarantine_t *q,
+                                             char *err,
+                                             size_t err_size) {
+  if(delete_quarantined_uncompress_source(q, op->title_id,
+                                          err, err_size) != 0) {
+    snprintf(op->error, sizeof(op->error), "%s", err);
+    gc_log("uncompress source delete failed title=%s err=%s", op->title_id,
+           op->error);
+    return -1;
+  }
+  return 0;
+}
+
+static void
+uncompress_request_shadowmount_scan(gc_operation_t *op,
+                                    char *err,
+                                    size_t err_size) {
+  gc_checkpoint("uncompress request shadowmount scan");
+  job_set_phase("mounting", 0, 0, "Requesting ShadowMount scan");
+  err[0] = 0;
+  if(gc_shadowmount_request_scan_cancelable(err, err_size) != 0 &&
+     !job_cancelled()) {
+    gc_log("uncompress scan request failed title=%s err=%s", op->title_id,
+           err[0] ? err : "unknown");
+  }
+}
+
+static int
+uncompress_complete_not_mounted(gc_operation_t *op,
+                                gc_source_quarantine_t *q,
+                                const pfs_decompress_info_t *info,
+                                int as_image,
+                                char *err,
+                                size_t err_size) {
+  snprintf(op->result, sizeof(op->result), "%s", "not-mounted");
+  op->error[0] = 0;
+  if(uncompress_delete_quarantined_source_or_fail(op, q, err, err_size) != 0) {
+    return -1;
+  }
+  size_cache_queue_measure(info->output_path);
+  if(as_image) {
+    gc_log("uncompress image complete but not mounted title=%s output=%s detail=%s",
+           op->title_id, op->output_path, err[0] ? err : "");
+  } else {
+    gc_log("uncompress complete but not mounted title=%s output=%s detail=%s",
+           op->title_id, op->output_path, err[0] ? err : "");
+  }
+  return 0;
+}
+
 static void
 restore_quarantined_uncompress_source(gc_source_quarantine_t *q,
                                       const char *title_id) {
@@ -3575,8 +3632,8 @@ repair_with_wait(const char *title_id, const char *path,
     }
     {
       char scan_err[256] = {0};
-      if(gc_shadowmount_request_scan_cancelable(scan_err,
-                                                sizeof(scan_err)) != 0) {
+      if(gc_shadowmount_request_source_scan_cancelable(path, scan_err,
+                                                       sizeof(scan_err)) != 0) {
         if(job_cancelled()) return -1;
         gc_log("repair wait scan request failed title=%s err=%s",
                title_id ? title_id : "",
@@ -3622,8 +3679,8 @@ repair_scan_only_with_wait(const char *title_id, const char *path,
     }
     {
       char scan_err[256] = {0};
-      if(gc_shadowmount_request_scan_cancelable(scan_err,
-                                                sizeof(scan_err)) != 0) {
+      if(gc_shadowmount_request_source_scan_cancelable(path, scan_err,
+                                                       sizeof(scan_err)) != 0) {
         if(job_cancelled()) return -1;
         gc_log("validate-only wait scan request failed title=%s err=%s",
                title_id ? title_id : "",
@@ -3716,7 +3773,8 @@ wait_for_compressed_shadowmount(const char *title_id, const char *path,
   }
   if(gc_cancel_requested(err, err_size)) return -1;
   job_set_phase("mounting", 0, 0, current ? current : "Waiting for remount");
-  if(gc_shadowmount_request_scan_cancelable(scan_err, sizeof(scan_err)) != 0) {
+  if(gc_shadowmount_request_source_scan_cancelable(path, scan_err,
+                                                  sizeof(scan_err)) != 0) {
     if(job_cancelled()) return -1;
     gc_log("compressed remount scan request failed title=%s err=%s",
            title_id ? title_id : "", scan_err[0] ? scan_err : "unknown");
@@ -4045,6 +4103,18 @@ mount_switch_hide_competitors(gc_operation_t *op, const gc_game_t *selected,
   }
   scan_roots_add_parent(&roots, selected->source_path);
   scan_roots_add_parent(&roots, selected->output_path);
+  if(op && op->source_path[0] &&
+     !paths_equal_ignoring_trailing_slash(op->source_path,
+                                          selected->source_path)) {
+    gc_game_t known;
+    memset(&known, 0, sizeof(known));
+    if(candidate_game_from_path(op->source_path, base_name(op->source_path),
+                                &known, 0, 0) == 0 &&
+       !strcmp(known.title_id, selected->title_id)) {
+      scan_roots_add_parent(&roots, known.source_path);
+      append_game_unique_by_source(games, GC_MAX_GAMES, &count, &known);
+    }
+  }
   {
     char link_target[1024];
     if(read_title_link(selected->title_id, "mount.lnk", link_target,
@@ -4674,10 +4744,11 @@ mount_switch_delete_hidden_source(gc_operation_t *op,
 }
 
 static int
-mount_switch_restore_after_operation(gc_operation_t *op,
-                                     gc_hidden_instance_t *hidden,
-                                     size_t hidden_count,
-                                     char *err, size_t err_size) {
+mount_switch_restore_after_operation_ex(gc_operation_t *op,
+                                        gc_hidden_instance_t *hidden,
+                                        size_t hidden_count,
+                                        int request_scan,
+                                        char *err, size_t err_size) {
   char scan_err[256] = {0};
   if(hidden_count > 0) {
     append_operation_phase(op, "restoring");
@@ -4689,6 +4760,11 @@ mount_switch_restore_after_operation(gc_operation_t *op,
     return -1;
   }
   artifact_cache_invalidate();
+  if(!request_scan) {
+    gc_log("mount switch post-restore scan skipped after selected mount title=%s",
+           op ? op->title_id : "");
+    return 0;
+  }
   if(job_cancelled()) {
     gc_log("mount switch post-restore scan skipped after cancel title=%s",
            op ? op->title_id : "");
@@ -4704,6 +4780,15 @@ mount_switch_restore_after_operation(gc_operation_t *op,
            op ? op->title_id : "", scan_err[0] ? scan_err : "unknown");
   }
   return 0;
+}
+
+static int
+mount_switch_restore_after_operation(gc_operation_t *op,
+                                     gc_hidden_instance_t *hidden,
+                                     size_t hidden_count,
+                                     char *err, size_t err_size) {
+  return mount_switch_restore_after_operation_ex(op, hidden, hidden_count, 1,
+                                                 err, err_size);
 }
 
 static void
@@ -4737,6 +4822,52 @@ build_preserved_original_path(const char *original_path,
   }
   if(!path_is_safe(out)) {
     errno = EINVAL;
+    return -1;
+  }
+  return 0;
+}
+
+static int
+compress_delete_source_after_success(gc_operation_t *op, const gc_game_t *game,
+                                     gc_hidden_instance_t *hidden,
+                                     size_t hidden_count) {
+  char delete_err[256] = {0};
+  gc_checkpoint("compress delete source");
+  job_set_current("Deleting original source");
+  if(mount_switch_delete_hidden_source(op, hidden, hidden_count,
+                                       game->source_path,
+                                       game->source_kind,
+                                       delete_err,
+                                       sizeof(delete_err)) != 0) {
+    char restore_err[256] = {0};
+    snprintf(op->error, sizeof(op->error), "%s", delete_err);
+    gc_log("compress delete source failed title=%s err=%s", op->title_id,
+           op->error);
+    (void)mount_switch_restore_after_operation(op, hidden, hidden_count,
+                                               restore_err,
+                                               sizeof(restore_err));
+    return -1;
+  }
+  gc_log("compress source deleted title=%s path=%s", op->title_id,
+         game->source_path);
+  append_operation_phase(op, "source-deleted");
+  return 0;
+}
+
+static int
+compress_restore_duplicates_after_success(gc_operation_t *op,
+                                          gc_hidden_instance_t *hidden,
+                                          size_t hidden_count,
+                                          int request_scan) {
+  char restore_err[256] = {0};
+  if(mount_switch_restore_after_operation_ex(op, hidden, hidden_count,
+                                             request_scan, restore_err,
+                                             sizeof(restore_err)) != 0) {
+    snprintf(op->error, sizeof(op->error), "%s",
+             restore_err[0] ? restore_err :
+             "could not restore duplicate instances");
+    gc_log("compress restore failed title=%s err=%s", op->title_id,
+           op->error);
     return -1;
   }
   return 0;
@@ -5388,39 +5519,14 @@ run_compress_op(gc_operation_t *op) {
                                       err, sizeof(err)) != 0) {
     if(shadowmount_mount_missed(err)) {
       if(delete_after) {
-        char delete_err[256] = {0};
-        gc_checkpoint("compress delete source");
-        job_set_current("Deleting original source");
-        if(mount_switch_delete_hidden_source(op, hidden, hidden_count,
-                                             game.source_path,
-                                             game.source_kind,
-                                             delete_err,
-                                             sizeof(delete_err)) != 0) {
-          char restore_err[256] = {0};
-          snprintf(op->error, sizeof(op->error), "%s", delete_err);
-          gc_log("compress delete source failed title=%s err=%s", op->title_id,
-                 op->error);
-          (void)mount_switch_restore_after_operation(op, hidden, hidden_count,
-                                                     restore_err,
-                                                     sizeof(restore_err));
+        if(compress_delete_source_after_success(op, &game, hidden,
+                                                hidden_count) != 0) {
           COMPRESS_FAIL_RETURN();
         }
-        gc_log("compress source deleted title=%s path=%s", op->title_id,
-               game.source_path);
-        append_operation_phase(op, "source-deleted");
       }
-      {
-        char restore_err[256] = {0};
-        if(mount_switch_restore_after_operation(op, hidden, hidden_count,
-                                                restore_err,
-                                                sizeof(restore_err)) != 0) {
-          snprintf(op->error, sizeof(op->error), "%s",
-                   restore_err[0] ? restore_err :
-                   "could not restore duplicate instances");
-          gc_log("compress restore failed title=%s err=%s", op->title_id,
-                 op->error);
-          COMPRESS_FAIL_RETURN();
-        }
+      if(compress_restore_duplicates_after_success(op, hidden,
+                                                   hidden_count, 1) != 0) {
+        COMPRESS_FAIL_RETURN();
       }
       operation_mark_verified_not_mounted(op, err);
       (void)write_validation_marker_ex(op->title_id, info.output_path, &repair,
@@ -5448,26 +5554,10 @@ run_compress_op(gc_operation_t *op) {
   char final_result[32];
   snprintf(final_result, sizeof(final_result), "%s", op->result);
   if(delete_after) {
-    char delete_err[256] = {0};
-    gc_checkpoint("compress delete source");
-    job_set_current("Deleting original source");
-    if(mount_switch_delete_hidden_source(op, hidden, hidden_count,
-                                         game.source_path,
-                                         game.source_kind,
-                                         delete_err,
-                                         sizeof(delete_err)) != 0) {
-      char restore_err[256] = {0};
-      snprintf(op->error, sizeof(op->error), "%s", delete_err);
-      gc_log("compress delete source failed title=%s err=%s", op->title_id,
-             op->error);
-      (void)mount_switch_restore_after_operation(op, hidden, hidden_count,
-                                                 restore_err,
-                                                 sizeof(restore_err));
+    if(compress_delete_source_after_success(op, &game, hidden,
+                                            hidden_count) != 0) {
       COMPRESS_FAIL_RETURN();
     }
-    gc_log("compress source deleted title=%s path=%s", op->title_id,
-           game.source_path);
-    append_operation_phase(op, "source-deleted");
     snprintf(final_result, sizeof(final_result), "%s",
              repair.repaired_blocks > 0 ? "repaired" : "success");
   } else if(preserve_hide) {
@@ -5489,20 +5579,11 @@ run_compress_op(gc_operation_t *op) {
       COMPRESS_FAIL_RETURN();
     }
   }
-  {
-    char restore_err[256] = {0};
-    if(mount_switch_restore_after_operation(op, hidden, hidden_count,
-                                            restore_err,
-                                            sizeof(restore_err)) != 0) {
-      snprintf(op->error, sizeof(op->error), "%s",
-               restore_err[0] ? restore_err :
-               "could not restore duplicate instances");
-      gc_log("compress restore failed title=%s err=%s", op->title_id,
-             op->error);
-      COMPRESS_FAIL_RETURN();
-    }
+  if(compress_restore_duplicates_after_success(op, hidden,
+                                               hidden_count, 0) != 0) {
+    COMPRESS_FAIL_RETURN();
   }
-	  snprintf(op->result, sizeof(op->result), "%s", final_result);
+  snprintf(op->result, sizeof(op->result), "%s", final_result);
   uint64_t final_compressed_size =
       source_size_bytes_exact(info.output_path, GC_SOURCE_COMPRESSED);
   operation_store_compression_stats(op, game.source_size, info.output_path);
@@ -5721,14 +5802,7 @@ run_uncompress_op(gc_operation_t *op) {
              op->title_id, info.output_path, op->error);
       return -1;
     }
-    gc_checkpoint("uncompress request shadowmount scan");
-    job_set_phase("mounting", 0, 0, "Requesting ShadowMount scan");
-    err[0] = 0;
-    if(gc_shadowmount_request_scan_cancelable(err, sizeof(err)) != 0 &&
-       !job_cancelled()) {
-      gc_log("uncompress scan request failed title=%s err=%s",
-             op->title_id, err[0] ? err : "unknown");
-    }
+    uncompress_request_shadowmount_scan(op, err, sizeof(err));
     gc_checkpoint("uncompress wait image remount");
     job_set_phase("mounting", 0, 0, "Waiting for remount");
     err[0] = 0;
@@ -5736,20 +5810,8 @@ run_uncompress_op(gc_operation_t *op) {
                                   info.output_path, err,
                                   sizeof(err)) != 0) {
       if(shadowmount_mount_missed(err)) {
-        snprintf(op->result, sizeof(op->result), "%s", "not-mounted");
-        op->error[0] = 0;
-        if(delete_quarantined_uncompress_source(&source_quarantine,
-                                                op->title_id, err,
-                                                sizeof(err)) != 0) {
-          snprintf(op->error, sizeof(op->error), "%s", err);
-          gc_log("uncompress source delete failed title=%s err=%s",
-                 op->title_id, op->error);
-          return -1;
-        }
-        size_cache_queue_measure(info.output_path);
-        gc_log("uncompress image complete but not mounted title=%s output=%s detail=%s",
-               op->title_id, op->output_path, err[0] ? err : "");
-        return 0;
+        return uncompress_complete_not_mounted(op, &source_quarantine, &info,
+                                               as_image, err, sizeof(err));
       }
       snprintf(op->error, sizeof(op->error), "%s",
                err[0] ? err : "ShadowMountPlus remount failed");
@@ -5759,32 +5821,13 @@ run_uncompress_op(gc_operation_t *op) {
       return -1;
     }
   } else {
-    gc_checkpoint("uncompress request shadowmount scan");
-    job_set_phase("mounting", 0, 0, "Requesting ShadowMount scan");
-    err[0] = 0;
-    if(gc_shadowmount_request_scan_cancelable(err, sizeof(err)) != 0 &&
-       !job_cancelled()) {
-      gc_log("uncompress scan request failed title=%s err=%s", op->title_id,
-             err[0] ? err : "unknown");
-    }
+    uncompress_request_shadowmount_scan(op, err, sizeof(err));
     gc_checkpoint("uncompress force remount");
     if(force_folder_path_bounce_remount(op->title_id, info.output_path,
                                         err, sizeof(err)) != 0) {
       if(shadowmount_mount_missed(err)) {
-        snprintf(op->result, sizeof(op->result), "%s", "not-mounted");
-        op->error[0] = 0;
-        if(delete_quarantined_uncompress_source(&source_quarantine,
-                                                op->title_id, err,
-                                                sizeof(err)) != 0) {
-          snprintf(op->error, sizeof(op->error), "%s", err);
-          gc_log("uncompress source delete failed title=%s err=%s",
-                 op->title_id, op->error);
-          return -1;
-        }
-        size_cache_queue_measure(info.output_path);
-        gc_log("uncompress complete but not mounted title=%s output=%s detail=%s",
-               op->title_id, op->output_path, err[0] ? err : "");
-        return 0;
+        return uncompress_complete_not_mounted(op, &source_quarantine, &info,
+                                               as_image, err, sizeof(err));
       }
       snprintf(op->error, sizeof(op->error), "%s",
                err[0] ? err : "ShadowMountPlus remount failed");
@@ -5794,11 +5837,8 @@ run_uncompress_op(gc_operation_t *op) {
       return -1;
     }
   }
-  if(delete_quarantined_uncompress_source(&source_quarantine, op->title_id,
-                                          err, sizeof(err)) != 0) {
-    snprintf(op->error, sizeof(op->error), "%s", err);
-    gc_log("uncompress source delete failed title=%s err=%s", op->title_id,
-           op->error);
+  if(uncompress_delete_quarantined_source_or_fail(op, &source_quarantine,
+                                                  err, sizeof(err)) != 0) {
     return -1;
   }
   size_cache_queue_measure(info.output_path);
@@ -6007,6 +6047,49 @@ run_validate_only_op(gc_operation_t *op) {
   return 0;
 }
 
+static void
+operation_append_error_detail(gc_operation_t *op, const char *detail) {
+  if(!op || !detail || !detail[0]) return;
+  if(op->error[0]) {
+    size_t used = strlen(op->error);
+    if(used < sizeof(op->error)) {
+      snprintf(op->error + used, sizeof(op->error) - used, "; %s", detail);
+    }
+  } else {
+    snprintf(op->error, sizeof(op->error), "%s", detail);
+  }
+}
+
+static void
+refresh_mount_restore_cleared_links_after_failure(gc_operation_t *op,
+                                                  gc_mount_link_backup_t *backup,
+                                                  char *restore_err,
+                                                  size_t restore_err_size) {
+  restore_err[0] = 0;
+  if(mount_switch_restore_cleared_links(backup, restore_err,
+                                        restore_err_size) != 0) {
+    gc_log("refresh-mount link restore after failure failed title=%s err=%s",
+           op->title_id, restore_err[0] ? restore_err : "unknown");
+    operation_append_error_detail(op, restore_err);
+  }
+}
+
+static void
+refresh_mount_request_restore_scan(gc_operation_t *op,
+                                   char *scan_err,
+                                   size_t scan_err_size) {
+  scan_err[0] = 0;
+  if(job_cancelled()) {
+    gc_log("refresh-mount restore scan skipped after cancel title=%s",
+           op->title_id);
+  } else if(gc_shadowmount_request_scan_cancelable(scan_err,
+                                                   scan_err_size) != 0 &&
+            !job_cancelled()) {
+    gc_log("refresh-mount restore scan failed title=%s err=%s",
+           op->title_id, scan_err[0] ? scan_err : "unknown");
+  }
+}
+
 static int
 run_refresh_mount_op(gc_operation_t *op) {
   gc_game_t game = {0};
@@ -6152,7 +6235,10 @@ run_refresh_mount_op(gc_operation_t *op) {
     return -1;
   }
   scan_err[0] = 0;
-  if(job_cancelled()) {
+  if(mount_ready) {
+    gc_log("refresh-mount post-restore scan skipped after selected mount title=%s",
+           op->title_id);
+  } else if(job_cancelled()) {
     gc_log("refresh-mount post-restore scan skipped after cancel title=%s",
            op->title_id);
   } else if(gc_shadowmount_request_scan_cancelable(scan_err,
@@ -6197,62 +6283,18 @@ restore_and_fail:
                                    restore_err, sizeof(restore_err)) != 0) {
       gc_log("refresh-mount restore after failure failed title=%s err=%s",
              op->title_id, restore_err[0] ? restore_err : "unknown");
-      if(op->error[0] && restore_err[0]) {
-        size_t used = strlen(op->error);
-        snprintf(op->error + used, sizeof(op->error) - used,
-                 "; %s", restore_err);
-      } else if(restore_err[0]) {
-        snprintf(op->error, sizeof(op->error), "%s", restore_err);
-      }
+      operation_append_error_detail(op, restore_err);
     }
     artifact_cache_invalidate();
-    restore_err[0] = 0;
-    if(mount_switch_restore_cleared_links(&link_backup, restore_err,
-                                          sizeof(restore_err)) != 0) {
-      gc_log("refresh-mount link restore after failure failed title=%s err=%s",
-             op->title_id, restore_err[0] ? restore_err : "unknown");
-      if(op->error[0] && restore_err[0]) {
-        size_t used = strlen(op->error);
-        snprintf(op->error + used, sizeof(op->error) - used,
-                 "; %s", restore_err);
-      } else if(restore_err[0]) {
-        snprintf(op->error, sizeof(op->error), "%s", restore_err);
-      }
-    }
-    scan_err[0] = 0;
-    if(job_cancelled()) {
-      gc_log("refresh-mount restore scan skipped after cancel title=%s",
-             op->title_id);
-    } else if(gc_shadowmount_request_scan_cancelable(scan_err,
-                                                     sizeof(scan_err)) != 0 &&
-              !job_cancelled()) {
-      gc_log("refresh-mount restore scan failed title=%s err=%s",
-             op->title_id, scan_err[0] ? scan_err : "unknown");
-    }
+    refresh_mount_restore_cleared_links_after_failure(op, &link_backup,
+                                                      restore_err,
+                                                      sizeof(restore_err));
+    refresh_mount_request_restore_scan(op, scan_err, sizeof(scan_err));
   } else if(link_backup.cleared) {
-    restore_err[0] = 0;
-    if(mount_switch_restore_cleared_links(&link_backup, restore_err,
-                                          sizeof(restore_err)) != 0) {
-      gc_log("refresh-mount link restore after failure failed title=%s err=%s",
-             op->title_id, restore_err[0] ? restore_err : "unknown");
-      if(op->error[0] && restore_err[0]) {
-        size_t used = strlen(op->error);
-        snprintf(op->error + used, sizeof(op->error) - used,
-                 "; %s", restore_err);
-      } else if(restore_err[0]) {
-        snprintf(op->error, sizeof(op->error), "%s", restore_err);
-      }
-    }
-    scan_err[0] = 0;
-    if(job_cancelled()) {
-      gc_log("refresh-mount restore scan skipped after cancel title=%s",
-             op->title_id);
-    } else if(gc_shadowmount_request_scan_cancelable(scan_err,
-                                                     sizeof(scan_err)) != 0 &&
-              !job_cancelled()) {
-      gc_log("refresh-mount restore scan failed title=%s err=%s",
-             op->title_id, scan_err[0] ? scan_err : "unknown");
-    }
+    refresh_mount_restore_cleared_links_after_failure(op, &link_backup,
+                                                      restore_err,
+                                                      sizeof(restore_err));
+    refresh_mount_request_restore_scan(op, scan_err, sizeof(scan_err));
   }
   return -1;
 }
@@ -6655,6 +6697,90 @@ start_next_locked(void) {
   }
 }
 
+/* Called with g_gc_lock held; releases it before building the response. */
+static int
+enqueue_start_response_locked(const http_request_t *req, gc_operation_t *op) {
+  append_operation_logs(op);
+  start_next_locked();
+  gc_op_status_t status = op->status;
+  char id[32];
+  snprintf(id, sizeof(id), "%s", op->id);
+  pthread_mutex_unlock(&g_gc_lock);
+
+  json_buf_t b = {0};
+  if(json_append(&b, "{\"ok\":true,\"id\":") != 0 ||
+     json_string(&b, id) != 0 ||
+     json_append(&b, ",\"status\":") != 0 ||
+     json_string(&b, status_name(status)) != 0 ||
+     json_append(&b, "}") != 0) {
+    free(b.data);
+    return -1;
+  }
+  return serve_owned(req, 200, b.data, b.len);
+}
+
+static const char *
+read_title_source_args(const http_request_t *req,
+                       char *title_id,
+                       size_t title_id_size,
+                       char *source_path,
+                       size_t source_path_size) {
+  if(!websrv_get_query_arg(req, "titleId", title_id, title_id_size) ||
+     !valid_title_id(title_id)) {
+    return "bad titleId";
+  }
+  int source_rc = get_required_source_path_arg(req, source_path,
+                                               source_path_size);
+  if(source_rc == -2) return "sourcePath required";
+  if(source_rc != 0) return "bad source path";
+  return NULL;
+}
+
+static int
+title_operation_busy(const char *title_id) {
+  pthread_mutex_lock(&g_gc_lock);
+  int busy = active_op_for_title_locked(title_id) ||
+             pending_op_for_title_locked(title_id);
+  pthread_mutex_unlock(&g_gc_lock);
+  return busy;
+}
+
+static gc_operation_t *
+alloc_queued_operation_locked(const http_request_t *req,
+                              const char *title_id,
+                              gc_action_t action,
+                              const char *display_name,
+                              int *response_out) {
+  if(response_out) *response_out = 0;
+  if(active_op_for_title_locked(title_id) ||
+     pending_op_for_title_locked(title_id)) {
+    pthread_mutex_unlock(&g_gc_lock);
+    if(response_out) {
+      *response_out = serve_error(req, 409,
+                                  "action already running for this game");
+    }
+    return NULL;
+  }
+  gc_operation_t *op = alloc_op_locked();
+  if(!op) {
+    pthread_mutex_unlock(&g_gc_lock);
+    if(response_out) *response_out = serve_error(req, 409, "history is full");
+    return NULL;
+  }
+  memset(op, 0, sizeof(*op));
+  op->used = 1;
+  op->seq = g_next_seq++;
+  snprintf(op->id, sizeof(op->id), "op-%llu",
+           (unsigned long long)op->seq);
+  op->action = action;
+  op->status = GC_OP_QUEUED;
+  op->created_at = time(NULL);
+  snprintf(op->title_id, sizeof(op->title_id), "%s", title_id);
+  snprintf(op->display_name, sizeof(op->display_name), "%s",
+           display_name ? display_name : title_id);
+  return op;
+}
+
 static int
 enqueue_action(const http_request_t *req, gc_action_t action) {
   char title_id[64];
@@ -6680,18 +6806,11 @@ enqueue_action(const http_request_t *req, gc_action_t action) {
   int uncompress_to_internal = 0;
   int compress_to_internal = 0;
 
-  if(!websrv_get_query_arg(req, "titleId", title_id, sizeof(title_id)) ||
-     !valid_title_id(title_id)) {
-    return serve_error(req, 400, "bad titleId");
-  }
-  int source_rc = get_required_source_path_arg(req, source_path_arg,
+  const char *arg_err = read_title_source_args(req, title_id,
+                                               sizeof(title_id),
+                                               source_path_arg,
                                                sizeof(source_path_arg));
-  if(source_rc == -2) {
-    return serve_error(req, 400, "sourcePath required");
-  }
-  if(source_rc != 0) {
-    return serve_error(req, 400, "bad source path");
-  }
+  if(arg_err) return serve_error(req, 400, arg_err);
   memset(&game, 0, sizeof(game));
   snprintf(game.title_id, sizeof(game.title_id), "%s", title_id);
   snprintf(game.name, sizeof(game.name), "%s", title_id);
@@ -6915,25 +7034,10 @@ enqueue_action(const http_request_t *req, gc_action_t action) {
     }
   }
   pthread_mutex_lock(&g_gc_lock);
-  if(active_op_for_title_locked(title_id) || pending_op_for_title_locked(title_id)) {
-    pthread_mutex_unlock(&g_gc_lock);
-    return serve_error(req, 409, "action already running for this game");
-  }
-  gc_operation_t *op = alloc_op_locked();
-  if(!op) {
-    pthread_mutex_unlock(&g_gc_lock);
-    return serve_error(req, 409, "history is full");
-  }
-  memset(op, 0, sizeof(*op));
-  op->used = 1;
-  op->seq = g_next_seq++;
-  snprintf(op->id, sizeof(op->id), "op-%llu",
-           (unsigned long long)op->seq);
-  op->action = action;
-  op->status = GC_OP_QUEUED;
-  op->created_at = time(NULL);
-  snprintf(op->title_id, sizeof(op->title_id), "%s", title_id);
-  snprintf(op->display_name, sizeof(op->display_name), "%s", game.name);
+  int response = 0;
+  gc_operation_t *op = alloc_queued_operation_locked(req, title_id, action,
+                                                     game.name, &response);
+  if(!op) return response;
   snprintf(op->source_path, sizeof(op->source_path), "%s", game.source_path);
   op->output_path[0] = 0;
   snprintf(op->source_kind, sizeof(op->source_kind), "%s",
@@ -6945,26 +7049,10 @@ enqueue_action(const http_request_t *req, gc_action_t action) {
 	           compression_profile_or_default(compression_profile));
 	  snprintf(op->stream_order, sizeof(op->stream_order), "%s", stream_order);
 	  op->stream_budget_bytes = stream_budget_bytes;
-	  snprintf(op->target_root, sizeof(op->target_root), "%s", target_root);
+  snprintf(op->target_root, sizeof(op->target_root), "%s", target_root);
   snprintf(op->preserve_original, sizeof(op->preserve_original), "%s",
            preserve_original);
-  append_operation_logs(op);
-  start_next_locked();
-  gc_op_status_t status = op->status;
-  char id[32];
-  snprintf(id, sizeof(id), "%s", op->id);
-  pthread_mutex_unlock(&g_gc_lock);
-
-  json_buf_t b = {0};
-  if(json_append(&b, "{\"ok\":true,\"id\":") != 0 ||
-     json_string(&b, id) != 0 ||
-     json_append(&b, ",\"status\":") != 0 ||
-     json_string(&b, status_name(status)) != 0 ||
-     json_append(&b, "}") != 0) {
-    free(b.data);
-    return -1;
-  }
-  return serve_owned(req, 200, b.data, b.len);
+  return enqueue_start_response_locked(req, op);
 }
 
 static const char *
@@ -7126,24 +7214,14 @@ enqueue_move_action(const http_request_t *req, gc_action_t action) {
   char target_root[1024] = "";
   int copy_only = transfer_action_copy_only(action);
 
-  if(!websrv_get_query_arg(req, "titleId", title_id, sizeof(title_id)) ||
-     !valid_title_id(title_id)) {
-    return serve_error(req, 400, "bad titleId");
-  }
-  int source_rc = get_required_source_path_arg(req, source_path_arg,
+  const char *arg_err = read_title_source_args(req, title_id,
+                                               sizeof(title_id),
+                                               source_path_arg,
                                                sizeof(source_path_arg));
-  if(source_rc == -2) {
-    return serve_error(req, 400, "sourcePath required");
-  }
-  if(source_rc != 0) {
-    return serve_error(req, 400, "bad source path");
-  }
-  pthread_mutex_lock(&g_gc_lock);
-  if(active_op_for_title_locked(title_id) || pending_op_for_title_locked(title_id)) {
-    pthread_mutex_unlock(&g_gc_lock);
+  if(arg_err) return serve_error(req, 400, arg_err);
+  if(title_operation_busy(title_id)) {
     return serve_error(req, 409, "action already running for this game");
   }
-  pthread_mutex_unlock(&g_gc_lock);
   if(transfer_action_to_external(action)) {
     const gc_storage_target_def_t *def;
     if(!websrv_get_query_arg(req, "usbId", usb_id, sizeof(usb_id)) ||
@@ -7166,25 +7244,10 @@ enqueue_move_action(const http_request_t *req, gc_action_t action) {
   }
 
   pthread_mutex_lock(&g_gc_lock);
-  if(active_op_for_title_locked(title_id) || pending_op_for_title_locked(title_id)) {
-    pthread_mutex_unlock(&g_gc_lock);
-    return serve_error(req, 409, "action already running for this game");
-  }
-  gc_operation_t *op = alloc_op_locked();
-  if(!op) {
-    pthread_mutex_unlock(&g_gc_lock);
-    return serve_error(req, 409, "history is full");
-  }
-  memset(op, 0, sizeof(*op));
-  op->used = 1;
-  op->seq = g_next_seq++;
-  snprintf(op->id, sizeof(op->id), "op-%llu",
-           (unsigned long long)op->seq);
-  op->action = action;
-  op->status = GC_OP_QUEUED;
-  op->created_at = time(NULL);
-  snprintf(op->title_id, sizeof(op->title_id), "%s", title_id);
-  snprintf(op->display_name, sizeof(op->display_name), "%s", title_id);
+  int response = 0;
+  gc_operation_t *op = alloc_queued_operation_locked(req, title_id, action,
+                                                     title_id, &response);
+  if(!op) return response;
   snprintf(op->source_path, sizeof(op->source_path), "%s", source_path_arg);
   snprintf(op->source_kind, sizeof(op->source_kind), "%s",
            source_kind_name_from_path(source_path_arg));
@@ -7194,23 +7257,7 @@ enqueue_move_action(const http_request_t *req, gc_action_t action) {
     snprintf(op->delete_policy, sizeof(op->delete_policy), "%s", "keep");
   }
   snprintf(op->target_root, sizeof(op->target_root), "%s", target_root);
-  append_operation_logs(op);
-  start_next_locked();
-  gc_op_status_t status = op->status;
-  char id[32];
-  snprintf(id, sizeof(id), "%s", op->id);
-  pthread_mutex_unlock(&g_gc_lock);
-
-  json_buf_t b = {0};
-  if(json_append(&b, "{\"ok\":true,\"id\":") != 0 ||
-     json_string(&b, id) != 0 ||
-     json_append(&b, ",\"status\":") != 0 ||
-     json_string(&b, status_name(status)) != 0 ||
-     json_append(&b, "}") != 0) {
-    free(b.data);
-    return -1;
-  }
-  return serve_owned(req, 200, b.data, b.len);
+  return enqueue_start_response_locked(req, op);
 }
 
 static int
@@ -7222,76 +7269,33 @@ enqueue_delete_game_data_action(const http_request_t *req) {
   if(strcmp(req->method, "POST")) {
     return serve_error(req, 405, "method not allowed");
   }
-  if(!websrv_get_query_arg(req, "titleId", title_id, sizeof(title_id)) ||
-     !valid_title_id(title_id)) {
-    return serve_error(req, 400, "bad titleId");
-  }
-  int source_rc = get_required_source_path_arg(req, source_path_arg,
+  const char *arg_err = read_title_source_args(req, title_id,
+                                               sizeof(title_id),
+                                               source_path_arg,
                                                sizeof(source_path_arg));
-  if(source_rc == -2) {
-    return serve_error(req, 400, "sourcePath required");
-  }
-  if(source_rc != 0) {
-    return serve_error(req, 400, "bad source path");
-  }
+  if(arg_err) return serve_error(req, 400, arg_err);
   if(!websrv_get_query_arg(req, "confirm", confirm_arg,
                            sizeof(confirm_arg)) ||
      strcmp(confirm_arg, "delete")) {
     return serve_error(req, 400, "delete confirmation is required");
   }
 
-  pthread_mutex_lock(&g_gc_lock);
-  if(active_op_for_title_locked(title_id) ||
-     pending_op_for_title_locked(title_id)) {
-    pthread_mutex_unlock(&g_gc_lock);
+  if(title_operation_busy(title_id)) {
     return serve_error(req, 409, "action already running for this game");
   }
-  pthread_mutex_unlock(&g_gc_lock);
 
   pthread_mutex_lock(&g_gc_lock);
-  if(active_op_for_title_locked(title_id) ||
-     pending_op_for_title_locked(title_id)) {
-    pthread_mutex_unlock(&g_gc_lock);
-    return serve_error(req, 409, "action already running for this game");
-  }
-  gc_operation_t *op = alloc_op_locked();
-  if(!op) {
-    pthread_mutex_unlock(&g_gc_lock);
-    return serve_error(req, 409, "history is full");
-  }
-  memset(op, 0, sizeof(*op));
-  op->used = 1;
-  op->seq = g_next_seq++;
-  snprintf(op->id, sizeof(op->id), "op-%llu",
-           (unsigned long long)op->seq);
-  op->action = GC_ACTION_DELETE_GAME_DATA;
-  op->status = GC_OP_QUEUED;
-  op->created_at = time(NULL);
-  snprintf(op->title_id, sizeof(op->title_id), "%s", title_id);
-  snprintf(op->display_name, sizeof(op->display_name), "%s", title_id);
+  int response = 0;
+  gc_operation_t *op = alloc_queued_operation_locked(
+      req, title_id, GC_ACTION_DELETE_GAME_DATA, title_id, &response);
+  if(!op) return response;
   snprintf(op->source_path, sizeof(op->source_path), "%s", source_path_arg);
   snprintf(op->output_path, sizeof(op->output_path), "%s", source_path_arg);
   snprintf(op->source_kind, sizeof(op->source_kind), "%s",
            source_kind_name_from_path(source_path_arg));
   snprintf(op->format, sizeof(op->format), "%s", "none");
   snprintf(op->delete_policy, sizeof(op->delete_policy), "%s", "delete");
-  append_operation_logs(op);
-  start_next_locked();
-  gc_op_status_t status = op->status;
-  char id[32];
-  snprintf(id, sizeof(id), "%s", op->id);
-  pthread_mutex_unlock(&g_gc_lock);
-
-  json_buf_t b = {0};
-  if(json_append(&b, "{\"ok\":true,\"id\":") != 0 ||
-     json_string(&b, id) != 0 ||
-     json_append(&b, ",\"status\":") != 0 ||
-     json_string(&b, status_name(status)) != 0 ||
-     json_append(&b, "}") != 0) {
-    free(b.data);
-    return -1;
-  }
-  return serve_owned(req, 200, b.data, b.len);
+  return enqueue_start_response_locked(req, op);
 }
 
 static int
@@ -7302,70 +7306,27 @@ enqueue_read_speed_test_action(const http_request_t *req) {
   if(strcmp(req->method, "POST")) {
     return serve_error(req, 405, "method not allowed");
   }
-  if(!websrv_get_query_arg(req, "titleId", title_id, sizeof(title_id)) ||
-     !valid_title_id(title_id)) {
-    return serve_error(req, 400, "bad titleId");
-  }
-  int source_rc = get_required_source_path_arg(req, source_path_arg,
+  const char *arg_err = read_title_source_args(req, title_id,
+                                               sizeof(title_id),
+                                               source_path_arg,
                                                sizeof(source_path_arg));
-  if(source_rc == -2) {
-    return serve_error(req, 400, "sourcePath required");
-  }
-  if(source_rc != 0) {
-    return serve_error(req, 400, "bad source path");
+  if(arg_err) return serve_error(req, 400, arg_err);
+
+  if(title_operation_busy(title_id)) {
+    return serve_error(req, 409, "action already running for this game");
   }
 
   pthread_mutex_lock(&g_gc_lock);
-  if(active_op_for_title_locked(title_id) ||
-     pending_op_for_title_locked(title_id)) {
-    pthread_mutex_unlock(&g_gc_lock);
-    return serve_error(req, 409, "action already running for this game");
-  }
-  pthread_mutex_unlock(&g_gc_lock);
-
-  pthread_mutex_lock(&g_gc_lock);
-  if(active_op_for_title_locked(title_id) ||
-     pending_op_for_title_locked(title_id)) {
-    pthread_mutex_unlock(&g_gc_lock);
-    return serve_error(req, 409, "action already running for this game");
-  }
-  gc_operation_t *op = alloc_op_locked();
-  if(!op) {
-    pthread_mutex_unlock(&g_gc_lock);
-    return serve_error(req, 409, "history is full");
-  }
-  memset(op, 0, sizeof(*op));
-  op->used = 1;
-  op->seq = g_next_seq++;
-  snprintf(op->id, sizeof(op->id), "op-%llu",
-           (unsigned long long)op->seq);
-  op->action = GC_ACTION_READ_SPEED_TEST;
-  op->status = GC_OP_QUEUED;
-  op->created_at = time(NULL);
-  snprintf(op->title_id, sizeof(op->title_id), "%s", title_id);
-  snprintf(op->display_name, sizeof(op->display_name), "%s", title_id);
+  int response = 0;
+  gc_operation_t *op = alloc_queued_operation_locked(
+      req, title_id, GC_ACTION_READ_SPEED_TEST, title_id, &response);
+  if(!op) return response;
   snprintf(op->source_path, sizeof(op->source_path), "%s", source_path_arg);
   snprintf(op->source_kind, sizeof(op->source_kind), "%s",
            source_kind_name_from_path(source_path_arg));
   snprintf(op->format, sizeof(op->format), "%s", "read");
   snprintf(op->delete_policy, sizeof(op->delete_policy), "%s", "none");
-  append_operation_logs(op);
-  start_next_locked();
-  gc_op_status_t status = op->status;
-  char id[32];
-  snprintf(id, sizeof(id), "%s", op->id);
-  pthread_mutex_unlock(&g_gc_lock);
-
-  json_buf_t b = {0};
-  if(json_append(&b, "{\"ok\":true,\"id\":") != 0 ||
-     json_string(&b, id) != 0 ||
-     json_append(&b, ",\"status\":") != 0 ||
-     json_string(&b, status_name(status)) != 0 ||
-     json_append(&b, "}") != 0) {
-    free(b.data);
-    return -1;
-  }
-  return serve_owned(req, 200, b.data, b.len);
+  return enqueue_start_response_locked(req, op);
 }
 
 static int
@@ -7399,106 +7360,7 @@ bad_blocks_request(const http_request_t *req) {
 
 static int
 append_op_summary(json_buf_t *b, const gc_operation_t *op) {
-  uint64_t bad_blocks_found = op->bad_blocks_found;
-  uint64_t hash_mismatched_blocks = op->hash_mismatched_blocks;
-  uint64_t software_compared_blocks = op->software_compared_blocks;
-  if(op->status == GC_OP_SUCCESS && op->repaired_blocks > 0) {
-    bad_blocks_found = 0;
-    software_compared_blocks = 0;
-  }
-  int ok = json_append(b, "{\"id\":") == 0 &&
-      json_string(b, op->id) == 0 &&
-      json_append(b, ",\"titleId\":") == 0 &&
-      json_string(b, op->title_id) == 0 &&
-      json_append(b, ",\"displayName\":") == 0 &&
-      json_string(b, op->display_name) == 0 &&
-      json_append(b, ",\"action\":") == 0 &&
-      json_string(b, action_name(op->action)) == 0 &&
-      json_append(b, ",\"status\":") == 0 &&
-      json_string(b, status_name(op->status)) == 0 &&
-      json_append(b, ",\"phase\":") == 0 &&
-      json_string(b, op->phase) == 0 &&
-      json_append(b, ",\"result\":") == 0 &&
-      json_string(b, op->result) == 0 &&
-      json_append(b, ",\"error\":") == 0 &&
-      json_string(b, op->error) == 0 &&
-      json_append(b, ",\"sourcePath\":") == 0 &&
-      json_string(b, op->source_path) == 0 &&
-      json_append(b, ",\"outputPath\":") == 0 &&
-      json_string(b, op->output_path) == 0 &&
-      json_append(b, ",\"sourceKind\":") == 0 &&
-      json_string(b, op->source_kind) == 0 &&
-      json_append(b, ",\"format\":") == 0 &&
-      json_string(b, op->format) == 0 &&
-      json_append(b, ",\"deletePolicy\":") == 0 &&
-      json_string(b, op->delete_policy) == 0 &&
-      json_append(b, ",\"compressionProfile\":") == 0 &&
-      json_string(b, compression_profile_or_default(op->compression_profile)) == 0 &&
-      json_append(b, ",\"streamOrder\":") == 0 &&
-      json_string(b, op->stream_order[0] ? op->stream_order : "budgeted-gain") == 0 &&
-	      json_append(b, ",\"targetRoot\":") == 0 &&
-	      json_string(b, op->target_root) == 0 &&
-	      json_append(b, ",\"preserveOriginal\":") == 0 &&
-	      json_string(b, op->preserve_original) == 0 &&
-	      json_append(b, ",\"preservedOriginalPath\":") == 0 &&
-	      json_string(b, op->preserved_original_path) == 0 &&
-	      json_append(b, ",\"preservedHiddenPath\":") == 0 &&
-	      json_string(b, op->preserved_hidden_path) == 0 &&
-	      json_append(b, ",\"repairSummary\":") == 0 &&
-	      json_string(b, op->repair_summary) == 0 &&
-	      json_append(b, ",\"readRoot\":") == 0 &&
-	      json_string(b, op->read_root) == 0 &&
-	      json_append(b, ",\"readStorage\":") == 0 &&
-	      json_string(b, op->read_storage) == 0 &&
-	      json_append(b, ",\"readFirstErrorPath\":") == 0 &&
-	      json_string(b, op->read_first_error_path) == 0 &&
-	      json_append(b, ",\"readFirstError\":") == 0 &&
-	      json_string(b, op->read_first_error) == 0 &&
-	      json_appendf(b,
-			                   ",\"streamBudgetBytes\":%llu,"
-			                   "\"compressionSourceSize\":%llu,"
-			                   "\"compressedSize\":%llu,"
-			                   "\"savedBytes\":%llu,"
-                         "\"scanBytes\":%llu,\"scanFiles\":%llu,"
-                         "\"scanDirs\":%llu,\"scanEntries\":%llu,"
-                         "\"scanElapsedMs\":%llu,\"scanWorkers\":%llu,"
-			                   "\"readBytes\":%llu,\"readFiles\":%llu,"
-		                   "\"readDirs\":%llu,\"readElapsedMs\":%llu,"
-		                   "\"readAvgBps\":%llu,\"readMinBps\":%llu,"
-		                   "\"readMaxBps\":%llu,\"readErrors\":%llu,"
-		                   "\"readSkipped\":%llu,"
-		                   "\"createdAt\":%ld,\"startedAt\":%ld,\"endedAt\":%ld,"
-		                   "\"repairedBlocks\":%llu,\"badBlocksFound\":%llu,"
-		                   "\"hashCheckedBlocks\":%llu,"
-	                   "\"hashMismatchedBlocks\":%llu,"
-	                   "\"softwareComparedBlocks\":%llu}",
-	                   (unsigned long long)op->stream_budget_bytes,
-			                   (unsigned long long)op->compression_source_size,
-			                   (unsigned long long)op->compressed_size,
-			                   (unsigned long long)op->saved_bytes,
-                         (unsigned long long)op->scan_bytes,
-                         (unsigned long long)op->scan_files,
-                         (unsigned long long)op->scan_dirs,
-                         (unsigned long long)op->scan_entries,
-                         (unsigned long long)op->scan_elapsed_ms,
-                         (unsigned long long)op->scan_workers,
-			                   (unsigned long long)op->read_bytes,
-		                   (unsigned long long)op->read_files,
-		                   (unsigned long long)op->read_dirs,
-		                   (unsigned long long)op->read_elapsed_ms,
-		                   (unsigned long long)op->read_avg_bps,
-		                   (unsigned long long)op->read_min_bps,
-		                   (unsigned long long)op->read_max_bps,
-		                   (unsigned long long)op->read_errors,
-		                   (unsigned long long)op->read_skipped,
-		                   (long)op->created_at, (long)op->started_at,
-	                   (long)op->ended_at,
-                   (unsigned long long)op->repaired_blocks,
-                   (unsigned long long)bad_blocks_found,
-                   (unsigned long long)op->hash_checked_blocks,
-                   (unsigned long long)hash_mismatched_blocks,
-                   (unsigned long long)software_compared_blocks) == 0;
-  return ok ? 0 : -1;
+  return append_operation_json(b, op, op->id, 0);
 }
 
 static int

@@ -66,7 +66,7 @@ on_ready(unsigned short port, void *arg) {
   detect_lan_ip(ip, sizeof(ip));
   gc_checkpoint("web server ready");
   gc_log("web ui ready http://%s:%u/", ip, (unsigned)port);
-  gc_launcher_start(ip);
+  gc_launcher_start();
 }
 
 static int

@@ -3,6 +3,6 @@
 
 #define GAME_COMPRESSOR_LAUNCHER_TITLE_ID "PSGC50001"
 
-int gc_launcher_start(const char *ip);
+int gc_launcher_start(void);
 
 #endif

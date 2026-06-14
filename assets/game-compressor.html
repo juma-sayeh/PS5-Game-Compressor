@@ -77,8 +77,7 @@
       cursor: pointer;
     }
 
-    .icon-btn svg,
-    .status-dot svg {
+    .icon-btn svg {
       width: 20px;
       height: 20px;
       stroke: currentColor;
@@ -676,10 +675,6 @@
       text-align: left;
       font-variant-numeric: tabular-nums;
       font-feature-settings: "tnum" 1;
-    }
-
-    .progress-percent.is-empty {
-      color: #6b7280;
     }
 
     .progress-times {
@@ -1748,8 +1743,7 @@
         </div>
         <div class="format-section-title">Destination</div>
         <div class="format-grid">
-          <button class="format-row is-default-choice" type="button" data-uncompress-destination="inplace"
-            id="uncompress-inplace-row">
+          <button class="format-row is-default-choice" type="button" data-uncompress-destination="inplace">
             <div>
               <div class="history-title">In place</div>
               <div class="history-meta" id="uncompress-inplace-meta">Write next to the compressed image</div>
@@ -3575,7 +3569,7 @@
         ? operationVisual(g.activeOp, job)
         : { label: 'Running', className: 'run' };
       box.classList.remove('is-compressing', 'is-closing', 'is-mounting', 'is-validating', 'is-repacking',
-        'is-moving', 'is-reading', 'is-finalizing', 'is-unpacking', 'is-restoring', 'is-run');
+        'is-moving', 'is-reading', 'is-deleting', 'is-finalizing', 'is-unpacking', 'is-restoring', 'is-run');
       box.classList.add('is-' + visual.className);
       if (label) {
         label.textContent = visual.label;

@@ -9,6 +9,7 @@
 
 #define SCE_NOTIFICATION_LOCAL_USER_ID_SYSTEM 0xFE
 
+#include "gc_json_escape.h"
 #include "gc_notify.h"
 
 #define GC_NOTIFY_APP_TITLE "Game Compressor"
@@ -160,36 +161,6 @@ compact_text(char *out, size_t out_size, const char *in, size_t max_chars) {
   out[pos] = 0;
 }
 
-static void
-toast_escape(char *out, size_t out_size, const char *in) {
-  size_t pos = 0;
-  if(out_size == 0) return;
-  out[0] = 0;
-  for(const unsigned char *p = (const unsigned char *)(in ? in : "");
-      *p && pos + 7 < out_size; p++) {
-    if(*p == '"' || *p == '\\') {
-      out[pos++] = '\\';
-      out[pos++] = (char)*p;
-    } else if(*p == '\n') {
-      out[pos++] = '\\';
-      out[pos++] = 'n';
-    } else if(*p == '\r') {
-      out[pos++] = '\\';
-      out[pos++] = 'r';
-    } else if(*p == '\t') {
-      out[pos++] = '\\';
-      out[pos++] = 't';
-    } else if(*p < 0x20) {
-      int n = snprintf(out + pos, out_size - pos, "\\u%04x", *p);
-      if(n < 0 || (size_t)n >= out_size - pos) break;
-      pos += (size_t)n;
-    } else {
-      out[pos++] = (char)*p;
-    }
-  }
-  out[pos] = 0;
-}
-
 static int
 gc_notify_debug(const char *message, const char *submessage) {
   notify_request_t req;
@@ -216,10 +187,10 @@ gc_notify_toast(const char *message, const char *submessage) {
   char escaped_submessage[1024];
   int n;
 
-  toast_escape(escaped_message, sizeof(escaped_message),
-               message ? message : GC_NOTIFY_APP_TITLE);
-  toast_escape(escaped_submessage, sizeof(escaped_submessage),
-               submessage ? submessage : "");
+  gc_json_escape_small(escaped_message, sizeof(escaped_message),
+                       message ? message : GC_NOTIFY_APP_TITLE);
+  gc_json_escape_small(escaped_submessage, sizeof(escaped_submessage),
+                       submessage ? submessage : "");
   n = snprintf(payload, sizeof(payload),
                "{"
                "\"rawData\":{"

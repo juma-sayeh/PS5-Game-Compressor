@@ -151,8 +151,3 @@ gc_checkpoint(const char *checkpoint) {
   pthread_mutex_unlock(&g_diag_lock);
   gc_log("checkpoint=%s", checkpoint ? checkpoint : "unknown");
 }
-
-const char *
-gc_diag_checkpoint(void) {
-  return g_checkpoint;
-}

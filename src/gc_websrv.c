@@ -18,8 +18,8 @@
 #include <sys/socket.h>
 
 #include "asset.h"
-#include "gc_diag.h"
 #include "gc_api.h"
+#include "gc_json_escape.h"
 #include "websrv.h"
 
 #define HEADER_MAX 65536
@@ -31,21 +31,6 @@ static int             g_websrv_srvfd = -1;
 static pthread_mutex_t g_websrv_lock = PTHREAD_MUTEX_INITIALIZER;
 static volatile sig_atomic_t g_websrv_exit_requested = 0;
 static time_t          g_started_at = 0;
-static gc_launcher_diag_t g_launcher_diag = {
-  .launcher_enabled = 1,
-  .launcher_attempted = 0,
-  .appinst_init_rc = GC_DIAG_SKIPPED,
-  .title_dir_resolved = 0,
-  .install_title_dir_resolved = 0,
-  .install_title_rc = GC_DIAG_SKIPPED,
-  .uninstall_resolved = 0,
-  .uninstall_rc = GC_DIAG_SKIPPED,
-  .install_all_resolved = 0,
-  .install_all_rc = GC_DIAG_SKIPPED,
-  .user_app_writable = -1,
-  .launcher_install_rc = -1,
-  .launcher_final_state = "deferred",
-};
 
 static const char *
 status_text(int status) {
@@ -61,17 +46,6 @@ status_text(int status) {
   case 500: return "Internal Server Error";
   default:  return "OK";
   }
-}
-
-static const char *
-json_bool(int value) {
-  return value ? "true" : "false";
-}
-
-static const char *
-json_tristate(int value) {
-  if(value < 0) return "null";
-  return value ? "true" : "false";
 }
 
 static int
@@ -127,41 +101,11 @@ websrv_send_text(int fd, int status, const char *mime, const char *body) {
                      body ? strlen(body) : 0);
 }
 
-static void
-json_escape_small(char *out, size_t out_size, const char *message) {
-  size_t pos = 0;
-  if(out_size == 0) return;
-  out[0] = 0;
-  for(const unsigned char *p = (const unsigned char *)(message ? message : "");
-      *p && pos + 7 < out_size; p++) {
-    if(*p == '"' || *p == '\\') {
-      out[pos++] = '\\';
-      out[pos++] = (char)*p;
-    } else if(*p == '\n') {
-      out[pos++] = '\\';
-      out[pos++] = 'n';
-    } else if(*p == '\r') {
-      out[pos++] = '\\';
-      out[pos++] = 'r';
-    } else if(*p == '\t') {
-      out[pos++] = '\\';
-      out[pos++] = 't';
-    } else if(*p < 0x20) {
-      int n = snprintf(out + pos, out_size - pos, "\\u%04x", *p);
-      if(n < 0 || (size_t)n >= out_size - pos) break;
-      pos += (size_t)n;
-    } else {
-      out[pos++] = (char)*p;
-    }
-  }
-  out[pos] = 0;
-}
-
 int
 websrv_send_error_json(int fd, int status, const char *message) {
   char escaped[512];
   char body[640];
-  json_escape_small(escaped, sizeof(escaped), message);
+  gc_json_escape_small(escaped, sizeof(escaped), message);
   snprintf(body, sizeof(body), "{\"ok\":false,\"error\":\"%s\"}", escaped);
   return websrv_send_text(fd, status, "application/json", body);
 }
@@ -226,15 +170,6 @@ websrv_request_exit(void) {
   if(srvfd >= 0) close(srvfd);
 }
 
-void
-websrv_set_launcher_diag(const gc_launcher_diag_t *diag) {
-  if(!diag) return;
-
-  pthread_mutex_lock(&g_websrv_lock);
-  g_launcher_diag = *diag;
-  pthread_mutex_unlock(&g_websrv_lock);
-}
-
 static int
 status_request(const http_request_t *req) {
   char body[512];
@@ -258,73 +193,6 @@ status_request(const http_request_t *req) {
                    );
   if(n < 0 || (size_t)n >= sizeof(body)) {
     return websrv_send_error_json(req->fd, 500, "status too large");
-  }
-  return websrv_send(req->fd, 200, "application/json", body, (size_t)n);
-}
-
-static int
-diag_request(const http_request_t *req) {
-  char checkpoint[192];
-  char launcher_final[64];
-  char body[2048];
-  gc_launcher_diag_t launcher;
-
-  pthread_mutex_lock(&g_websrv_lock);
-  launcher = g_launcher_diag;
-  pthread_mutex_unlock(&g_websrv_lock);
-
-  json_escape_small(checkpoint, sizeof(checkpoint), gc_diag_checkpoint());
-  json_escape_small(launcher_final, sizeof(launcher_final),
-                    launcher.launcher_final_state);
-  int n = snprintf(body, sizeof(body),
-                   "{\"ok\":true,\"app\":\"Game Compressor\","
-                   "\"checkpoint\":\"%s\","
-                   "\"launcher\":{"
-                   "\"launcher_enabled\":%s,"
-                   "\"launcher_attempted\":%s,"
-                   "\"appinst_init_rc\":%d,"
-                   "\"title_dir_resolved\":%s,"
-                   "\"install_title_dir_resolved\":%s,"
-                   "\"install_title_rc\":%d,"
-                   "\"uninstall_resolved\":%s,"
-                   "\"uninstall_rc\":%d,"
-                   "\"install_all_resolved\":%s,"
-                   "\"install_all_rc\":%d,"
-                   "\"user_app_writable\":%s,"
-                   "\"launcher_install_rc\":%d,"
-                   "\"launcher_final_state\":\"%s\"},"
-                   "\"routes\":[\"/\",\"/api/status\",\"/api/diag\","
-                   "\"/api/control/shutdown\","
-                   "\"/api/control/handoff-state\","
-                   "\"/api/control/handoff-shutdown\","
-                   "\"/api/gc/games\",\"/api/gc/usb\","
-		                   "\"/api/gc/history\",\"/api/gc/job\","
-		                   "\"/api/gc/job/cancel\",\"/api/gc/queue/cancel\","
-		                   "\"/api/gc/bad-blocks\","
-		                   "\"/api/gc/uncompress-plan\","
-		                   "\"/api/gc/compress\",\"/api/gc/uncompress\","
-	                   "\"/api/gc/validate-repair\",\"/api/gc/validate-only\","
-	                   "\"/api/gc/refresh-mount\","
-                   "\"/api/gc/move-to-usb\","
-                   "\"/api/gc/move-to-internal\","
-	                   "\"/api/gc/delete-game-data\","
-	                   "\"/api/gc/read-speed-test\"]}",
-                   checkpoint,
-                   json_bool(launcher.launcher_enabled),
-                   json_bool(launcher.launcher_attempted),
-                   launcher.appinst_init_rc,
-                   json_bool(launcher.title_dir_resolved),
-                   json_bool(launcher.install_title_dir_resolved),
-                   launcher.install_title_rc,
-                   json_bool(launcher.uninstall_resolved),
-                   launcher.uninstall_rc,
-                   json_bool(launcher.install_all_resolved),
-                   launcher.install_all_rc,
-                   json_tristate(launcher.user_app_writable),
-                   launcher.launcher_install_rc,
-                   launcher_final);
-  if(n < 0 || (size_t)n >= sizeof(body)) {
-    return websrv_send_error_json(req->fd, 500, "diag too large");
   }
   return websrv_send(req->fd, 200, "application/json", body, (size_t)n);
 }
@@ -370,11 +238,8 @@ dispatch_request(const http_request_t *req) {
     if(!strcmp(req->path, "/") || !strcmp(req->path, "/index.html")) {
       return asset_request(req, "/game-compressor.html");
     }
-    if(!strcmp(req->path, "/api/status") || !strcmp(req->path, "/api/version")) {
+    if(!strcmp(req->path, "/api/status")) {
       return status_request(req);
-    }
-    if(!strcmp(req->path, "/api/diag")) {
-      return diag_request(req);
     }
     if(!strcmp(req->path, "/api/control/shutdown")) {
       return shutdown_request(req);

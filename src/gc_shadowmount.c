@@ -70,6 +70,30 @@ mkdir_if_needed(const char *path) {
   return -1;
 }
 
+static int
+replace_shadowmount_temp(FILE **out, const char *tmp_path,
+                         const char *final_path, const char *flush_context,
+                         const char *close_context,
+                         const char *replace_context,
+                         char *err, size_t err_size) {
+  if(fflush(*out) != 0 || fsync(fileno(*out)) != 0) {
+    set_errno_err(err, err_size, flush_context);
+    return -1;
+  }
+  if(fclose(*out) != 0) {
+    *out = NULL;
+    set_errno_err(err, err_size, close_context);
+    return -1;
+  }
+  *out = NULL;
+  if(rename(tmp_path, final_path) != 0) {
+    set_errno_err(err, err_size, replace_context);
+    return -1;
+  }
+  chmod(final_path, 0666);
+  return 0;
+}
+
 static const char *
 base_name(const char *path) {
   const char *slash = strrchr(path ? path : "", '/');
@@ -433,21 +457,14 @@ upsert_image_mode_hint(const char *path_or_name, int read_only,
     set_errno_err(err, err_size, "append ShadowMount image mode hint");
     goto done;
   }
-  if(fflush(out) != 0 || fsync(fileno(out)) != 0) {
-    set_errno_err(err, err_size, "flush ShadowMount config");
+  if(replace_shadowmount_temp(&out, SHADOWMOUNT_CONFIG_TMP,
+                              SHADOWMOUNT_CONFIG,
+                              "flush ShadowMount config",
+                              "close ShadowMount config temp",
+                              "replace ShadowMount config",
+                              err, err_size) != 0) {
     goto done;
   }
-  if(fclose(out) != 0) {
-    out = NULL;
-    set_errno_err(err, err_size, "close ShadowMount config temp");
-    goto done;
-  }
-  out = NULL;
-  if(rename(SHADOWMOUNT_CONFIG_TMP, SHADOWMOUNT_CONFIG) != 0) {
-    set_errno_err(err, err_size, "replace ShadowMount config");
-    goto done;
-  }
-  chmod(SHADOWMOUNT_CONFIG, 0666);
   rc = 0;
 
 done:
@@ -502,21 +519,14 @@ remove_image_mode_hint(const char *path_or_name, char *err, size_t err_size) {
     set_errno_err(err, err_size, "read ShadowMount config");
     goto done;
   }
-  if(fflush(out) != 0 || fsync(fileno(out)) != 0) {
-    set_errno_err(err, err_size, "flush ShadowMount config");
+  if(replace_shadowmount_temp(&out, SHADOWMOUNT_CONFIG_TMP,
+                              SHADOWMOUNT_CONFIG,
+                              "flush ShadowMount config",
+                              "close ShadowMount config temp",
+                              "replace ShadowMount config",
+                              err, err_size) != 0) {
     goto done;
   }
-  if(fclose(out) != 0) {
-    out = NULL;
-    set_errno_err(err, err_size, "close ShadowMount config temp");
-    goto done;
-  }
-  out = NULL;
-  if(rename(SHADOWMOUNT_CONFIG_TMP, SHADOWMOUNT_CONFIG) != 0) {
-    set_errno_err(err, err_size, "replace ShadowMount config");
-    goto done;
-  }
-  chmod(SHADOWMOUNT_CONFIG, 0666);
   if(removed) sync();
   rc = 0;
 
@@ -592,21 +602,14 @@ upsert_sector_hint(const char *path_or_name, unsigned sector,
     set_errno_err(err, err_size, "append ShadowMount hint");
     goto done;
   }
-  if(fflush(out) != 0 || fsync(fileno(out)) != 0) {
-    set_errno_err(err, err_size, "flush ShadowMount autotune");
+  if(replace_shadowmount_temp(&out, SHADOWMOUNT_AUTOTUNE_TMP,
+                              SHADOWMOUNT_AUTOTUNE,
+                              "flush ShadowMount autotune",
+                              "close ShadowMount autotune temp",
+                              "replace ShadowMount autotune",
+                              err, err_size) != 0) {
     goto done;
   }
-  if(fclose(out) != 0) {
-    out = NULL;
-    set_errno_err(err, err_size, "close ShadowMount autotune temp");
-    goto done;
-  }
-  out = NULL;
-  if(rename(SHADOWMOUNT_AUTOTUNE_TMP, SHADOWMOUNT_AUTOTUNE) != 0) {
-    set_errno_err(err, err_size, "replace ShadowMount autotune");
-    goto done;
-  }
-  chmod(SHADOWMOUNT_AUTOTUNE, 0666);
   rc = 0;
 
 done:
@@ -661,21 +664,14 @@ remove_sector_hint(const char *path_or_name, char *err, size_t err_size) {
     set_errno_err(err, err_size, "read ShadowMount autotune");
     goto done;
   }
-  if(fflush(out) != 0 || fsync(fileno(out)) != 0) {
-    set_errno_err(err, err_size, "flush ShadowMount autotune");
+  if(replace_shadowmount_temp(&out, SHADOWMOUNT_AUTOTUNE_TMP,
+                              SHADOWMOUNT_AUTOTUNE,
+                              "flush ShadowMount autotune",
+                              "close ShadowMount autotune temp",
+                              "replace ShadowMount autotune",
+                              err, err_size) != 0) {
     goto done;
   }
-  if(fclose(out) != 0) {
-    out = NULL;
-    set_errno_err(err, err_size, "close ShadowMount autotune temp");
-    goto done;
-  }
-  out = NULL;
-  if(rename(SHADOWMOUNT_AUTOTUNE_TMP, SHADOWMOUNT_AUTOTUNE) != 0) {
-    set_errno_err(err, err_size, "replace ShadowMount autotune");
-    goto done;
-  }
-  chmod(SHADOWMOUNT_AUTOTUNE, 0666);
   if(removed) {
     sync();
   }

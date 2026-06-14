@@ -29,7 +29,9 @@
 #define PFSC_WINDOW_LOG(...) do { } while(0)
 #endif
 #include "pfs_compress.h"
+#include "pfs_fs_util.h"
 #include "pfs_io_policy.h"
+#include "pfs_job_util.h"
 #include "pfs_validate_hash.h"
 #include "transfer_internal.h"
 #include "exfat_upcase_standard.inc"
@@ -656,14 +658,6 @@ ceil_div_u64(uint64_t a, uint64_t b) {
 }
 
 static int
-ends_with_ci(const char *s, const char *suffix) {
-  size_t slen = s ? strlen(s) : 0;
-  size_t suffix_len = suffix ? strlen(suffix) : 0;
-  if(slen < suffix_len) return 0;
-  return strcasecmp(s + slen - suffix_len, suffix) == 0;
-}
-
-static int
 starts_with_ci(const char *s, const char *prefix) {
   size_t prefix_len = prefix ? strlen(prefix) : 0;
   if(!s || strlen(s) < prefix_len) return 0;
@@ -718,58 +712,12 @@ ascii_casecmp(const char *a, const char *b) {
 }
 
 static int
-path_segment_supported(const char *name) {
-  if(!name || !*name || !strcmp(name, ".") || !strcmp(name, "..")) return 0;
-  if(strlen(name) >= 256) return 0;
-  for(const unsigned char *p = (const unsigned char *)name; *p; p++) {
-    if(*p < 0x20 || *p >= 0x7f || *p == '/' || *p == '\\') return 0;
-  }
-  return 1;
-}
-
-static int
 title_id_safe(const char *title) {
   if(!title || !*title || strlen(title) >= 64) return 0;
   for(const unsigned char *p = (const unsigned char *)title; *p; p++) {
     if(!isalnum(*p) && *p != '_' && *p != '-') return 0;
   }
   return 1;
-}
-
-static int
-normalize_app_path(const char *path, char *out, size_t out_size) {
-  if(!path || path[0] != '/' || strstr(path, "..")) {
-    errno = EINVAL;
-    return -1;
-  }
-  size_t n = strlen(path);
-  while(n > 1 && path[n - 1] == '/') n--;
-  if(n == 0 || n >= out_size) {
-    errno = ENAMETOOLONG;
-    return -1;
-  }
-  memcpy(out, path, n);
-  out[n] = 0;
-  return 0;
-}
-
-static int
-path_parent_base(const char *path, char *parent, size_t parent_size,
-                 char *base, size_t base_size) {
-  const char *slash = strrchr(path ? path : "", '/');
-  if(!slash || !slash[1]) {
-    errno = EINVAL;
-    return -1;
-  }
-  size_t parent_len = slash == path ? 1 : (size_t)(slash - path);
-  if(parent_len >= parent_size || strlen(slash + 1) >= base_size) {
-    errno = ENAMETOOLONG;
-    return -1;
-  }
-  memcpy(parent, path, parent_len);
-  parent[parent_len] = 0;
-  snprintf(base, base_size, "%s", slash + 1);
-  return 0;
 }
 
 static int
@@ -819,34 +767,6 @@ pfs_compress_temp_output_path(const char *output_path, char *out,
     return -1;
   }
   return 0;
-}
-
-static int
-remove_tree_local(const char *path) {
-  struct stat st;
-  if(lstat(path, &st) != 0) {
-    if(errno == ENOENT) return 0;
-    return -1;
-  }
-  if(S_ISDIR(st.st_mode)) {
-    DIR *d = opendir(path);
-    if(!d) return -1;
-    int rc = 0;
-    struct dirent *ent;
-    while((ent = readdir(d))) {
-      if(!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) continue;
-      char child[1024];
-      if(join_abs(child, sizeof(child), path, ent->d_name) != 0 ||
-         remove_tree_local(child) != 0) {
-        rc = -1;
-        break;
-      }
-    }
-    closedir(d);
-    if(rc != 0) return -1;
-    return rmdir(path);
-  }
-  return unlink(path);
 }
 
 static int
@@ -912,33 +832,11 @@ rd64(const unsigned char *p) {
 }
 
 static int
-pwrite_all_local(int fd, const void *data, size_t size, off_t offset) {
+pwrite_all_local_impl(int fd, const void *data, size_t size, off_t offset,
+                      int cancelable) {
   const unsigned char *p = data;
   while(size > 0) {
-    size_t chunk = size > PFS_IO_SYSCALL_CHUNK_SIZE ?
-        PFS_IO_SYSCALL_CHUNK_SIZE : size;
-    ssize_t n = pwrite(fd, p, chunk, offset);
-    if(n < 0) {
-      if(errno == EINTR) continue;
-      return -1;
-    }
-    if(n == 0) {
-      errno = EIO;
-      return -1;
-    }
-    p += n;
-    size -= (size_t)n;
-    offset += n;
-  }
-  return 0;
-}
-
-static int
-pwrite_all_local_cancelable(int fd, const void *data, size_t size,
-                            off_t offset) {
-  const unsigned char *p = data;
-  while(size > 0) {
-    if(job_cancelled()) {
+    if(cancelable && job_cancelled()) {
       errno = EINTR;
       return -1;
     }
@@ -958,6 +856,17 @@ pwrite_all_local_cancelable(int fd, const void *data, size_t size,
     offset += n;
   }
   return 0;
+}
+
+static int
+pwrite_all_local(int fd, const void *data, size_t size, off_t offset) {
+  return pwrite_all_local_impl(fd, data, size, offset, 0);
+}
+
+static int
+pwrite_all_local_cancelable(int fd, const void *data, size_t size,
+                            off_t offset) {
+  return pwrite_all_local_impl(fd, data, size, offset, 1);
 }
 
 static int
@@ -985,9 +894,6 @@ write_all_local_cancelable(int fd, const void *data, size_t size) {
   return 0;
 }
 
-static uint64_t monotonic_us(void);
-static void cancel_poll_cond_wait(pthread_cond_t *cond,
-                                  pthread_mutex_t *lock);
 static void virtual_reader_close_file(virtual_reader_t *vr);
 static int virtual_reader_open_path(virtual_reader_t *vr, const char *path,
                                     ssize_t key, char *err,
@@ -2850,37 +2756,6 @@ destructive_stream_truncate_committed(int fd, uint64_t file_start,
   }
   if(destructive_stream_sync(ctx, err, err_size) != 0) return -1;
   return 0;
-}
-
-static uint64_t
-monotonic_us(void) {
-  struct timespec ts;
-#if defined(CLOCK_MONOTONIC)
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-#else
-  clock_gettime(CLOCK_REALTIME, &ts);
-#endif
-  return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
-}
-
-static void
-cancel_poll_cond_wait(pthread_cond_t *cond, pthread_mutex_t *lock) {
-  struct timespec ts;
-  clock_gettime(CLOCK_REALTIME, &ts);
-  ts.tv_nsec += 100000000L;
-  if(ts.tv_nsec >= 1000000000L) {
-    ts.tv_sec += ts.tv_nsec / 1000000000L;
-    ts.tv_nsec %= 1000000000L;
-  }
-  (void)pthread_cond_timedwait(cond, lock, &ts);
-}
-
-static void
-job_add_wait_us(atomic_long *counter, uint64_t started_at) {
-  uint64_t now = monotonic_us();
-  if(now <= started_at) return;
-  uint64_t delta = now - started_at;
-  atomic_fetch_add(counter, delta > (uint64_t)LONG_MAX ? LONG_MAX : (long)delta);
 }
 
 static int

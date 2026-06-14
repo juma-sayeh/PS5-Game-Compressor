@@ -23,7 +23,9 @@
 #include "miniz.h"
 #include "pfs_block_pipeline.h"
 #include "pfs_compress.h"
+#include "pfs_fs_util.h"
 #include "pfs_io_policy.h"
+#include "pfs_job_util.h"
 #include "transfer_internal.h"
 #if defined(GAME_COMPRESSOR_VERSION)
 #include "gc_diag.h"
@@ -230,62 +232,8 @@ ceil_div_u64(uint64_t a, uint64_t b) {
 }
 
 static int
-ends_with_ci(const char *s, const char *suffix) {
-  size_t slen = s ? strlen(s) : 0;
-  size_t suffix_len = suffix ? strlen(suffix) : 0;
-  if(slen < suffix_len) return 0;
-  return strcasecmp(s + slen - suffix_len, suffix) == 0;
-}
-
-static int
-path_segment_supported(const char *name) {
-  if(!name || !*name || !strcmp(name, ".") || !strcmp(name, "..")) return 0;
-  if(strlen(name) >= 256) return 0;
-  for(const unsigned char *p = (const unsigned char *)name; *p; p++) {
-    if(*p < 0x20 || *p >= 0x7f || *p == '/' || *p == '\\') return 0;
-  }
-  return 1;
-}
-
-static int
 ffpfsc_path_supported(const char *path) {
   return path && ends_with_ci(path, ".ffpfsc");
-}
-
-static int
-normalize_app_path(const char *path, char *out, size_t out_size) {
-  if(!path || path[0] != '/' || strstr(path, "..")) {
-    errno = EINVAL;
-    return -1;
-  }
-  size_t n = strlen(path);
-  while(n > 1 && path[n - 1] == '/') n--;
-  if(n == 0 || n >= out_size) {
-    errno = ENAMETOOLONG;
-    return -1;
-  }
-  memcpy(out, path, n);
-  out[n] = 0;
-  return 0;
-}
-
-static int
-path_parent_base(const char *path, char *parent, size_t parent_size,
-                 char *base, size_t base_size) {
-  const char *slash = strrchr(path ? path : "", '/');
-  if(!slash || !slash[1]) {
-    errno = EINVAL;
-    return -1;
-  }
-  size_t parent_len = slash == path ? 1 : (size_t)(slash - path);
-  if(parent_len >= parent_size || strlen(slash + 1) >= base_size) {
-    errno = ENAMETOOLONG;
-    return -1;
-  }
-  memcpy(parent, parent_len ? path : "/", parent_len);
-  parent[parent_len] = 0;
-  snprintf(base, base_size, "%s", slash + 1);
-  return 0;
 }
 
 static int
@@ -438,34 +386,6 @@ write_all_fd_cancelable(int fd, const void *data, size_t size) {
 }
 
 static int
-remove_tree_local(const char *path) {
-  struct stat st;
-  if(lstat(path, &st) != 0) {
-    if(errno == ENOENT) return 0;
-    return -1;
-  }
-  if(S_ISDIR(st.st_mode)) {
-    DIR *d = opendir(path);
-    if(!d) return -1;
-    int rc = 0;
-    struct dirent *ent;
-    while((ent = readdir(d))) {
-      if(!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) continue;
-      char child[1024];
-      if(join_abs(child, sizeof(child), path, ent->d_name) != 0 ||
-         remove_tree_local(child) != 0) {
-        rc = -1;
-        break;
-      }
-    }
-    closedir(d);
-    if(rc != 0) return -1;
-    return rmdir(path);
-  }
-  return unlink(path);
-}
-
-static int
 mkdir_one_local(const char *path) {
   if(mkdir(path, 0777) == 0) {
     chmod(path, 0777);
@@ -479,37 +399,6 @@ mkdir_one_local(const char *path) {
     }
   }
   return -1;
-}
-
-static uint64_t
-monotonic_us(void) {
-  struct timespec ts;
-#if defined(CLOCK_MONOTONIC)
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-#else
-  clock_gettime(CLOCK_REALTIME, &ts);
-#endif
-  return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
-}
-
-static void
-cancel_poll_cond_wait(pthread_cond_t *cond, pthread_mutex_t *lock) {
-  struct timespec ts;
-  clock_gettime(CLOCK_REALTIME, &ts);
-  ts.tv_nsec += 100000000L;
-  if(ts.tv_nsec >= 1000000000L) {
-    ts.tv_sec += ts.tv_nsec / 1000000000L;
-    ts.tv_nsec %= 1000000000L;
-  }
-  (void)pthread_cond_timedwait(cond, lock, &ts);
-}
-
-static void
-job_add_wait_us(atomic_long *counter, uint64_t started_at) {
-  uint64_t now = monotonic_us();
-  if(now <= started_at) return;
-  uint64_t delta = now - started_at;
-  atomic_fetch_add(counter, delta > (uint64_t)LONG_MAX ? LONG_MAX : (long)delta);
 }
 
 static long
@@ -1388,6 +1277,49 @@ pfs_nested_read_inode_data(pfs_nested_reader_t *nr, const pfs_inode_info_t *ino,
   return 0;
 }
 
+typedef struct pfs_dirent_info {
+  uint32_t child_inode;
+  uint32_t type;
+  uint32_t name_len;
+  uint32_t ent_size;
+  char name[256];
+} pfs_dirent_info_t;
+
+static int
+pfs_nested_read_dirent(pfs_nested_reader_t *nr, const pfs_inode_info_t *dir_ino,
+                       uint64_t off, pfs_dirent_info_t *ent, int *end,
+                       char *err, size_t err_size) {
+  unsigned char hdr[16];
+  if(end) *end = 0;
+  if(pfs_nested_read_inode_data(nr, dir_ino, off, hdr, sizeof(hdr),
+                                err, err_size) != 0) {
+    return -1;
+  }
+  ent->child_inode = rd32(hdr + 0);
+  ent->type = rd32(hdr + 4);
+  ent->name_len = rd32(hdr + 8);
+  ent->ent_size = rd32(hdr + 12);
+  if(ent->ent_size == 0) {
+    if(end) *end = 1;
+    return 0;
+  }
+  if(ent->ent_size < 16 || ent->ent_size > PFS_BLOCK_SIZE ||
+     ent->name_len == 0 || ent->name_len >= sizeof(ent->name) ||
+     16ULL + ent->name_len > ent->ent_size ||
+     off + ent->ent_size > dir_ino->size) {
+    set_err(err, err_size, "invalid PFS dirent");
+    errno = EINVAL;
+    return -1;
+  }
+
+  if(pfs_nested_read_inode_data(nr, dir_ino, off + 16, ent->name,
+                                ent->name_len, err, err_size) != 0) {
+    return -1;
+  }
+  ent->name[ent->name_len] = 0;
+  return 0;
+}
+
 static int
 pfs_find_child_inode(pfs_nested_reader_t *nr, uint32_t dir_inode_num,
                      const char *wanted, uint32_t wanted_type,
@@ -1403,36 +1335,18 @@ pfs_find_child_inode(pfs_nested_reader_t *nr, uint32_t dir_inode_num,
   }
 
   for(uint64_t off = 0; off + 16 <= dir_ino.size;) {
-    unsigned char hdr[16];
-    if(pfs_nested_read_inode_data(nr, &dir_ino, off, hdr, sizeof(hdr),
-                                  err, err_size) != 0) {
+    pfs_dirent_info_t ent;
+    int end = 0;
+    if(pfs_nested_read_dirent(nr, &dir_ino, off, &ent, &end,
+                              err, err_size) != 0) {
       return -1;
     }
-    uint32_t child_inode = rd32(hdr + 0);
-    uint32_t type = rd32(hdr + 4);
-    uint32_t name_len = rd32(hdr + 8);
-    uint32_t ent_size = rd32(hdr + 12);
-    if(ent_size == 0) break;
-    if(ent_size < 16 || ent_size > PFS_BLOCK_SIZE ||
-       name_len == 0 || name_len >= 256 ||
-       16ULL + name_len > ent_size ||
-       off + ent_size > dir_ino.size) {
-      set_err(err, err_size, "invalid PFS dirent");
-      errno = EINVAL;
-      return -1;
-    }
-
-    char name[256];
-    if(pfs_nested_read_inode_data(nr, &dir_ino, off + 16, name, name_len,
-                                  err, err_size) != 0) {
-      return -1;
-    }
-    name[name_len] = 0;
-    if(type == wanted_type && strcmp(name, wanted) == 0) {
-      *inode_out = child_inode;
+    if(end) break;
+    if(ent.type == wanted_type && strcmp(ent.name, wanted) == 0) {
+      *inode_out = ent.child_inode;
       return 0;
     }
-    off += ent_size;
+    off += ent.ent_size;
   }
 
   set_err(err, err_size, "PFS superroot missing uroot");
@@ -1535,59 +1449,41 @@ pfs_collect_extract_plan(pfs_nested_reader_t *nr, uint32_t inode_num,
   }
 
   for(uint64_t off = 0; off + 16 <= dir_ino.size;) {
-    unsigned char hdr[16];
     if(job_cancelled()) {
       set_err(err, err_size, "cancelled");
       errno = EINTR;
       return -1;
     }
-    if(pfs_nested_read_inode_data(nr, &dir_ino, off, hdr, sizeof(hdr),
-                                  err, err_size) != 0) {
+    pfs_dirent_info_t ent;
+    int end = 0;
+    if(pfs_nested_read_dirent(nr, &dir_ino, off, &ent, &end,
+                              err, err_size) != 0) {
       return -1;
     }
-    uint32_t child_inode = rd32(hdr + 0);
-    uint32_t type = rd32(hdr + 4);
-    uint32_t name_len = rd32(hdr + 8);
-    uint32_t ent_size = rd32(hdr + 12);
-    if(ent_size == 0) break;
-    if(ent_size < 16 || ent_size > PFS_BLOCK_SIZE ||
-       name_len == 0 || name_len >= 256 ||
-       16ULL + name_len > ent_size ||
-       off + ent_size > dir_ino.size) {
-      set_err(err, err_size, "invalid PFS dirent");
-      errno = EINVAL;
-      return -1;
-    }
-
-    char name[256];
-    if(pfs_nested_read_inode_data(nr, &dir_ino, off + 16, name, name_len,
-                                  err, err_size) != 0) {
-      return -1;
-    }
-    name[name_len] = 0;
-    if(strcmp(name, ".") != 0 && strcmp(name, "..") != 0) {
-      if(!path_segment_supported(name)) {
+    if(end) break;
+    if(strcmp(ent.name, ".") != 0 && strcmp(ent.name, "..") != 0) {
+      if(!path_segment_supported(ent.name)) {
         set_err(err, err_size, "unsafe PFS path segment");
         errno = EINVAL;
         return -1;
       }
       char child_out[1024];
       char child_rel[1024];
-      if(join_abs(child_out, sizeof(child_out), out_dir, name) != 0 ||
-         join_rel(child_rel, sizeof(child_rel), rel ? rel : "", name) != 0) {
+      if(join_abs(child_out, sizeof(child_out), out_dir, ent.name) != 0 ||
+         join_rel(child_rel, sizeof(child_rel), rel ? rel : "", ent.name) != 0) {
         set_err(err, err_size, "output path too long");
         return -1;
       }
-      if(type == PFS_DIRENT_TYPE_DIRECTORY) {
-        if(pfs_collect_extract_plan(nr, child_inode, child_out, child_rel,
+      if(ent.type == PFS_DIRENT_TYPE_DIRECTORY) {
+        if(pfs_collect_extract_plan(nr, ent.child_inode, child_out, child_rel,
                                     plan, err, err_size) != 0) {
           return -1;
         }
-      } else if(type == PFS_DIRENT_TYPE_FILE) {
+      } else if(ent.type == PFS_DIRENT_TYPE_FILE) {
         pfs_inode_info_t file_ino;
-        if(pfs_nested_read_inode(nr, child_inode, &file_ino,
+        if(pfs_nested_read_inode(nr, ent.child_inode, &file_ino,
                                  err, err_size) != 0 ||
-           pfs_extract_plan_push(plan, child_inode, &file_ino, child_out,
+           pfs_extract_plan_push(plan, ent.child_inode, &file_ino, child_out,
                                  child_rel, err, err_size) != 0) {
           return -1;
         }
@@ -1597,7 +1493,7 @@ pfs_collect_extract_plan(pfs_nested_reader_t *nr, uint32_t inode_num,
         return -1;
       }
     }
-    off += ent_size;
+    off += ent.ent_size;
   }
   chmod(out_dir, 0777);
   return 0;
@@ -3063,51 +2959,33 @@ pfs_extract_dir(pfs_nested_reader_t *nr, uint32_t inode_num,
   }
 
   for(uint64_t off = 0; off + 16 <= dir_ino.size;) {
-    unsigned char hdr[16];
-    if(pfs_nested_read_inode_data(nr, &dir_ino, off, hdr, sizeof(hdr),
-                                  err, err_size) != 0) {
+    pfs_dirent_info_t ent;
+    int end = 0;
+    if(pfs_nested_read_dirent(nr, &dir_ino, off, &ent, &end,
+                              err, err_size) != 0) {
       return -1;
     }
-    uint32_t child_inode = rd32(hdr + 0);
-    uint32_t type = rd32(hdr + 4);
-    uint32_t name_len = rd32(hdr + 8);
-    uint32_t ent_size = rd32(hdr + 12);
-    if(ent_size == 0) break;
-    if(ent_size < 16 || ent_size > PFS_BLOCK_SIZE ||
-       name_len == 0 || name_len >= 256 ||
-       16ULL + name_len > ent_size ||
-       off + ent_size > dir_ino.size) {
-      set_err(err, err_size, "invalid PFS dirent");
-      errno = EINVAL;
-      return -1;
-    }
-
-    char name[256];
-    if(pfs_nested_read_inode_data(nr, &dir_ino, off + 16, name, name_len,
-                                  err, err_size) != 0) {
-      return -1;
-    }
-    name[name_len] = 0;
-    if(strcmp(name, ".") != 0 && strcmp(name, "..") != 0) {
-      if(!path_segment_supported(name)) {
+    if(end) break;
+    if(strcmp(ent.name, ".") != 0 && strcmp(ent.name, "..") != 0) {
+      if(!path_segment_supported(ent.name)) {
         set_err(err, err_size, "unsafe PFS path segment");
         errno = EINVAL;
         return -1;
       }
       char child_out[1024];
       char child_rel[1024];
-      if(join_abs(child_out, sizeof(child_out), out_dir, name) != 0 ||
-         join_rel(child_rel, sizeof(child_rel), rel ? rel : "", name) != 0) {
+      if(join_abs(child_out, sizeof(child_out), out_dir, ent.name) != 0 ||
+         join_rel(child_rel, sizeof(child_rel), rel ? rel : "", ent.name) != 0) {
         set_err(err, err_size, "output path too long");
         return -1;
       }
-      if(type == PFS_DIRENT_TYPE_DIRECTORY) {
-        if(pfs_extract_dir(nr, child_inode, child_out, child_rel, workers,
+      if(ent.type == PFS_DIRENT_TYPE_DIRECTORY) {
+        if(pfs_extract_dir(nr, ent.child_inode, child_out, child_rel, workers,
                            sync_files, err, err_size) != 0) {
           return -1;
         }
-      } else if(type == PFS_DIRENT_TYPE_FILE) {
-        if(pfs_extract_file(nr, child_inode, child_out, child_rel, workers,
+      } else if(ent.type == PFS_DIRENT_TYPE_FILE) {
+        if(pfs_extract_file(nr, ent.child_inode, child_out, child_rel, workers,
                             sync_files, err, err_size) != 0) {
           return -1;
         }
@@ -3117,7 +2995,7 @@ pfs_extract_dir(pfs_nested_reader_t *nr, uint32_t inode_num,
         return -1;
       }
     }
-    off += ent_size;
+    off += ent.ent_size;
   }
   chmod(out_dir, 0777);
   return 0;
