@@ -108,7 +108,7 @@
 #define PFSC_WINDOW_BLOCKS_PER_LANE (PFSC_WINDOW_LANE_SIZE / PFS_BLOCK_SIZE)
 #define PFSC_WINDOW_BLOCKS \
   (PFSC_WINDOW_BLOCKS_PER_LANE * (uint64_t)PFSC_WINDOW_LANES)
-#define PFSC_WINDOW_COMP_CHUNK_BLOCKS 1U
+#define PFSC_WINDOW_COMP_CHUNK_BLOCKS 8U
 
 #define EXFAT_SECTOR_SIZE 512ULL
 #define EXFAT_SECTORS_PER_CLUSTER 128ULL
@@ -5115,7 +5115,7 @@ pfsc_compressed_block_meets_gain(size_t comp_len, int threshold_gain) {
 static size_t
 pfsc_compress_block_smaller(const unsigned char *raw, unsigned char *out,
                             const pfsc_comp_config_t *config,
-                            pfsc_comp_state_t *comp) {
+                            pfsc_comp_state_t *comp, z_stream *zcomp) {
   if(config && (config->profile == PFS_COMPRESS_PROFILE_FAST ||
                 config->fast_deflate)) {
     size_t in_size = (size_t)PFS_BLOCK_SIZE;
@@ -5136,9 +5136,26 @@ pfsc_compress_block_smaller(const unsigned char *raw, unsigned char *out,
   }
 
   size_t out_size = (size_t)PFS_BLOCK_SIZE - 1;
-  uLongf z_out_size = (uLongf)out_size;
   int zlib_level = config ? config->zlib_level : GC_PFSC_ZLIB_LEVEL;
   int threshold_gain = config ? config->threshold_gain : GC_PFSC_THRESHOLD_GAIN;
+  if(zcomp) {
+    int zrc = deflateReset(zcomp);
+    if(zrc != Z_OK) return 0;
+    zcomp->next_in = (Bytef *)raw;
+    zcomp->avail_in = (uInt)PFS_BLOCK_SIZE;
+    zcomp->next_out = out;
+    zcomp->avail_out = (uInt)out_size;
+    zrc = deflate(zcomp, Z_FINISH);
+    if(zrc == Z_STREAM_END && zcomp->avail_in == 0) {
+      size_t z_out_size = out_size - (size_t)zcomp->avail_out;
+      if(pfsc_compressed_block_meets_gain(z_out_size, threshold_gain)) {
+        return z_out_size;
+      }
+    }
+    return 0;
+  }
+
+  uLongf z_out_size = (uLongf)out_size;
   int zrc = compress2(out, &z_out_size, raw, (uLong)PFS_BLOCK_SIZE,
                       zlib_level);
   if(zrc == Z_OK &&
@@ -5169,6 +5186,8 @@ static void *
 pfsc_worker_main(void *arg) {
   pfsc_pool_t *pool = arg;
   pfsc_comp_state_t *comp = NULL;
+  z_stream zcomp;
+  int zcomp_initialized = 0;
   if(pool->comp_config.profile == PFS_COMPRESS_PROFILE_FAST ||
      pool->comp_config.fast_deflate) {
     comp = malloc(sizeof(*comp));
@@ -5176,6 +5195,14 @@ pfsc_worker_main(void *arg) {
       pfsc_pool_set_error(pool, ENOMEM);
       return NULL;
     }
+  } else if(!pool->comp_config.raw_only) {
+    memset(&zcomp, 0, sizeof(zcomp));
+    int zrc = deflateInit(&zcomp, pool->comp_config.zlib_level);
+    if(zrc != Z_OK) {
+      pfsc_pool_set_error(pool, EIO);
+      return NULL;
+    }
+    zcomp_initialized = 1;
   }
 
   for(;;) {
@@ -5202,7 +5229,9 @@ pfsc_worker_main(void *arg) {
       atomic_fetch_add(&g_job.skipped_zlib_blocks, 1);
     } else {
       slot->comp_len = pfsc_compress_block_smaller(slot->raw, slot->comp,
-                                                   &pool->comp_config, comp);
+                                                   &pool->comp_config, comp,
+                                                   zcomp_initialized ?
+                                                       &zcomp : NULL);
     }
     pfs_sha256(slot->raw, slot->raw_len, slot->hash);
 
@@ -5212,6 +5241,7 @@ pfsc_worker_main(void *arg) {
     pthread_mutex_unlock(&pool->lock);
   }
 
+  if(zcomp_initialized) deflateEnd(&zcomp);
   free(comp);
   return NULL;
 }
@@ -5501,7 +5531,7 @@ pfsc_window_read_task(pfsc_window_pool_t *pool, pfsc_window_task_t *task) {
 
 static void
 pfsc_window_compress_task(pfsc_window_pool_t *pool, pfsc_window_task_t *task,
-                          pfsc_comp_state_t *comp) {
+                          pfsc_comp_state_t *comp, z_stream *zcomp) {
   pfsc_window_lane_t *lane = &task->window->lanes[task->lane_index];
   const pfsc_comp_config_t *config = pool->comp_config;
 
@@ -5535,7 +5565,8 @@ pfsc_window_compress_task(pfsc_window_pool_t *pool, pfsc_window_task_t *task,
       result->compressed = 0;
       atomic_fetch_add(&g_job.skipped_zlib_blocks, 1);
     } else {
-      size_t comp_len = pfsc_compress_block_smaller(raw, out, config, comp);
+      size_t comp_len = pfsc_compress_block_smaller(raw, out, config, comp,
+                                                    zcomp);
       if(comp_len > 0 && comp_len < (size_t)PFS_BLOCK_SIZE) {
         result->stored_len = (uint32_t)comp_len;
         result->compressed = 1;
@@ -5776,6 +5807,8 @@ static void *
 pfsc_window_worker_main(void *arg) {
   pfsc_window_pool_t *pool = arg;
   pfsc_comp_state_t *comp = NULL;
+  z_stream zcomp;
+  int zcomp_initialized = 0;
   for(;;) {
     pthread_mutex_lock(&pool->lock);
 	    pfsc_window_task_t *task = NULL;
@@ -5802,7 +5835,18 @@ pfsc_window_worker_main(void *arg) {
             break;
           }
         }
-        pfsc_window_compress_task(pool, task, comp);
+        if(!comp && !zcomp_initialized && pool->comp_config &&
+           !pool->comp_config->raw_only) {
+          memset(&zcomp, 0, sizeof(zcomp));
+          int zrc = deflateInit(&zcomp, pool->comp_config->zlib_level);
+          if(zrc != Z_OK) {
+            pfsc_window_pool_set_error(pool, EIO, "init zlib compressor failed");
+            break;
+          }
+          zcomp_initialized = 1;
+        }
+        pfsc_window_compress_task(pool, task, comp,
+                                  zcomp_initialized ? &zcomp : NULL);
         break;
       case PFSC_WINDOW_TASK_WRITE:
         pfsc_window_write_task(pool, task);
@@ -5814,6 +5858,7 @@ pfsc_window_worker_main(void *arg) {
     pthread_mutex_unlock(&pool->lock);
     free(task);
   }
+  if(zcomp_initialized) deflateEnd(&zcomp);
   free(comp);
   return NULL;
 }

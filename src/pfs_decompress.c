@@ -3408,14 +3408,15 @@ done:
 
 static int
 exfat_extract_plan(exfat_reader_t *er, pfs_extract_plan_t *plan,
-                   char *err, size_t err_size) {
+                   int sync_files, char *err, size_t err_size) {
   for(size_t i = 0; i < plan->count; i++) {
     if(job_cancelled()) {
       set_err(err, err_size, "cancelled");
       errno = EINTR;
       return -1;
     }
-    if(exfat_extract_file(er, &plan->items[i], 1, err, err_size) != 0) {
+    if(exfat_extract_file(er, &plan->items[i], sync_files,
+                          err, err_size) != 0) {
       return -1;
     }
   }
@@ -3669,6 +3670,7 @@ pfs_decompress_ffpfsc_to_image_opts_output(const char *path, int overwrite,
   int rc = -1;
   pfs_io_policy_info_t io_policy;
   int allow_io_overlap = 0;
+  int sync_output = delete_policy == PFS_DELETE_AFTER;
 
   memset(&reader, 0, sizeof(reader));
   reader.fd = -1;
@@ -3780,7 +3782,7 @@ pfs_decompress_ffpfsc_to_image_opts_output(const char *path, int overwrite,
   } else if(image_rc != 0) {
     goto done;
   }
-  if(fsync(out) != 0) {
+  if(sync_output && fsync(out) != 0) {
     set_err(err, err_size, "sync output image: %s", strerror(errno));
     goto done;
   }
@@ -3856,6 +3858,7 @@ pfs_decompress_ffpfsc_to_app_opts_output(const char *path, int overwrite,
   int nested_type = PFS_NESTED_UNKNOWN;
   pfs_io_policy_info_t io_policy;
   int allow_io_overlap = 0;
+  int sync_output_files = delete_policy == PFS_DELETE_AFTER;
 
   memset(&nr, 0, sizeof(nr));
   nr.pfsc.fd = -1;
@@ -3990,7 +3993,8 @@ pfs_decompress_ffpfsc_to_app_opts_output(const char *path, int overwrite,
   }
   job_set_current("Decompressing app folder");
   pfsc_reader_t *reader = nested_type == PFS_NESTED_PFS ? &nr.pfsc : &er.pfsc;
-  int plan_rc = pfsc_decomp_extract_plan_windowed(reader, &plan, workers, 1,
+  int plan_rc = pfsc_decomp_extract_plan_windowed(reader, &plan, workers,
+                                                  sync_output_files,
                                                   allow_io_overlap,
                                                   err, err_size);
   if(plan_rc == PFSC_DECOMPRESS_WINDOW_RC_FALLBACK) {
@@ -3998,11 +4002,12 @@ pfs_decompress_ffpfsc_to_app_opts_output(const char *path, int overwrite,
     PFS_DECOMPRESS_LOG("decompress window unavailable mode=app fallback=serial");
     if(nested_type == PFS_NESTED_PFS) {
       if(pfs_extract_dir(&nr, nr.uroot_inode, tmp_path, "", 1,
-                         1, err, err_size) != 0) {
+                         sync_output_files, err, err_size) != 0) {
         goto done;
       }
     } else if(nested_type == PFS_NESTED_EXFAT) {
-      if(exfat_extract_plan(&er, &plan, err, err_size) != 0) {
+      if(exfat_extract_plan(&er, &plan, sync_output_files,
+                            err, err_size) != 0) {
         goto done;
       }
     }

@@ -1856,8 +1856,8 @@
           <div class="usb-picker" id="uncompress-usb-picker"></div>
           <div class="compress-usb-meta" id="uncompress-usb-meta"></div>
         </div>
-        <div class="format-section-title is-hidden" id="uncompress-source-title">Original source</div>
-        <div class="format-grid is-hidden" id="uncompress-policy-grid">
+        <div class="format-section-title" id="uncompress-source-title">Original source</div>
+        <div class="format-grid" id="uncompress-policy-grid">
           <button class="format-row" type="button" data-uncompress-policy="keep">
             <div>
               <div class="history-title">Keep both</div>
@@ -1944,6 +1944,7 @@
       uncompressMode: 'image',
       uncompressDestination: 'inplace',
       uncompressDeletePolicy: 'after',
+      uncompressDeletePolicyTouched: false,
       uncompressUsbId: '',
       uncompressUsbLoading: false,
       uncompressUsbOpen: false,
@@ -3590,6 +3591,27 @@
 	      return null;
 	    }
 
+	    function operationProgressTiming(job, visual, op, g) {
+	      const progress = progressTiming(job);
+	      const phaseProgress = operationProgressInfoForVisual(visual, job, op, g);
+	      if (!phaseProgress || !phaseProgress.countable || phaseProgress.total <= 0) {
+	        return progress;
+	      }
+	      const elapsed = Math.max(0, Number((job && job.elapsedSeconds) || 0));
+	      const fraction = Math.max(0, Math.min(1, phaseProgress.scanned / phaseProgress.total));
+	      const remaining = fraction >= 1
+	        ? 0
+	        : fraction > 0.001 && elapsed > 0
+	          ? Math.max(0, elapsed * (1 - fraction) / fraction)
+	          : null;
+	      return {
+	        ...progress,
+	        percent: phaseProgress.percent,
+	        countable: true,
+	        remainingText: remaining === null ? '--' : formatDuration(remaining)
+	      };
+	    }
+
 	    function operationScanSummary(op) {
 	      const scanned = Math.max(0, Number((op && op.scanBytes) || 0));
 	      if (!op || scanned <= 0) return '';
@@ -3732,8 +3754,8 @@
         const destructiveStreamLocked = unsafeStreamActive && job && job.destructiveStreamActive;
         const cancelDisabled = !!(job && job.cancelDisabled);
         const cancelDisabledReason = String((job && job.cancelDisabledReason) || '');
-        const progress = progressTiming(job);
-        const visual = operationVisual(g.activeOp, job);
+	        const visual = operationVisual(g.activeOp, job);
+	        const progress = operationProgressTiming(job, visual, g.activeOp, g);
 	        const scanProgress = operationProgressInfoForVisual(visual, job, g.activeOp, g);
         const displayPercent = scanProgress && scanProgress.countable
           ? scanProgress.percent
@@ -4189,10 +4211,10 @@
         renderHistory(true);
         return;
       }
-      const progress = progressTiming(job);
-      const visual = g && g.activeOp
-        ? operationVisual(g.activeOp, job)
-        : { label: 'Running', className: 'run' };
+	      const visual = g && g.activeOp
+	        ? operationVisual(g.activeOp, job)
+	        : { label: 'Running', className: 'run' };
+	      const progress = operationProgressTiming(job, visual, g && g.activeOp, g);
 	      const scanProgress = operationProgressInfoForVisual(visual, job, g && g.activeOp, g);
 	      const displayPercent = scanProgress && scanProgress.countable
 	        ? scanProgress.percent
@@ -4540,6 +4562,16 @@
       return 'Image';
     }
 
+    function defaultUncompressDeletePolicyForDestination(destination) {
+      return destination === 'usb' || destination === 'internal' ? 'keep' : 'after';
+    }
+
+    function syncUncompressDeletePolicyFromDestination() {
+      if (state.uncompressDeletePolicyTouched) return;
+      state.uncompressDeletePolicy =
+        defaultUncompressDeletePolicyForDestination(state.uncompressDestination);
+    }
+
     function updateUncompressModalSelection() {
       const g = state.uncompressGame;
       const plan = state.uncompressPlan || {};
@@ -4555,11 +4587,8 @@
       if (state.uncompressDestination !== 'usb') {
         state.uncompressUsbOpen = false;
       }
-      if (state.uncompressDestination === 'inplace') {
-        state.uncompressDeletePolicy = 'after';
-      }
+      syncUncompressDeletePolicyFromDestination();
       const movingToUsb = state.uncompressDestination === 'usb';
-      const movingElsewhere = state.uncompressDestination !== 'inplace';
       $('uncompress-files-name').textContent = plan.filesOutputPath
         ? basenameFromPath(plan.filesOutputPath)
         : 'App folder';
@@ -4568,14 +4597,12 @@
         ? basenameFromPath(plan.imageOutputPath)
         : (state.uncompressPlanError ||
           (state.uncompressPlanLoading ? 'Detecting image type' : 'Image output'));
-      $('uncompress-inplace-meta').textContent = movingElsewhere
-        ? 'Write next to the compressed image'
-        : 'Write next to the compressed image and remove it after remount';
+      $('uncompress-inplace-meta').textContent = state.uncompressDeletePolicy === 'keep'
+        ? 'Write next to the compressed image and keep the compressed source'
+        : 'Write next to the compressed image and remove it after output is ready';
       $('uncompress-internal-row').classList.toggle('is-hidden', !showInternal);
       $('uncompress-usb-row').classList.toggle('is-hidden', !showUsb);
       $('uncompress-usb-panel').classList.toggle('hidden', !movingToUsb);
-      $('uncompress-source-title').classList.toggle('is-hidden', !movingElsewhere);
-      $('uncompress-policy-grid').classList.toggle('is-hidden', !movingElsewhere);
       renderUncompressUsbSelect();
       document.querySelectorAll('[data-uncompress-mode], [data-uncompress-destination], [data-uncompress-policy]').forEach((button) => {
         const mode = button.getAttribute('data-uncompress-mode');
@@ -4592,7 +4619,6 @@
             (destination === 'usb' && (!showUsb || (!state.uncompressUsbLoading && !state.usb.length)));
         } else if (policy) {
           selected = policy === state.uncompressDeletePolicy;
-          disabled = !movingElsewhere;
         }
         button.disabled = disabled;
         button.classList.toggle('is-disabled', disabled);
@@ -4620,6 +4646,7 @@
       state.uncompressMode = 'image';
       state.uncompressDestination = 'inplace';
       state.uncompressDeletePolicy = 'after';
+      state.uncompressDeletePolicyTouched = false;
       state.uncompressUsbId = '';
       state.uncompressUsbLoading = true;
       state.uncompressUsbOpen = false;
@@ -4663,6 +4690,7 @@
       state.uncompressPlanError = '';
       state.uncompressDestination = 'inplace';
       state.uncompressDeletePolicy = 'after';
+      state.uncompressDeletePolicyTouched = false;
       state.uncompressUsbId = '';
       state.uncompressUsbLoading = false;
       state.uncompressUsbOpen = false;
@@ -4994,9 +5022,7 @@
       }
       const mode = state.uncompressMode === 'image' ? 'image' : 'app';
       const destination = state.uncompressDestination || 'inplace';
-      const deletePolicy = destination === 'inplace'
-        ? 'after'
-        : (state.uncompressDeletePolicy === 'after' ? 'after' : 'keep');
+      const deletePolicy = state.uncompressDeletePolicy === 'after' ? 'after' : 'keep';
       const usbId = destination === 'usb' ? state.uncompressUsbId : '';
       if (destination === 'usb' && !usbId) {
         updateUncompressModalSelection();
@@ -5190,11 +5216,9 @@
         button.addEventListener('click', () => {
           if (button.disabled) return;
           state.uncompressDestination = button.getAttribute('data-uncompress-destination') || 'inplace';
+          syncUncompressDeletePolicyFromDestination();
           if (state.uncompressDestination === 'usb' && !state.uncompressUsbId && state.usb[0]) {
             state.uncompressUsbId = state.usb[0].id || '';
-          }
-          if (state.uncompressDestination !== 'inplace') {
-            state.uncompressDeletePolicy = 'keep';
           }
           updateUncompressModalSelection();
         });
@@ -5203,6 +5227,7 @@
         button.addEventListener('click', () => {
           if (button.disabled) return;
           state.uncompressDeletePolicy = button.getAttribute('data-uncompress-policy') || 'keep';
+          state.uncompressDeletePolicyTouched = true;
           updateUncompressModalSelection();
         });
       });
