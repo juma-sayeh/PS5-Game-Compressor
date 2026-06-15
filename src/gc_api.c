@@ -26,6 +26,7 @@
 #include "gc_notify.h"
 #include "gc_shadowmount.h"
 #include "pfs_compress.h"
+#include "pfs_validate_hash.h"
 #include "pfs_repair.h"
 #include "transfer_internal.h"
 
@@ -107,10 +108,13 @@ gc_shadowmount_request_scan_cancelable(char *err, size_t err_size) {
 }
 
 static int
-gc_shadowmount_request_source_scan_cancelable(const char *source_path,
-                                              char *err, size_t err_size) {
+gc_shadowmount_request_title_source_scan_cancelable(const char *title_id,
+                                                    const char *source_path,
+                                                    char *err,
+                                                    size_t err_size) {
   if(gc_cancel_requested(err, err_size)) return -1;
-  if(gc_shadowmount_request_source_scan(source_path, err, err_size) != 0) {
+  if(gc_shadowmount_request_title_source_scan(title_id, source_path, err,
+                                              err_size) != 0) {
     return -1;
   }
   return gc_cancel_requested(err, err_size) ? -1 : 0;
@@ -1583,6 +1587,8 @@ load_validation_state(gc_game_t *g) {
   int marker_matches_path = stat_ok &&
       strcmp(image_path, g->source_path) == 0 &&
       (uint64_t)st.st_size == old_size;
+  int stats_only_marker = !strcmp(marker_status, "compression-stats") ||
+      !strcmp(marker_status, "not-mounted");
   if(marker_matches_path) {
     g->compression_source_size =
         json_find_u64_value(json, "compressionSourceSize", 0);
@@ -1601,9 +1607,15 @@ load_validation_state(gc_game_t *g) {
       (void)unlink(path);
     }
   } else {
-    snprintf(g->validation_status, sizeof(g->validation_status), "%s",
-             "validated");
-    g->validation = GC_VALIDATION_VALIDATED;
+    if(stats_only_marker) {
+      snprintf(g->validation_status, sizeof(g->validation_status), "%s",
+               "not-validated");
+      g->validation = GC_VALIDATION_NONE;
+    } else {
+      snprintf(g->validation_status, sizeof(g->validation_status), "%s",
+               "validated");
+      g->validation = GC_VALIDATION_VALIDATED;
+    }
   }
   free(json);
   return 0;
@@ -1617,6 +1629,49 @@ write_validation_marker_file(const char *path, const char *data, size_t len) {
   fsync(fd);
   close(fd);
   return rc;
+}
+
+static uint64_t
+folder_size_for_compression_stats(const char *path) {
+  uint64_t cached = 0;
+  struct stat st;
+  if(!path || !path[0]) return 0;
+  if(lstat(path, &st) != 0 || !S_ISDIR(st.st_mode)) return 0;
+  if(size_cache_get(path, &cached) == 0 && cached > 0) return cached;
+  cached = source_size_bytes_exact(path, GC_SOURCE_FOLDER);
+  if(cached > 0) size_cache_store(path, cached);
+  return cached;
+}
+
+static uint64_t
+infer_compression_source_size_from_known_roots(const char *title_id,
+                                               const char *image_path,
+                                               uint64_t compressed_size) {
+  char parent[1024];
+  char candidate[1024];
+  uint64_t best = 0;
+
+  if(!valid_title_id(title_id) || !image_path || !image_path[0]) return 0;
+
+  if(path_parent(image_path, parent, sizeof(parent)) == 0) {
+    int n = snprintf(candidate, sizeof(candidate), "%s/%s-app", parent,
+                     title_id);
+    if(n >= 0 && (size_t)n < sizeof(candidate)) {
+      best = folder_size_for_compression_stats(candidate);
+      if(best > compressed_size) return best;
+    }
+  }
+
+  for(size_t i = 0; GC_SHADOW_SOURCE_ROOTS[i]; i++) {
+    int n = snprintf(candidate, sizeof(candidate), "%s/%s-app",
+                     GC_SHADOW_SOURCE_ROOTS[i], title_id);
+    uint64_t size = 0;
+    if(n < 0 || (size_t)n >= sizeof(candidate)) continue;
+    size = folder_size_for_compression_stats(candidate);
+    if(size > best) best = size;
+    if(best > compressed_size) return best;
+  }
+  return best > compressed_size ? best : 0;
 }
 
 static int
@@ -1657,6 +1712,14 @@ write_validation_marker_ex(const char *title_id, const char *image_path,
         }
       }
       free(old_json);
+    }
+    if(compression_source_size == 0) {
+      compression_source_size =
+          infer_compression_source_size_from_known_roots(title_id, image_path,
+                                                        compressed_size);
+      if(compression_source_size > compressed_size) {
+        saved_bytes = compression_source_size - compressed_size;
+      }
     }
   }
 
@@ -2770,6 +2833,15 @@ operation_mark_verified_not_mounted(gc_operation_t *op, const char *detail) {
          op->title_id, detail && detail[0] ? detail : "ShadowMountPlus did not mount");
 }
 
+static void
+operation_mark_not_mounted(gc_operation_t *op, const char *detail) {
+  if(!op) return;
+  snprintf(op->result, sizeof(op->result), "%s", "not-mounted");
+  op->error[0] = 0;
+  gc_log("operation complete but not mounted title=%s detail=%s",
+         op->title_id, detail && detail[0] ? detail : "ShadowMountPlus did not mount");
+}
+
 static int
 append_operation_json(json_buf_t *b, const gc_operation_t *op,
                       const char *id, int newline) {
@@ -3441,39 +3513,25 @@ uncompress_delete_quarantined_source_or_fail(gc_operation_t *op,
   return 0;
 }
 
-static void
-uncompress_request_shadowmount_scan(gc_operation_t *op,
-                                    char *err,
-                                    size_t err_size) {
-  gc_checkpoint("uncompress request shadowmount scan");
-  job_set_phase("mounting", 0, 0, "Requesting ShadowMount scan");
-  err[0] = 0;
-  if(gc_shadowmount_request_scan_cancelable(err, err_size) != 0 &&
-     !job_cancelled()) {
-    gc_log("uncompress scan request failed title=%s err=%s", op->title_id,
-           err[0] ? err : "unknown");
-  }
-}
-
 static int
 uncompress_complete_not_mounted(gc_operation_t *op,
                                 gc_source_quarantine_t *q,
                                 const pfs_decompress_info_t *info,
                                 int as_image,
+                                const char *detail,
                                 char *err,
                                 size_t err_size) {
-  snprintf(op->result, sizeof(op->result), "%s", "not-mounted");
-  op->error[0] = 0;
+  operation_mark_not_mounted(op, detail);
   if(uncompress_delete_quarantined_source_or_fail(op, q, err, err_size) != 0) {
     return -1;
   }
   size_cache_queue_measure(info->output_path);
   if(as_image) {
     gc_log("uncompress image complete but not mounted title=%s output=%s detail=%s",
-           op->title_id, op->output_path, err[0] ? err : "");
+           op->title_id, op->output_path, detail && detail[0] ? detail : "");
   } else {
     gc_log("uncompress complete but not mounted title=%s output=%s detail=%s",
-           op->title_id, op->output_path, err[0] ? err : "");
+           op->title_id, op->output_path, detail && detail[0] ? detail : "");
   }
   return 0;
 }
@@ -3632,8 +3690,8 @@ repair_with_wait(const char *title_id, const char *path,
     }
     {
       char scan_err[256] = {0};
-      if(gc_shadowmount_request_source_scan_cancelable(path, scan_err,
-                                                       sizeof(scan_err)) != 0) {
+      if(gc_shadowmount_request_title_source_scan_cancelable(
+             title_id, path, scan_err, sizeof(scan_err)) != 0) {
         if(job_cancelled()) return -1;
         gc_log("repair wait scan request failed title=%s err=%s",
                title_id ? title_id : "",
@@ -3679,8 +3737,8 @@ repair_scan_only_with_wait(const char *title_id, const char *path,
     }
     {
       char scan_err[256] = {0};
-      if(gc_shadowmount_request_source_scan_cancelable(path, scan_err,
-                                                       sizeof(scan_err)) != 0) {
+      if(gc_shadowmount_request_title_source_scan_cancelable(
+             title_id, path, scan_err, sizeof(scan_err)) != 0) {
         if(job_cancelled()) return -1;
         gc_log("validate-only wait scan request failed title=%s err=%s",
                title_id ? title_id : "",
@@ -3773,29 +3831,14 @@ wait_for_compressed_shadowmount(const char *title_id, const char *path,
   }
   if(gc_cancel_requested(err, err_size)) return -1;
   job_set_phase("mounting", 0, 0, current ? current : "Waiting for remount");
-  if(gc_shadowmount_request_source_scan_cancelable(path, scan_err,
-                                                  sizeof(scan_err)) != 0) {
+  if(gc_shadowmount_request_title_source_scan_cancelable(
+         title_id, path, scan_err, sizeof(scan_err)) != 0) {
     if(job_cancelled()) return -1;
     gc_log("compressed remount scan request failed title=%s err=%s",
            title_id ? title_id : "", scan_err[0] ? scan_err : "unknown");
   }
   return wait_for_shadowmount_links(title_id, expected_mount, expected_image,
                                     err, err_size);
-}
-
-static int
-wait_for_folder_shadowmount(const char *title_id, const char *path,
-                            const char *current,
-                            char *err, size_t err_size) {
-  char scan_err[256] = {0};
-  if(gc_cancel_requested(err, err_size)) return -1;
-  job_set_phase("mounting", 0, 0, current ? current : "Waiting for remount");
-  if(gc_shadowmount_request_scan_cancelable(scan_err, sizeof(scan_err)) != 0) {
-    if(job_cancelled()) return -1;
-    gc_log("folder remount scan request failed title=%s err=%s",
-           title_id ? title_id : "", scan_err[0] ? scan_err : "unknown");
-  }
-  return wait_for_shadowmount_links(title_id, path, "", err, err_size);
 }
 
 static int
@@ -3876,64 +3919,6 @@ force_compressed_path_bounce_remount(const char *title_id,
                                          nested_type,
                                          "Waiting for final remount",
                                          err, err_size);
-}
-
-static int
-force_folder_path_bounce_remount(const char *title_id,
-                                 const char *original_path,
-                                 char *err, size_t err_size) {
-  char temp_path[1024];
-  char scan_err[256] = {0};
-  struct stat st;
-  int cancelled = 0;
-
-  if(gc_cancel_requested(err, err_size)) return -1;
-  if(stat(original_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
-    snprintf(err, err_size, "folder remount path unavailable: %s",
-             strerror(errno));
-    return -1;
-  }
-  if(build_force_remount_temp_path(original_path, title_id, temp_path,
-                                   sizeof(temp_path)) != 0) {
-    snprintf(err, err_size, "%s", "could not build folder remount temp path");
-    return -1;
-  }
-  if(rename(original_path, temp_path) != 0) {
-    snprintf(err, err_size, "rename folder for remount: %s", strerror(errno));
-    return -1;
-  }
-  gc_log("folder remount bounce title=%s original=%s temp=%s",
-         title_id ? title_id : "", original_path, temp_path);
-
-  job_set_phase("mounting", 0, 0, "Refreshing temporary mount state");
-  if(gc_shadowmount_request_scan_cancelable(scan_err, sizeof(scan_err)) != 0) {
-    if(job_cancelled()) cancelled = 1;
-  }
-  if(!cancelled && scan_err[0]) {
-    gc_log("folder temp remount scan failed title=%s err=%s",
-           title_id ? title_id : "", scan_err[0] ? scan_err : "unknown");
-  }
-  if(!cancelled &&
-     gc_sleep_cancelable_seconds(GC_MOUNT_SCAN_REQUEST_SECONDS,
-                                 err, err_size) != 0) {
-    cancelled = 1;
-  }
-  if(rename(temp_path, original_path) != 0) {
-    snprintf(err, err_size, "restore folder name: %s", strerror(errno));
-    gc_log("folder remount restore failed title=%s temp=%s original=%s err=%s",
-           title_id ? title_id : "", temp_path, original_path,
-           err && err[0] ? err : "");
-    return -1;
-  }
-  gc_log("folder remount restore title=%s temp=%s original=%s",
-         title_id ? title_id : "", temp_path, original_path);
-  if(cancelled || gc_cancel_requested(err, err_size)) {
-    snprintf(err, err_size, "%s", "cancelled");
-    return -1;
-  }
-  return wait_for_folder_shadowmount(title_id, original_path,
-                                     "Waiting for final remount",
-                                     err, err_size);
 }
 
 static int
@@ -4375,6 +4360,127 @@ build_compress_target_path(const char *target_root, const gc_game_t *game,
 }
 
 static int
+build_compress_stage_path(const gc_operation_t *op, const gc_game_t *game,
+                          char *out, size_t out_size,
+                          char *err, size_t err_size) {
+  const char *name = NULL;
+  char root[1024];
+  if(!op || !game || !out || out_size == 0) {
+    snprintf(err, err_size, "%s", "bad compression stage path");
+    errno = EINVAL;
+    return -1;
+  }
+  name = path_basename(game->output_path);
+  if(!name || !upload_segment_safe(name) || !ends_with_ci(name, ".ffpfsc")) {
+    snprintf(err, err_size, "%s", "bad compression stage name");
+    errno = EINVAL;
+    return -1;
+  }
+  if(path_under_root(game->source_path, "/data")) {
+    snprintf(root, sizeof(root), "%s", GC_INTERNAL_GAME_ROOT);
+  } else {
+    snprintf(root, sizeof(root), "%s", "/data/GameCompressor/staging");
+    if(mkdirs(root) != 0) {
+      snprintf(err, err_size, "create compression staging root: %s",
+               strerror(errno));
+      return -1;
+    }
+  }
+  int n = snprintf(out, out_size, "%s/.%s.%s.stage.ffpfsc",
+                   root, game->title_id, op->id);
+  if(n < 0 || (size_t)n >= out_size) {
+    snprintf(err, err_size, "%s", "compression stage path too long");
+    errno = ENAMETOOLONG;
+    return -1;
+  }
+  return 0;
+}
+
+static int
+publish_staged_compress_output(gc_operation_t *op,
+                               const char *stage_path,
+                               const char *final_path,
+                               char *err,
+                               size_t err_size) {
+  char stage_vhash[1024];
+  char final_vhash[1024];
+  char final_tmp[1024];
+  char final_vhash_tmp[1024];
+  struct stat st;
+  struct stat vh_st;
+  uint64_t copied = 0;
+
+  if(!op || !stage_path || !stage_path[0] ||
+     !final_path || !final_path[0]) {
+    snprintf(err, err_size, "%s", "bad staged compression publish");
+    errno = EINVAL;
+    return -1;
+  }
+  if(stat(stage_path, &st) != 0 || !S_ISREG(st.st_mode)) {
+    snprintf(err, err_size, "stat staged output: %s", strerror(errno));
+    return -1;
+  }
+  if(pfs_vhash_sidecar_path(stage_path, stage_vhash, sizeof(stage_vhash)) != 0 ||
+     pfs_vhash_sidecar_path(final_path, final_vhash, sizeof(final_vhash)) != 0) {
+    snprintf(err, err_size, "%s", "validation hash path too long");
+    errno = ENAMETOOLONG;
+    return -1;
+  }
+  if(stat(stage_vhash, &vh_st) != 0 || !S_ISREG(vh_st.st_mode)) {
+    snprintf(err, err_size, "stat staged validation hash: %s",
+             strerror(errno));
+    return -1;
+  }
+  if(legacy_suffix_temp_path(final_path, "publishing",
+                             final_tmp, sizeof(final_tmp)) != 0 ||
+     legacy_suffix_temp_path(final_vhash, "publishing",
+                             final_vhash_tmp, sizeof(final_vhash_tmp)) != 0) {
+    snprintf(err, err_size, "%s", "publish temp path too long");
+    errno = ENAMETOOLONG;
+    return -1;
+  }
+  unlink(final_tmp);
+  unlink(final_vhash_tmp);
+  append_operation_phase(op, "copying");
+  job_set_phase("copying", 0, 0, "Publishing compressed image");
+  job_set_current(path_basename(final_path));
+  atomic_store(&g_job.total_bytes, st.st_size > LONG_MAX ? LONG_MAX :
+               (long)st.st_size);
+  atomic_store(&g_job.copied_bytes, 0);
+  if(copy_regular_file_gc(stage_path, final_tmp, &st, &copied,
+                          err, err_size) != 0) {
+    unlink(final_tmp);
+    return -1;
+  }
+  job_set_current("Publishing validation hash");
+  if(copy_regular_file_gc(stage_vhash, final_vhash_tmp, &vh_st, NULL,
+                          err, err_size) != 0) {
+    unlink(final_tmp);
+    unlink(final_vhash_tmp);
+    return -1;
+  }
+  job_set_current("Finalizing USB compressed image");
+  if(rename(final_tmp, final_path) != 0) {
+    snprintf(err, err_size, "rename published output: %s", strerror(errno));
+    unlink(final_tmp);
+    unlink(final_vhash_tmp);
+    return -1;
+  }
+  fsync_parent_dir_best_effort(final_path);
+  if(rename(final_vhash_tmp, final_vhash) != 0) {
+    snprintf(err, err_size, "rename published validation hash: %s",
+             strerror(errno));
+    unlink(final_path);
+    unlink(final_vhash_tmp);
+    return -1;
+  }
+  fsync_parent_dir_best_effort(final_vhash);
+  unlink(stage_path);
+  unlink(stage_vhash);
+  return 0;
+}
+
+static int
 build_uncompress_target_path(const char *target_root, const gc_game_t *game,
                              char *out, size_t out_size,
                              char *err, size_t err_size) {
@@ -4542,6 +4648,50 @@ mount_switch_clear_stale_links(const char *title_id,
 }
 
 static int
+mount_switch_clear_live_title_mount(const char *title_id,
+                                    char *err, size_t err_size) {
+  char mountpoint[1024];
+  int rc;
+  int saved_errno;
+
+  if(!valid_title_id(title_id)) {
+    snprintf(err, err_size, "%s", "bad title mount state");
+    errno = EINVAL;
+    return -1;
+  }
+
+  int n = snprintf(mountpoint, sizeof(mountpoint), "%s/%s",
+                   GC_SYSTEM_APP_BASE, title_id);
+  if(n < 0 || (size_t)n >= sizeof(mountpoint)) {
+    snprintf(err, err_size, "%s", "title mount path too long");
+    errno = ENAMETOOLONG;
+    return -1;
+  }
+
+  rc = unmount(mountpoint, 0);
+  if(rc == 0) {
+    gc_log("mount switch unmounted live title mount title=%s path=%s",
+           title_id, mountpoint);
+    return 0;
+  }
+  saved_errno = errno;
+  rc = unmount(mountpoint, MNT_FORCE);
+  if(rc == 0) {
+    gc_log("mount switch force-unmounted live title mount title=%s path=%s",
+           title_id, mountpoint);
+    return 0;
+  }
+
+  if(errno == ENOENT || errno == EINVAL || saved_errno == ENOENT ||
+     saved_errno == EINVAL) {
+    return 0;
+  }
+
+  snprintf(err, err_size, "unmount live title mount: %s", strerror(errno));
+  return -1;
+}
+
+static int
 mount_switch_restore_cleared_links(gc_mount_link_backup_t *backup,
                                    char *err, size_t err_size) {
   char title_dir[1024];
@@ -4677,13 +4827,18 @@ mount_selected_instance_hidden_exclusive(gc_operation_t *op,
                                     err, err_size) != 0) {
     return -1;
   }
+  if(mount_switch_clear_live_title_mount(op->title_id, err, err_size) != 0) {
+    (void)mount_switch_restore_cleared_links(&link_backup, scan_err,
+                                             sizeof(scan_err));
+    return -1;
+  }
 
   gc_checkpoint("mount selected source scan");
   append_operation_phase(op, "mounting");
   job_set_phase("mounting", 0, 0, "Mounting");
-  if(gc_shadowmount_request_source_scan_cancelable(selected->source_path,
-                                                   scan_err,
-                                                   sizeof(scan_err)) != 0) {
+  if(gc_shadowmount_request_title_source_scan_cancelable(
+         selected->title_id, selected->source_path, scan_err,
+         sizeof(scan_err)) != 0) {
     snprintf(err, err_size, "%s",
              scan_err[0] ? scan_err : "could not request ShadowMount scan");
     (void)mount_switch_restore_cleared_links(&link_backup, scan_err,
@@ -4968,17 +5123,23 @@ transfer_action_copy_only(gc_action_t action) {
          action == GC_ACTION_COPY_TO_INTERNAL;
 }
 
+static void operation_append_error_detail(gc_operation_t *op,
+                                          const char *detail);
+
 static int
 run_move_op(gc_operation_t *op) {
   gc_game_t game = {0};
+  gc_game_t moved_game = {0};
+  gc_hidden_instance_t hidden[GC_MAX_GAMES];
   char err[256] = {0};
+  char restore_err[256] = {0};
   char target_path[1024] = {0};
   char temp_path[1024] = {0};
-  char expected_mount[1024] = {0};
-  char expected_image[1024] = {0};
   struct stat st;
   uint64_t copied = 0;
   uint64_t free_bytes = 0;
+  size_t hidden_count = 0;
+  int mount_missed = 0;
   int copy_only = transfer_action_copy_only(op->action);
   const char *verb = copy_only ? "copy" : "move";
 
@@ -5116,6 +5277,11 @@ run_move_op(gc_operation_t *op) {
   if(game.source_kind == GC_SOURCE_FOLDER) {
     size_cache_store(target_path, game.source_size);
   }
+  if(copy_only && game.source_kind == GC_SOURCE_COMPRESSED) {
+    (void)write_validation_marker_ex(
+        op->title_id, target_path, NULL, "compression-stats",
+        game.compression_source_size);
+  }
 
   if(copy_only) {
     err[0] = 0;
@@ -5145,33 +5311,57 @@ run_move_op(gc_operation_t *op) {
                                           target_path);
   }
 
+  moved_game = game;
+  snprintf(moved_game.source_path, sizeof(moved_game.source_path), "%s",
+           target_path);
+  snprintf(moved_game.output_path, sizeof(moved_game.output_path), "%s",
+           target_path);
+  if(moved_game.source_kind == GC_SOURCE_COMPRESSED) {
+    snprintf(moved_game.image_path, sizeof(moved_game.image_path), "%s",
+             target_path);
+  }
+  set_game_mount_status(&moved_game, 0, "not-mounted");
+
+  gc_checkpoint("move mount target");
   err[0] = 0;
-  job_set_phase("mounting", 0, 0, "Requesting ShadowMount scan");
-  if(gc_shadowmount_request_scan_cancelable(err, sizeof(err)) != 0 &&
-     !job_cancelled()) {
-    gc_log("move scan request failed title=%s err=%s", op->title_id,
-           err[0] ? err : "unknown");
-  }
-  if(gc_cancel_requested(err, sizeof(err))) {
-    snprintf(op->error, sizeof(op->error), "%s", err);
-    return -1;
-  }
-  if(move_remount_expectations(&game, target_path, expected_mount,
-                               sizeof(expected_mount), expected_image,
-                               sizeof(expected_image), err,
-                               sizeof(err)) != 0) {
-    snprintf(op->error, sizeof(op->error), "%s",
-             err[0] ? err : "could not derive moved remount path");
-    gc_log("move remount failed title=%s err=%s", op->title_id, op->error);
-    return -1;
-  }
-  gc_checkpoint("move wait remount");
-  job_set_phase("mounting", 0, 0, "Waiting for remount");
-  if(wait_for_shadowmount_links(op->title_id, expected_mount, expected_image,
-                                err, sizeof(err)) != 0) {
+  if(mount_selected_instance_hidden_exclusive(
+         op, &moved_game, hidden, GC_MAX_GAMES, &hidden_count, &mount_missed,
+         err, sizeof(err)) != 0) {
+    if(mount_switch_restore_after_operation(op, hidden, hidden_count,
+                                            restore_err,
+                                            sizeof(restore_err)) != 0) {
+      gc_log("move mount restore failed title=%s err=%s", op->title_id,
+             restore_err[0] ? restore_err : "unknown");
+      operation_append_error_detail(op, restore_err);
+    }
     snprintf(op->error, sizeof(op->error), "%s",
              err[0] ? err : "ShadowMountPlus remount failed");
     gc_log("move remount failed title=%s err=%s", op->title_id, op->error);
+    return -1;
+  }
+  if(mount_missed) {
+    if(mount_switch_restore_after_operation(op, hidden, hidden_count,
+                                            restore_err,
+                                            sizeof(restore_err)) != 0) {
+      snprintf(op->error, sizeof(op->error), "%s",
+               restore_err[0] ? restore_err :
+               "could not restore duplicate instances");
+      gc_log("move mount-missed restore failed title=%s err=%s",
+             op->title_id, op->error);
+      return -1;
+    }
+    operation_mark_not_mounted(op, err);
+    gc_log("move complete not mounted title=%s output=%s detail=%s",
+           op->title_id, target_path, err[0] ? err : "");
+    return 0;
+  }
+  if(mount_switch_restore_after_operation_ex(op, hidden, hidden_count, 0,
+                                             restore_err,
+                                             sizeof(restore_err)) != 0) {
+    snprintf(op->error, sizeof(op->error), "%s",
+             restore_err[0] ? restore_err :
+             "could not restore duplicate instances");
+    gc_log("move restore failed title=%s err=%s", op->title_id, op->error);
     return -1;
   }
 
@@ -5221,8 +5411,12 @@ run_compress_op(gc_operation_t *op) {
   char planned_nested_name[256] = {0};
   int planned_nested_type = PFS_NESTED_UNKNOWN;
   char compress_output_path[1024] = {0};
+  char compress_write_path[1024] = {0};
+  char staged_compress_path[1024] = {0};
   uint64_t target_free_bytes = 0;
+  uint64_t stage_free_bytes = 0;
   int moving_to_target = 0;
+  int stage_usb_target = 0;
   int mount_missed = 0;
   struct stat st;
 
@@ -5265,9 +5459,26 @@ run_compress_op(gc_operation_t *op) {
     }
     snprintf(op->output_path, sizeof(op->output_path), "%s",
              compress_output_path);
+    if(!strcmp(storage_name_for_path(compress_output_path), "usb")) {
+      stage_usb_target = 1;
+      if(build_compress_stage_path(op, &game, staged_compress_path,
+                                   sizeof(staged_compress_path),
+                                   err, sizeof(err)) != 0) {
+        snprintf(op->error, sizeof(op->error), "%s", err);
+        gc_log("compress failed title=%s err=%s", op->title_id, op->error);
+        COMPRESS_FAIL_RETURN();
+      }
+      snprintf(compress_write_path, sizeof(compress_write_path), "%s",
+               staged_compress_path);
+    } else {
+      snprintf(compress_write_path, sizeof(compress_write_path), "%s",
+               compress_output_path);
+    }
   } else {
     snprintf(compress_output_path, sizeof(compress_output_path), "%s",
              game.output_path);
+    snprintf(compress_write_path, sizeof(compress_write_path), "%s",
+             compress_output_path);
     snprintf(op->output_path, sizeof(op->output_path), "%s", game.output_path);
   }
   snprintf(op->source_kind, sizeof(op->source_kind), "%s",
@@ -5289,7 +5500,7 @@ run_compress_op(gc_operation_t *op) {
     gc_checkpoint("compress prepare scan");
     if(pfs_compress_prepare_source_to_ffpfsc_opts_profile_output_ex(
            game.source_path, 0, format, pfs_delete_policy, compression_profile,
-           moving_to_target ? compress_output_path : NULL,
+           moving_to_target ? compress_write_path : NULL,
            stream_delete ? &stream_opts : NULL,
            &compress_plan, &info, err, sizeof(err)) != 0) {
       snprintf(op->error, sizeof(op->error), "%s",
@@ -5351,6 +5562,12 @@ run_compress_op(gc_operation_t *op) {
       gc_log("compress failed title=%s err=%s", op->title_id, op->error);
       COMPRESS_FAIL_RETURN();
     }
+    if(stage_usb_target && stat(staged_compress_path, &st) == 0) {
+      snprintf(op->error, sizeof(op->error), "%s",
+               "staged compression target already exists");
+      gc_log("compress failed title=%s err=%s", op->title_id, op->error);
+      COMPRESS_FAIL_RETURN();
+    }
     if(space_for_path(op->target_root, &target_free_bytes, NULL) != 0 ||
        target_free_bytes < game.required_bytes) {
       uint64_t need = target_free_bytes < game.required_bytes
@@ -5358,6 +5575,18 @@ run_compress_op(gc_operation_t *op) {
           : game.required_bytes;
       snprintf(op->error, sizeof(op->error),
                "not enough free storage on selected target storage; free %llu more bytes",
+               (unsigned long long)need);
+      gc_log("compress failed title=%s err=%s", op->title_id, op->error);
+      COMPRESS_FAIL_RETURN();
+    }
+    if(stage_usb_target &&
+       (free_bytes_for_output(staged_compress_path, &stage_free_bytes) != 0 ||
+        stage_free_bytes < game.required_bytes)) {
+      uint64_t need = stage_free_bytes < game.required_bytes
+          ? game.required_bytes - stage_free_bytes
+          : game.required_bytes;
+      snprintf(op->error, sizeof(op->error),
+               "not enough internal staging space for USB compression; free %llu more bytes",
                (unsigned long long)need);
       gc_log("compress failed title=%s err=%s", op->title_id, op->error);
       COMPRESS_FAIL_RETURN();
@@ -5425,7 +5654,7 @@ run_compress_op(gc_operation_t *op) {
     compress_rc = pfs_compress_source_to_ffpfsc_opts_profile_output_ex(
         game.source_path, 0, PFS_COMPRESS_DEFAULT_WORKERS,
         format, pfs_delete_policy, compression_profile,
-        moving_to_target ? compress_output_path : NULL,
+        moving_to_target ? compress_write_path : NULL,
         stream_delete ? &stream_opts : NULL,
         &info, err, sizeof(err));
   }
@@ -5436,6 +5665,23 @@ run_compress_op(gc_operation_t *op) {
     COMPRESS_FAIL_RETURN();
   }
   operation_store_scan_stats(op, &info);
+  if(stage_usb_target) {
+    gc_checkpoint("compress publish staged output");
+    err[0] = 0;
+    if(publish_staged_compress_output(op, info.output_path,
+                                      compress_output_path,
+                                      err, sizeof(err)) != 0) {
+      snprintf(op->error, sizeof(op->error), "%s",
+               err[0] ? err : "publish compressed image failed");
+      gc_log("compress publish failed title=%s err=%s", op->title_id,
+             op->error);
+      cleanup_failed_safe_compress_output(info.output_path, op->title_id);
+      COMPRESS_FAIL_RETURN();
+    }
+    snprintf(info.output_path, sizeof(info.output_path), "%s",
+             compress_output_path);
+    info.output_exists = 1;
+  }
   snprintf(op->output_path, sizeof(op->output_path), "%s", info.output_path);
 	  operation_store_compression_stats(op, game.source_size, info.output_path);
 	  gc_log("compress wrote title=%s output=%s nested=%s nestedSize=%llu storedSize=%llu",
@@ -5473,17 +5719,32 @@ run_compress_op(gc_operation_t *op) {
   }
   if(mount_missed) {
     char restore_err[256] = {0};
-    if(mount_switch_restore_after_operation(op, hidden, hidden_count,
-                                            restore_err,
-                                            sizeof(restore_err)) != 0) {
-      gc_log("compress mount-missed restore failed title=%s err=%s",
-             op->title_id, restore_err[0] ? restore_err : "unknown");
+    char remount_err[256] = {0};
+    gc_log("compress mount missed title=%s output=%s detail=%s; retrying bounce remount",
+           op->title_id, info.output_path, err[0] ? err : "");
+    if(force_compressed_path_bounce_remount(
+           op->title_id, info.output_path, compressed_game.nested_name,
+           compressed_game.nested_type, remount_err,
+           sizeof(remount_err)) != 0) {
+      if(mount_switch_restore_after_operation(op, hidden, hidden_count,
+                                              restore_err,
+                                              sizeof(restore_err)) != 0) {
+        gc_log("compress mount-missed restore failed title=%s err=%s",
+               op->title_id, restore_err[0] ? restore_err : "unknown");
+      }
+      snprintf(op->error, sizeof(op->error), "%s",
+               remount_err[0] ? remount_err :
+               (err[0] ? err : "ShadowMountPlus did not mount compressed output"));
+      gc_log("compress mount retry failed title=%s output=%s err=%s",
+             op->title_id, info.output_path, op->error);
+      operation_mark_not_mounted(op, op->error);
+      operation_store_compression_stats(op, game.source_size, info.output_path);
+      (void)write_validation_marker_ex(op->title_id, info.output_path, NULL,
+                                       "compression-stats", game.source_size);
+      return 0;
     }
-    snprintf(op->error, sizeof(op->error), "%s",
-             err[0] ? err : "ShadowMountPlus did not mount compressed output");
-    gc_log("compress mount missed title=%s output=%s detail=%s",
-           op->title_id, info.output_path, op->error);
-    COMPRESS_FAIL_RETURN();
+    gc_log("compress mount retry succeeded title=%s output=%s",
+           op->title_id, info.output_path);
   }
 
   gc_checkpoint("compress wait repair");
@@ -5598,16 +5859,24 @@ run_compress_op(gc_operation_t *op) {
 }
 #undef COMPRESS_FAIL_RETURN
 
+static void operation_append_error_detail(gc_operation_t *op,
+                                          const char *detail);
+
 static int
 run_uncompress_op(gc_operation_t *op) {
   gc_game_t game = {0};
+  gc_game_t output_game = {0};
+  gc_hidden_instance_t hidden[GC_MAX_GAMES];
   char err[256] = {0};
+  char restore_err[256] = {0};
   pfs_decompress_info_t info = {0};
   gc_source_quarantine_t source_quarantine = {0};
   char target_path[1024] = {0};
   int as_image = !strcmp(op->format, "image");
   int delete_after = !strcmp(op->delete_policy, "after");
   int pfs_delete_policy = PFS_DELETE_KEEP;
+  size_t hidden_count = 0;
+  int mount_missed = 0;
 
   gc_checkpoint("uncompress find game");
   gc_log("uncompress start op=%s title=%s policy=%s mode=%s", op->id,
@@ -5719,7 +5988,6 @@ run_uncompress_op(gc_operation_t *op) {
          as_image ? "image" : "app");
   struct stat output_st;
   pfs_app_info_t output_probe = {0};
-  char expected_mount[1024] = {0};
   char hint_err[256] = {0};
   err[0] = 0;
   if(as_image) {
@@ -5729,18 +5997,9 @@ run_uncompress_op(gc_operation_t *op) {
                        sizeof(err)) != 0) {
       snprintf(op->error, sizeof(op->error), "%s",
                err[0] ? err : "uncompressed image is not valid");
-	      gc_log("uncompress output verify failed title=%s path=%s err=%s",
-	             op->title_id, info.output_path, op->error);
-	      cleanup_failed_uncompress_output(info.output_path, op->title_id);
-      return -1;
-	    }
-    if(shadow_image_mount_point(info.output_path, output_probe.nested_type,
-                                expected_mount,
-                                sizeof(expected_mount)) != 0) {
-      snprintf(op->error, sizeof(op->error), "%s",
-               "could not derive image remount path");
-      gc_log("uncompress image remount failed title=%s path=%s err=%s",
+      gc_log("uncompress output verify failed title=%s path=%s err=%s",
              op->title_id, info.output_path, op->error);
+      cleanup_failed_uncompress_output(info.output_path, op->title_id);
       return -1;
     }
   } else {
@@ -5790,52 +6049,65 @@ run_uncompress_op(gc_operation_t *op) {
     }
   }
 
+  output_game = game;
+  snprintf(output_game.source_path, sizeof(output_game.source_path), "%s",
+           info.output_path);
+  snprintf(output_game.output_path, sizeof(output_game.output_path), "%s",
+           info.output_path);
+  output_game.source_kind = as_image ? GC_SOURCE_IMAGE : GC_SOURCE_FOLDER;
   if(as_image) {
-    hint_err[0] = 0;
-    if(gc_shadowmount_prepare_image_hints_for_title(
-           op->title_id, info.output_path, output_probe.nested_type,
-           hint_err, sizeof(hint_err)) != 0) {
+    snprintf(output_game.image_path, sizeof(output_game.image_path), "%s",
+             info.output_path);
+    output_game.nested_type = output_probe.nested_type;
+  }
+  set_game_mount_status(&output_game, 0, "not-mounted");
+
+  gc_checkpoint("uncompress mount output");
+  err[0] = 0;
+  if(mount_selected_instance_hidden_exclusive(
+         op, &output_game, hidden, GC_MAX_GAMES, &hidden_count, &mount_missed,
+         err, sizeof(err)) != 0) {
+    if(mount_switch_restore_after_operation(op, hidden, hidden_count,
+                                            restore_err,
+                                            sizeof(restore_err)) != 0) {
+      gc_log("uncompress mount restore failed title=%s err=%s",
+             op->title_id, restore_err[0] ? restore_err : "unknown");
+      operation_append_error_detail(op, restore_err);
+    }
+    snprintf(op->error, sizeof(op->error), "%s",
+             err[0] ? err : "ShadowMountPlus remount failed");
+    gc_log("uncompress remount failed title=%s err=%s", op->title_id,
+           op->error);
+    restore_quarantined_uncompress_source(&source_quarantine, op->title_id);
+    return -1;
+  }
+  if(mount_missed) {
+    if(mount_switch_restore_after_operation(op, hidden, hidden_count,
+                                            restore_err,
+                                            sizeof(restore_err)) != 0) {
       restore_quarantined_uncompress_source(&source_quarantine, op->title_id);
       snprintf(op->error, sizeof(op->error), "%s",
-               hint_err[0] ? hint_err : "ShadowMountPlus image hints failed");
-      gc_log("uncompress image hint failed title=%s path=%s err=%s",
-             op->title_id, info.output_path, op->error);
-      return -1;
-    }
-    uncompress_request_shadowmount_scan(op, err, sizeof(err));
-    gc_checkpoint("uncompress wait image remount");
-    job_set_phase("mounting", 0, 0, "Waiting for remount");
-    err[0] = 0;
-    if(wait_for_shadowmount_links(op->title_id, expected_mount,
-                                  info.output_path, err,
-                                  sizeof(err)) != 0) {
-      if(shadowmount_mount_missed(err)) {
-        return uncompress_complete_not_mounted(op, &source_quarantine, &info,
-                                               as_image, err, sizeof(err));
-      }
-      snprintf(op->error, sizeof(op->error), "%s",
-               err[0] ? err : "ShadowMountPlus remount failed");
-      gc_log("uncompress image remount failed title=%s err=%s",
-             op->title_id, op->error);
-      restore_quarantined_uncompress_source(&source_quarantine, op->title_id);
-      return -1;
-    }
-  } else {
-    uncompress_request_shadowmount_scan(op, err, sizeof(err));
-    gc_checkpoint("uncompress force remount");
-    if(force_folder_path_bounce_remount(op->title_id, info.output_path,
-                                        err, sizeof(err)) != 0) {
-      if(shadowmount_mount_missed(err)) {
-        return uncompress_complete_not_mounted(op, &source_quarantine, &info,
-                                               as_image, err, sizeof(err));
-      }
-      snprintf(op->error, sizeof(op->error), "%s",
-               err[0] ? err : "ShadowMountPlus remount failed");
-      gc_log("uncompress remount failed title=%s err=%s", op->title_id,
-             op->error);
-      restore_quarantined_uncompress_source(&source_quarantine, op->title_id);
-      return -1;
-    }
+               restore_err[0] ? restore_err :
+               "could not restore duplicate instances");
+	    gc_log("uncompress mount-missed restore failed title=%s err=%s",
+	           op->title_id, op->error);
+	    return -1;
+	  }
+    return uncompress_complete_not_mounted(
+        op, &source_quarantine, &info, as_image,
+        err[0] ? err : "ShadowMountPlus did not mount uncompressed output",
+        err, sizeof(err));
+  }
+  if(mount_switch_restore_after_operation_ex(op, hidden, hidden_count, 0,
+                                             restore_err,
+                                             sizeof(restore_err)) != 0) {
+    restore_quarantined_uncompress_source(&source_quarantine, op->title_id);
+    snprintf(op->error, sizeof(op->error), "%s",
+             restore_err[0] ? restore_err :
+             "could not restore duplicate instances");
+    gc_log("uncompress restore failed title=%s err=%s", op->title_id,
+           op->error);
+    return -1;
   }
   if(uncompress_delete_quarantined_source_or_fail(op, &source_quarantine,
                                                   err, sizeof(err)) != 0) {
@@ -5851,11 +6123,18 @@ run_uncompress_op(gc_operation_t *op) {
 static int
 run_validate_repair_op(gc_operation_t *op) {
   gc_game_t game = {0};
+  gc_hidden_instance_t hidden[GC_MAX_GAMES];
   char err[256] = {0};
+  char restore_err[256] = {0};
   pfs_repair_info_t repair = {0};
   const char *repair_path = NULL;
+  char final_result[32] = {0};
   uint64_t source_size = 0;
   uint64_t free_bytes = 0;
+  size_t hidden_count = 0;
+  int mount_missed = 0;
+
+  memset(hidden, 0, sizeof(hidden));
   gc_checkpoint("validate find game");
   gc_log("validate start op=%s title=%s", op->id, op->title_id);
   append_operation_phase(op, "resolving");
@@ -5887,12 +6166,34 @@ run_validate_repair_op(gc_operation_t *op) {
          (unsigned long long)source_size,
          (unsigned long long)free_bytes,
          game.validation_status);
-  err[0] = 0;
-  job_set_phase("mounting", 0, 0, "Requesting ShadowMount scan");
-  if(gc_shadowmount_request_scan_cancelable(err, sizeof(err)) != 0 &&
-     !job_cancelled()) {
-    gc_log("validate scan request failed title=%s err=%s", op->title_id,
-           err[0] ? err : "unknown");
+  if(mount_selected_instance_hidden_exclusive(
+         op, &game, hidden, GC_MAX_GAMES, &hidden_count, &mount_missed,
+         err, sizeof(err)) != 0) {
+    snprintf(op->error, sizeof(op->error), "%s",
+             err[0] ? err : "could not mount selected source");
+    gc_log("validate mount failed title=%s err=%s", op->title_id, op->error);
+    if(mount_switch_restore_after_operation(op, hidden, hidden_count,
+                                            restore_err,
+                                            sizeof(restore_err)) != 0) {
+      gc_log("validate mount restore failed title=%s err=%s",
+             op->title_id, restore_err[0] ? restore_err : "unknown");
+      operation_append_error_detail(op, restore_err);
+    }
+    return -1;
+  }
+  if(mount_missed) {
+    snprintf(op->error, sizeof(op->error), "%s",
+             err[0] ? err : "selected source was not mounted");
+    gc_log("validate mount missed title=%s path=%s detail=%s",
+           op->title_id, repair_path ? repair_path : "", op->error);
+    if(mount_switch_restore_after_operation(op, hidden, hidden_count,
+                                            restore_err,
+                                            sizeof(restore_err)) != 0) {
+      gc_log("validate mount-missed restore failed title=%s err=%s",
+             op->title_id, restore_err[0] ? restore_err : "unknown");
+      operation_append_error_detail(op, restore_err);
+    }
+    return -1;
   }
   gc_checkpoint("validate repair");
   if(repair_with_wait(op->title_id, repair_path, &repair, err,
@@ -5907,25 +6208,63 @@ run_validate_repair_op(gc_operation_t *op) {
     snprintf(op->error, sizeof(op->error), "%s",
              err[0] ? err : "validate and repair failed");
     gc_log("validate repair failed title=%s err=%s", op->title_id, op->error);
+    if(mount_switch_restore_after_operation(op, hidden, hidden_count,
+                                            restore_err,
+                                            sizeof(restore_err)) != 0) {
+      gc_log("validate repair restore failed title=%s err=%s",
+             op->title_id, restore_err[0] ? restore_err : "unknown");
+      operation_append_error_detail(op, restore_err);
+    }
     return -1;
   }
   operation_store_repair_success(op, &repair);
+  snprintf(final_result, sizeof(final_result), "%s", op->result);
   if(repair_force_path_bounce_remount(op->title_id, repair_path, &repair,
                                       err, sizeof(err)) != 0) {
     if(shadowmount_mount_missed(err)) {
       operation_mark_verified_not_mounted(op, err);
+      snprintf(final_result, sizeof(final_result), "%s", op->result);
       (void)write_validation_marker_ex(op->title_id, repair_path, &repair,
                                        op->result, 0);
+      if(mount_switch_restore_after_operation_ex(op, hidden, hidden_count, 0,
+                                                 restore_err,
+                                                 sizeof(restore_err)) != 0) {
+        snprintf(op->error, sizeof(op->error), "%s",
+                 restore_err[0] ? restore_err :
+                 "could not restore duplicate instances");
+        gc_log("validate verified-not-mounted restore failed title=%s err=%s",
+               op->title_id, op->error);
+        return -1;
+      }
+      snprintf(op->result, sizeof(op->result), "%s", final_result);
       return 0;
     }
     snprintf(op->error, sizeof(op->error), "%s",
              err[0] ? err : "repair smoke verification failed");
     gc_log("validate smoke verify failed title=%s err=%s", op->title_id,
            op->error);
+    if(mount_switch_restore_after_operation(op, hidden, hidden_count,
+                                            restore_err,
+                                            sizeof(restore_err)) != 0) {
+      gc_log("validate smoke restore failed title=%s err=%s",
+             op->title_id, restore_err[0] ? restore_err : "unknown");
+      operation_append_error_detail(op, restore_err);
+    }
     return -1;
   }
   (void)write_validation_marker_ex(op->title_id, repair_path, &repair,
                                    op->result, 0);
+  if(mount_switch_restore_after_operation_ex(op, hidden, hidden_count, 0,
+                                             restore_err,
+                                             sizeof(restore_err)) != 0) {
+    snprintf(op->error, sizeof(op->error), "%s",
+             restore_err[0] ? restore_err :
+             "could not restore duplicate instances");
+    gc_log("validate restore failed title=%s err=%s", op->title_id,
+           op->error);
+    return -1;
+  }
+  snprintf(op->result, sizeof(op->result), "%s", final_result);
   gc_log("validate complete title=%s result=%s repaired=%llu",
          op->title_id, op->result,
          (unsigned long long)op->repaired_blocks);
@@ -5935,13 +6274,19 @@ run_validate_repair_op(gc_operation_t *op) {
 static int
 run_validate_only_op(gc_operation_t *op) {
   gc_game_t game = {0};
+  gc_hidden_instance_t hidden[GC_MAX_GAMES];
   char err[256] = {0};
+  char restore_err[256] = {0};
   pfs_repair_info_t repair = {0};
   const char *repair_path = NULL;
+  char final_result[32] = {0};
   uint64_t source_size = 0;
   uint64_t free_bytes = 0;
+  size_t hidden_count = 0;
+  int mount_missed = 0;
   int scan_rc = -1;
 
+  memset(hidden, 0, sizeof(hidden));
   gc_checkpoint("validate-only find game");
   gc_log("validate-only start op=%s title=%s", op->id, op->title_id);
   append_operation_phase(op, "resolving");
@@ -5974,12 +6319,35 @@ run_validate_only_op(gc_operation_t *op) {
          (unsigned long long)source_size,
          (unsigned long long)free_bytes,
          game.validation_status);
-  err[0] = 0;
-  job_set_phase("mounting", 0, 0, "Requesting ShadowMount scan");
-  if(gc_shadowmount_request_scan_cancelable(err, sizeof(err)) != 0 &&
-     !job_cancelled()) {
-    gc_log("validate-only scan request failed title=%s err=%s",
-           op->title_id, err[0] ? err : "unknown");
+  if(mount_selected_instance_hidden_exclusive(
+         op, &game, hidden, GC_MAX_GAMES, &hidden_count, &mount_missed,
+         err, sizeof(err)) != 0) {
+    snprintf(op->error, sizeof(op->error), "%s",
+             err[0] ? err : "could not mount selected source");
+    gc_log("validate-only mount failed title=%s err=%s",
+           op->title_id, op->error);
+    if(mount_switch_restore_after_operation(op, hidden, hidden_count,
+                                            restore_err,
+                                            sizeof(restore_err)) != 0) {
+      gc_log("validate-only mount restore failed title=%s err=%s",
+             op->title_id, restore_err[0] ? restore_err : "unknown");
+      operation_append_error_detail(op, restore_err);
+    }
+    return -1;
+  }
+  if(mount_missed) {
+    snprintf(op->error, sizeof(op->error), "%s",
+             err[0] ? err : "selected source was not mounted");
+    gc_log("validate-only mount missed title=%s path=%s detail=%s",
+           op->title_id, repair_path ? repair_path : "", op->error);
+    if(mount_switch_restore_after_operation(op, hidden, hidden_count,
+                                            restore_err,
+                                            sizeof(restore_err)) != 0) {
+      gc_log("validate-only mount-missed restore failed title=%s err=%s",
+             op->title_id, restore_err[0] ? restore_err : "unknown");
+      operation_append_error_detail(op, restore_err);
+    }
+    return -1;
   }
   gc_checkpoint("validate-only scan");
   if(repair_scan_only_with_wait(op->title_id, repair_path, &repair, &scan_rc,
@@ -5994,6 +6362,13 @@ run_validate_only_op(gc_operation_t *op) {
     snprintf(op->error, sizeof(op->error), "%s",
              err[0] ? err : "validate-only scan failed");
     gc_log("validate-only failed title=%s err=%s", op->title_id, op->error);
+    if(mount_switch_restore_after_operation(op, hidden, hidden_count,
+                                            restore_err,
+                                            sizeof(restore_err)) != 0) {
+      gc_log("validate-only scan restore failed title=%s err=%s",
+             op->title_id, restore_err[0] ? restore_err : "unknown");
+      operation_append_error_detail(op, restore_err);
+    }
     return -1;
   }
 
@@ -6002,9 +6377,10 @@ run_validate_only_op(gc_operation_t *op) {
   operation_store_repair_counters(op, &repair);
   snprintf(op->repair_summary, sizeof(op->repair_summary), "%s",
            repair.outdir);
-	  snprintf(op->result, sizeof(op->result), "%s",
+	  snprintf(final_result, sizeof(final_result), "%s",
 	           scan_rc == PFS_REPAIR_SCAN_REPAIR_NEEDED ||
 	               repair.repaired_blocks > 0 ? "bad-blocks-found" : "clean");
+	  snprintf(op->result, sizeof(op->result), "%s", final_result);
 	  if(repair.repaired_blocks > 0) {
 	    delete_validation_marker_for_path(op->title_id, repair_path);
 	  }
@@ -6021,18 +6397,37 @@ run_validate_only_op(gc_operation_t *op) {
       } else {
 	        snprintf(op->result, sizeof(op->result), "%s",
 	                 "bad-blocks-found-not-mounted");
+	        snprintf(final_result, sizeof(final_result), "%s", op->result);
 	        op->error[0] = 0;
 	        delete_validation_marker_for_path(op->title_id, repair_path);
 	        gc_log("validate-only complete but not mounted title=%s bad=%llu detail=%s",
                op->title_id, (unsigned long long)op->bad_blocks_found,
                err[0] ? err : "");
       }
+      if(mount_switch_restore_after_operation_ex(op, hidden, hidden_count, 0,
+                                                 restore_err,
+                                                 sizeof(restore_err)) != 0) {
+        snprintf(op->error, sizeof(op->error), "%s",
+                 restore_err[0] ? restore_err :
+                 "could not restore duplicate instances");
+        gc_log("validate-only not-mounted restore failed title=%s err=%s",
+               op->title_id, op->error);
+        return -1;
+      }
+      snprintf(op->result, sizeof(op->result), "%s", final_result);
       return 0;
     }
     snprintf(op->error, sizeof(op->error), "%s",
              err[0] ? err : "ShadowMountPlus remount failed");
     gc_log("validate-only remount failed title=%s err=%s",
            op->title_id, op->error);
+    if(mount_switch_restore_after_operation(op, hidden, hidden_count,
+                                            restore_err,
+                                            sizeof(restore_err)) != 0) {
+      gc_log("validate-only remount restore failed title=%s err=%s",
+             op->title_id, restore_err[0] ? restore_err : "unknown");
+      operation_append_error_detail(op, restore_err);
+    }
     return -1;
   }
   if(repair.repaired_blocks == 0) {
@@ -6041,6 +6436,17 @@ run_validate_only_op(gc_operation_t *op) {
 	  } else {
 	    delete_validation_marker_for_path(op->title_id, repair_path);
 	  }
+  if(mount_switch_restore_after_operation_ex(op, hidden, hidden_count, 0,
+                                             restore_err,
+                                             sizeof(restore_err)) != 0) {
+    snprintf(op->error, sizeof(op->error), "%s",
+             restore_err[0] ? restore_err :
+             "could not restore duplicate instances");
+    gc_log("validate-only restore failed title=%s err=%s", op->title_id,
+           op->error);
+    return -1;
+  }
+  snprintf(op->result, sizeof(op->result), "%s", final_result);
   gc_log("validate-only complete title=%s result=%s bad=%llu",
          op->title_id, op->result,
          (unsigned long long)op->bad_blocks_found);
@@ -6183,13 +6589,19 @@ run_refresh_mount_op(gc_operation_t *op) {
            op->error);
     goto restore_and_fail;
   }
+  if(mount_switch_clear_live_title_mount(op->title_id, err, sizeof(err)) != 0) {
+    snprintf(op->error, sizeof(op->error), "%s",
+             err[0] ? err : "could not clear live mount state");
+    gc_log("refresh-mount live mount clear failed title=%s err=%s",
+           op->title_id, op->error);
+    goto restore_and_fail;
+  }
 
   gc_checkpoint("refresh-mount mount selected");
   append_operation_phase(op, "mounting");
   job_set_phase("mounting", 0, 0, "Mounting");
-  if(gc_shadowmount_request_source_scan_cancelable(game.source_path,
-                                                   scan_err,
-                                                   sizeof(scan_err)) != 0) {
+  if(gc_shadowmount_request_title_source_scan_cancelable(
+         game.title_id, game.source_path, scan_err, sizeof(scan_err)) != 0) {
     snprintf(op->error, sizeof(op->error), "%s",
              scan_err[0] ? scan_err : "could not request ShadowMount scan");
     gc_log("refresh-mount scan failed title=%s err=%s", op->title_id,
@@ -6260,15 +6672,11 @@ run_refresh_mount_op(gc_operation_t *op) {
   }
 
   if(mount_missed) {
-    snprintf(op->result, sizeof(op->result), "%s", "not-mounted");
-    op->error[0] = 0;
-    if(was_validated) {
-      (void)write_validation_marker_ex(op->title_id, game.source_path, NULL,
-                                       "verified-not-mounted", 0);
-    }
-    gc_log("refresh-mount complete but not mounted title=%s path=%s detail=%s",
-           op->title_id, game.source_path, err[0] ? err : "");
-    return 0;
+    snprintf(op->error, sizeof(op->error), "%s",
+             err[0] ? err : "selected source was not mounted");
+    gc_log("refresh-mount failed not mounted title=%s path=%s detail=%s",
+           op->title_id, game.source_path, op->error);
+    return -1;
   }
 
   snprintf(op->error, sizeof(op->error), "%s", "mount did not complete");

@@ -33,10 +33,15 @@ int gc_shadowmount_remove_title_pfsc_hints(const char *title_id,
 int gc_shadowmount_remove_outer_sector_hint(const char *outer_path,
                                             char *err,
                                             size_t err_size);
+int gc_shadowmount_enable_pfsc_direct_game(char *err, size_t err_size);
 
 int gc_shadowmount_request_source_scan(const char *source_path,
                                        char *err,
                                        size_t err_size);
+int gc_shadowmount_request_title_source_scan(const char *title_id,
+                                             const char *source_path,
+                                             char *err,
+                                             size_t err_size);
 int gc_shadowmount_request_scan(char *err, size_t err_size);
 int gc_shadowmount_restart_running(char *detail, size_t detail_size);
 

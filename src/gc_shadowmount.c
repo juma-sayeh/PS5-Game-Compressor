@@ -5,6 +5,7 @@
 #include "gc_shadowmount.h"
 
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -19,12 +20,28 @@
 #include <sys/user.h>
 #include <unistd.h>
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+
 #define SHADOWMOUNT_DIR "/data/shadowmount"
 #define SHADOWMOUNT_CONFIG SHADOWMOUNT_DIR "/config.ini"
 #define SHADOWMOUNT_CONFIG_TMP SHADOWMOUNT_DIR "/config.ini.game-compressor.tmp"
 #define SHADOWMOUNT_AUTOTUNE SHADOWMOUNT_DIR "/autotune.ini"
 #define SHADOWMOUNT_AUTOTUNE_TMP SHADOWMOUNT_DIR "/autotune.ini.game-compressor.tmp"
 #define SHADOWMOUNT_MANUAL_LIST SHADOWMOUNT_DIR "/manual.lst"
+#define SHADOWMOUNT_MANUAL_LIST_TMP \
+  SHADOWMOUNT_DIR "/manual.lst.game-compressor.tmp"
+#define SHADOWMOUNT_PAYLOAD_MANAGER_ELF \
+  "/data/pldmgr/payloads/ShadowMountPlus/shadowmountplus.elf"
+#define SHADOWMOUNT_PAYLOAD_MANAGER_ELF_LEGACY \
+  "/data/pldmgr/payloads/shadowmountplus/shadowmountplus.elf"
+#define SHADOWMOUNT_PAYLOAD_MANAGER_DIR \
+  "/data/pldmgr/payloads/ShadowMountPlus"
+#define SHADOWMOUNT_PAYLOAD_MANAGER_DIR_LEGACY \
+  "/data/pldmgr/payloads/shadowmountplus"
+#define PAYLOAD_MANAGER_PORT 8084
+#define LOCAL_HTTP_TIMEOUT_SECONDS 5
 #define SHADOWMOUNT_PFSC_SECTOR 65536U
 
 int sceKernelLoadStartModule(const char *, size_t, const void *, uint32_t,
@@ -395,6 +412,95 @@ line_matches_image_mode(const char *line, const char *image_name) {
   char *value = trim_left(eq + 1);
   trim_right(value);
   return !strcasecmp(value, image_name);
+}
+
+static int
+line_matches_config_key(const char *line, const char *key) {
+  char tmp[512];
+  int n = snprintf(tmp, sizeof(tmp), "%s", line ? line : "");
+  if(n < 0 || (size_t)n >= sizeof(tmp)) return 0;
+
+  char *p = trim_left(tmp);
+  if(!*p || *p == '#' || *p == ';') return 0;
+  char *eq = strchr(p, '=');
+  if(!eq) return 0;
+  *eq = 0;
+  trim_right(p);
+  return !strcasecmp(p, key ? key : "");
+}
+
+static int
+upsert_config_key_value(const char *key, const char *value,
+                        char *err, size_t err_size) {
+  char line[384];
+  FILE *in = NULL;
+  FILE *out = NULL;
+  int found = 0;
+  int rc = -1;
+
+  if(!key || !key[0] || !value) {
+    set_err(err, err_size, "bad ShadowMount config key");
+    return -1;
+  }
+  if(mkdir_if_needed(SHADOWMOUNT_DIR) != 0) {
+    set_errno_err(err, err_size, "create /data/shadowmount");
+    return -1;
+  }
+  int n = snprintf(line, sizeof(line), "%s=%s\n", key, value);
+  if(n < 0 || (size_t)n >= sizeof(line)) {
+    set_err(err, err_size, "ShadowMount config line too long");
+    return -1;
+  }
+
+  in = fopen(SHADOWMOUNT_CONFIG, "r");
+  out = fopen(SHADOWMOUNT_CONFIG_TMP, "w");
+  if(!out) {
+    if(in) fclose(in);
+    set_errno_err(err, err_size, "open ShadowMount config temp");
+    return -1;
+  }
+
+  if(in) {
+    char existing[512];
+    while(fgets(existing, sizeof(existing), in)) {
+      if(line_matches_config_key(existing, key)) {
+        if(!found && fputs(line, out) == EOF) {
+          set_errno_err(err, err_size, "write ShadowMount config key");
+          goto done;
+        }
+        found = 1;
+        continue;
+      }
+      if(fputs(existing, out) == EOF) {
+        set_errno_err(err, err_size, "write ShadowMount config");
+        goto done;
+      }
+    }
+    if(ferror(in)) {
+      set_errno_err(err, err_size, "read ShadowMount config");
+      goto done;
+    }
+  }
+
+  if(!found && fputs(line, out) == EOF) {
+    set_errno_err(err, err_size, "append ShadowMount config key");
+    goto done;
+  }
+  if(replace_shadowmount_temp(&out, SHADOWMOUNT_CONFIG_TMP,
+                              SHADOWMOUNT_CONFIG,
+                              "flush ShadowMount config",
+                              "close ShadowMount config temp",
+                              "replace ShadowMount config",
+                              err, err_size) != 0) {
+    goto done;
+  }
+  rc = 0;
+
+done:
+  if(in) fclose(in);
+  if(out) fclose(out);
+  if(rc != 0) unlink(SHADOWMOUNT_CONFIG_TMP);
+  return rc;
 }
 
 static int
@@ -770,6 +876,7 @@ gc_shadowmount_prepare_pfsc_hints_for_title(const char *title_id,
                                             char *err,
                                             size_t err_size) {
   if(err && err_size) err[0] = 0;
+  if(gc_shadowmount_enable_pfsc_direct_game(err, err_size) != 0) return -1;
   if(gc_shadowmount_remove_title_pfsc_hints(title_id, outer_path,
                                            err, err_size) != 0) {
     return -1;
@@ -826,30 +933,108 @@ gc_shadowmount_remove_outer_sector_hint(const char *outer_path,
   return remove_sector_hint(outer_path, err, err_size);
 }
 
-static int
-manual_list_needs_separator(int fd, int *needs_separator) {
-  struct stat st;
-  char ch;
-
-  if(!needs_separator) {
-    errno = EINVAL;
-    return -1;
-  }
-  *needs_separator = 0;
-  if(fstat(fd, &st) != 0) return -1;
-  if(st.st_size <= 0) return 0;
-  if(lseek(fd, st.st_size - 1, SEEK_SET) < 0) return -1;
-  if(read(fd, &ch, 1) != 1) return -1;
-  *needs_separator = ch != '\n';
-  return lseek(fd, 0, SEEK_END) < 0 ? -1 : 0;
+int
+gc_shadowmount_enable_pfsc_direct_game(char *err, size_t err_size) {
+  if(err && err_size) err[0] = 0;
+  return upsert_config_key_value("pfsc_direct_game", "1", err, err_size);
 }
 
-int
-gc_shadowmount_request_source_scan(const char *source_path,
-                                   char *err, size_t err_size) {
-  int fd;
-  int needs_separator;
+static int
+shadowmount_title_id_valid(const char *title_id) {
+  if(!title_id || strlen(title_id) != 9) return 0;
+  for(size_t i = 0; i < 9; i++) {
+    if(!isalnum((unsigned char)title_id[i])) return 0;
+  }
+  return 1;
+}
+
+static void
+manual_list_strip_line(char *line) {
   size_t len;
+  if(!line) return;
+  len = strlen(line);
+  while(len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+    line[--len] = 0;
+  }
+}
+
+static int
+manual_list_line_matches_path(char *line, const char *source_path) {
+  if(!line || !source_path) return 0;
+  manual_list_strip_line(line);
+  return strcmp(line, source_path) == 0;
+}
+
+static int
+manual_list_line_matches_title(const char *line, const char *title_id) {
+  const char *name;
+  if(!line || !shadowmount_title_id_valid(title_id)) return 0;
+  name = base_name(line);
+  return strncmp(name, title_id, 9) == 0 &&
+      (name[9] == 0 || name[9] == '-' || name[9] == '.');
+}
+
+static int
+manual_list_upsert_source(const char *title_id, const char *source_path,
+                          char *err, size_t err_size) {
+  FILE *in = NULL;
+  FILE *out = NULL;
+  char line[PATH_MAX + 8];
+  int rc = -1;
+  int replace_same_title = shadowmount_title_id_valid(title_id);
+
+  in = fopen(SHADOWMOUNT_MANUAL_LIST, "r");
+  if(!in && errno != ENOENT) {
+    set_errno_err(err, err_size, "open ShadowMount manual.lst");
+    goto done;
+  }
+  out = fopen(SHADOWMOUNT_MANUAL_LIST_TMP, "w");
+  if(!out) {
+    set_errno_err(err, err_size, "open ShadowMount manual temp");
+    goto done;
+  }
+  if(in) {
+    while(fgets(line, sizeof(line), in)) {
+      if(manual_list_line_matches_path(line, source_path)) continue;
+      if(replace_same_title &&
+         manual_list_line_matches_title(line, title_id)) {
+        continue;
+      }
+      if(line[0] == 0) continue;
+      if(fprintf(out, "%s\n", line) < 0) {
+        set_errno_err(err, err_size, "write ShadowMount manual source");
+        goto done;
+      }
+    }
+    if(ferror(in)) {
+      set_errno_err(err, err_size, "read ShadowMount manual.lst");
+      goto done;
+    }
+  }
+  if(fprintf(out, "%s\n", source_path) < 0) {
+    set_errno_err(err, err_size, "write ShadowMount manual source");
+    goto done;
+  }
+  if(replace_shadowmount_temp(&out, SHADOWMOUNT_MANUAL_LIST_TMP,
+                              SHADOWMOUNT_MANUAL_LIST,
+                              "flush ShadowMount manual.lst",
+                              "close ShadowMount manual.lst",
+                              "replace ShadowMount manual.lst",
+                              err, err_size) != 0) {
+    goto done;
+  }
+  rc = 0;
+
+done:
+  if(in) fclose(in);
+  if(out) fclose(out);
+  if(rc != 0) unlink(SHADOWMOUNT_MANUAL_LIST_TMP);
+  return rc;
+}
+
+static int
+request_source_scan_locked(const char *title_id, const char *source_path,
+                           char *err, size_t err_size) {
   if(err && err_size) err[0] = 0;
   if(!source_path || source_path[0] != '/') {
     set_err(err, err_size, "bad ShadowMount source path");
@@ -859,28 +1044,28 @@ gc_shadowmount_request_source_scan(const char *source_path,
     set_errno_err(err, err_size, "create /data/shadowmount");
     return -1;
   }
-  fd = open(SHADOWMOUNT_MANUAL_LIST, O_RDWR | O_CREAT | O_APPEND, 0666);
-  if(fd < 0) {
-    set_errno_err(err, err_size, "open ShadowMount manual.lst");
+  if(manual_list_upsert_source(title_id, source_path, err, err_size) != 0) {
     return -1;
   }
-  if(manual_list_needs_separator(fd, &needs_separator) != 0) {
-    set_errno_err(err, err_size, "inspect ShadowMount manual.lst");
-    close(fd);
-    return -1;
-  }
-  len = strlen(source_path);
-  if((needs_separator && write(fd, "\n", 1) != 1) ||
-     write(fd, source_path, len) != (ssize_t)len ||
-     write(fd, "\n", 1) != 1) {
-    set_errno_err(err, err_size, "append ShadowMount manual source");
-    close(fd);
-    return -1;
-  }
-  fsync(fd);
-  close(fd);
   chmod(SHADOWMOUNT_MANUAL_LIST, 0666);
   return gc_shadowmount_request_scan(err, err_size);
+}
+
+int
+gc_shadowmount_request_source_scan(const char *source_path,
+                                   char *err, size_t err_size) {
+  return request_source_scan_locked(NULL, source_path, err, err_size);
+}
+
+int
+gc_shadowmount_request_title_source_scan(const char *title_id,
+                                         const char *source_path,
+                                         char *err, size_t err_size) {
+  if(!shadowmount_title_id_valid(title_id)) {
+    set_err(err, err_size, "bad ShadowMount title id");
+    return -1;
+  }
+  return request_source_scan_locked(title_id, source_path, err, err_size);
 }
 
 int
@@ -916,16 +1101,234 @@ gc_shadowmount_request_scan(char *err, size_t err_size) {
   return 0;
 }
 
+static int
+ends_with_ci_local(const char *s, const char *suffix) {
+  size_t n, m, i;
+  if(!s || !suffix) return 0;
+  n = strlen(s);
+  m = strlen(suffix);
+  if(m > n) return 0;
+  s += n - m;
+  for(i = 0; i < m; i++) {
+    if(tolower((unsigned char)s[i]) !=
+       tolower((unsigned char)suffix[i])) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static int
+name_contains_shadowmount(const char *name) {
+  const char *needle = "shadowmount";
+  size_t n = strlen(needle);
+  if(!name) return 0;
+  for(; *name; name++) {
+    size_t i;
+    for(i = 0; i < n; i++) {
+      if(!name[i] ||
+         tolower((unsigned char)name[i]) != (unsigned char)needle[i]) {
+        break;
+      }
+    }
+    if(i == n) return 1;
+  }
+  return 0;
+}
+
+static int
+find_shadowmount_payload_manager_elf(char *path, size_t path_size,
+                                     char *detail, size_t detail_size) {
+  const char *dirs[] = {
+      SHADOWMOUNT_PAYLOAD_MANAGER_DIR,
+      SHADOWMOUNT_PAYLOAD_MANAGER_DIR_LEGACY,
+  };
+  char first_valid[PATH_MAX];
+  char candidate[PATH_MAX];
+  char candidate_detail[256];
+  size_t i;
+  first_valid[0] = 0;
+  if(path && path_size) path[0] = 0;
+  if(detail && detail_size) detail[0] = 0;
+  for(i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
+    DIR *d = opendir(dirs[i]);
+    struct dirent *ent;
+    if(!d) {
+      if(detail && detail_size && !detail[0]) {
+        snprintf(detail, detail_size, "open %s: %s", dirs[i], strerror(errno));
+      }
+      continue;
+    }
+    while((ent = readdir(d))) {
+      if(ent->d_name[0] == '.' || !ends_with_ci_local(ent->d_name, ".elf")) {
+        continue;
+      }
+      if(snprintf(candidate, sizeof(candidate), "%s/%s", dirs[i],
+                  ent->d_name) >= (int)sizeof(candidate)) {
+        continue;
+      }
+      candidate_detail[0] = 0;
+      if(!path_is_regular_elf(candidate, candidate_detail,
+                              sizeof(candidate_detail))) {
+        if(detail && detail_size && !detail[0]) {
+          snprintf(detail, detail_size, "%s",
+                   candidate_detail[0] ? candidate_detail : candidate);
+        }
+        continue;
+      }
+      if(!first_valid[0]) {
+        snprintf(first_valid, sizeof(first_valid), "%s", candidate);
+      }
+      if(name_contains_shadowmount(ent->d_name)) {
+        closedir(d);
+        snprintf(path, path_size, "%s", candidate);
+        return 0;
+      }
+    }
+    closedir(d);
+  }
+  if(first_valid[0]) {
+    snprintf(path, path_size, "%s", first_valid);
+    return 0;
+  }
+  if(detail && detail_size && !detail[0]) {
+    snprintf(detail, detail_size, "%s", "no ShadowMountPlus payload ELF found");
+  }
+  return -1;
+}
+
+static int
+local_send_all(int fd, const char *data, size_t size) {
+  size_t off = 0;
+  while(off < size) {
+    ssize_t n = send(fd, data + off, size - off, 0);
+    if(n < 0) {
+      if(errno == EINTR) continue;
+      return -1;
+    }
+    if(n == 0) return -1;
+    off += (size_t)n;
+  }
+  return 0;
+}
+
+static int
+payload_manager_launch(const char *elf_path, char *detail, size_t detail_size) {
+  int fd;
+  struct timeval timeout;
+  struct sockaddr_in addr;
+  char request[1536];
+  char response[4096];
+  size_t used = 0;
+  int status = 0;
+  int n;
+  if(detail && detail_size) detail[0] = 0;
+  fd = socket(AF_INET, SOCK_STREAM, 0);
+  if(fd < 0) {
+    set_detail_errno(detail, detail_size, "Payload Manager socket");
+    return -1;
+  }
+  timeout.tv_sec = LOCAL_HTTP_TIMEOUT_SECONDS;
+  timeout.tv_usec = 0;
+  setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(PAYLOAD_MANAGER_PORT);
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  if(connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+    set_detail_errno(detail, detail_size, "connect Payload Manager");
+    close(fd);
+    return -1;
+  }
+  n = snprintf(request, sizeof(request),
+               "GET /loadpayload:%s HTTP/1.1\r\n"
+               "Host: 127.0.0.1:%d\r\n"
+               "Connection: close\r\n"
+               "\r\n",
+               elf_path ? elf_path : "", PAYLOAD_MANAGER_PORT);
+  if(n < 0 || (size_t)n >= sizeof(request)) {
+    set_detail(detail, detail_size, "Payload Manager request too long");
+    close(fd);
+    return -1;
+  }
+  if(local_send_all(fd, request, (size_t)n) != 0) {
+    set_detail_errno(detail, detail_size, "send Payload Manager request");
+    close(fd);
+    return -1;
+  }
+  while(used + 1 < sizeof(response)) {
+    ssize_t got = recv(fd, response + used, sizeof(response) - 1 - used, 0);
+    if(got < 0 && errno == EINTR) continue;
+    if(got <= 0) break;
+    used += (size_t)got;
+  }
+  close(fd);
+  response[used] = 0;
+  if(sscanf(response, "HTTP/%*s %d", &status) != 1) {
+    snprintf(detail, detail_size, "Payload Manager bad response: %.120s",
+             response);
+    return -1;
+  }
+  if(status >= 400) {
+    snprintf(detail, detail_size, "Payload Manager launch failed HTTP %d: %.120s",
+             status, response);
+    return -1;
+  }
+  if(detail && detail_size) {
+    snprintf(detail, detail_size,
+             "Payload Manager launched ShadowMountPlus HTTP %d path=%s",
+             status, elf_path ? elf_path : "");
+  }
+  return 0;
+}
+
 int
 gc_shadowmount_restart_running(char *detail, size_t detail_size) {
   char path[PATH_MAX];
+  char original_detail[512];
+  char path_detail[256];
+  int use_payload_manager = 0;
+  const char *fallbacks[] = {
+      SHADOWMOUNT_PAYLOAD_MANAGER_ELF,
+      SHADOWMOUNT_PAYLOAD_MANAGER_ELF_LEGACY,
+  };
+  size_t i;
   int rc;
   if(detail && detail_size) detail[0] = 0;
   if(find_running_shadowmount_path(path, sizeof(path), detail, detail_size) != 0) {
-    return -1;
+    snprintf(original_detail, sizeof(original_detail), "%s",
+             detail && detail[0] ? detail : "running ShadowMount process not identified");
+    path_detail[0] = 0;
+    path[0] = 0;
+    for(i = 0; i < sizeof(fallbacks) / sizeof(fallbacks[0]); i++) {
+      if(path_is_regular_elf(fallbacks[i], path_detail, sizeof(path_detail))) {
+        snprintf(path, sizeof(path), "%s", fallbacks[i]);
+        use_payload_manager = 1;
+        break;
+      }
+    }
+    if(!path[0] &&
+       find_shadowmount_payload_manager_elf(path, sizeof(path), path_detail,
+                                            sizeof(path_detail)) != 0) {
+      if(detail && detail_size) {
+        snprintf(detail, detail_size, "%s; fallback unavailable: %s",
+                 original_detail,
+                 path_detail[0] ? path_detail : SHADOWMOUNT_PAYLOAD_MANAGER_ELF);
+      }
+      return -1;
+    }
+    if(path[0]) use_payload_manager = 1;
+  }
+  if(use_payload_manager) {
+    return payload_manager_launch(path, detail, detail_size);
   }
   rc = sceKernelLoadStartModule(path, 0, NULL, 0, NULL, NULL);
   if(rc <= 0) {
+    if(strstr(path, "/data/pldmgr/payloads/") &&
+       payload_manager_launch(path, detail, detail_size) == 0) {
+      return 0;
+    }
     if(detail && detail_size) {
       snprintf(detail, detail_size, "launch ShadowMount executable failed rc=0x%08x path=%s",
                (unsigned)rc, path);
