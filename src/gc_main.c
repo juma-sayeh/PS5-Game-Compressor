@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -31,6 +32,7 @@
 #define LISTEN_RETRY_SECONDS 1
 #define LOCAL_HTTP_TIMEOUT_SECONDS 1
 #define HANDOFF_WAIT_SECONDS 8
+#define GAME_COMPRESSOR_PAYLOAD_NAME "game-compressor.elf"
 
 typedef enum handoff_result {
   HANDOFF_CONTINUE = 0,
@@ -318,6 +320,7 @@ int
 main(int argc, char **argv) {
   gc_diag_init();
   gc_diag_install_signal_handlers();
+  syscall(SYS_thr_set_name, -1, GAME_COMPRESSOR_PAYLOAD_NAME);
   gc_checkpoint("process start");
   gc_log("PID=%ld argc=%d", (long)getpid(), argc);
   for(int i = 0; i < argc; i++) {

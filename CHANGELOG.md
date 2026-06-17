@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.9.9 - 2026-06-17
+
+Compared local `TestingBetterReads` against `main` / `v0.9.7`
+(`29860ca`).
+
+Full release notes: [RELEASE_NOTES_0.9.9.md](RELEASE_NOTES_0.9.9.md).
+
+### Added
+
+- Added an `Extract to Folder` action for mounted image entries. The operation
+  copies the live mounted image contents into a normal title folder beside the
+  source image, verifies the extracted folder, and then asks ShadowMountPlus to
+  switch to the extracted output.
+- Added `extract-image` progress, history, job-speed, pending-state, and
+  notification labels.
+- Added a topbar terminate button and a post-operation reminder so users can
+  stop Game Compressor before playing games.
+- Added a safe retry path for compression failures caused by unavailable
+  free-space probing. History can now offer `Continue anyway` for non-
+  destructive compression when the original will be kept until the new output is
+  complete and verified.
+
+### Fixed
+
+- Fixed the `/api/gc/extract-image` POST route so the UI action reaches the
+  backend handler.
+- Fixed free-space checks for output paths whose final folders do not exist yet
+  by falling back to the nearest mounted storage root.
+- Fixed resume handling for repair journals with invalid or inconsistent
+  counters by discarding the bad journal and creating a clean one.
+- Fixed title display for `param.json` files that store names under localized
+  `localizedParameters` entries.
+- Avoided automatic exact size rechecks for USB-hosted folder entries during
+  normal library refresh.
+
+### Changed
+
+- Move/copy target roots now prefer existing game parent folders on the selected
+  storage, such as `/homebrew` or `/etaHEN/games`, before falling back to the
+  default target root.
+- New repair journals now explicitly zero their state area before use.
+- The payload names its main thread as `game-compressor.elf` for easier
+  identification in runtime tools and logs.
+- Modal handling now uses shared show/hide helpers with scroll locking and a
+  higher modal layer.
+
 ## 0.9.7 - 2026-06-15
 
 Compared local `UIPolish` (`f87cdaf`) against `main` / `v0.9.6`

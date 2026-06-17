@@ -27,6 +27,7 @@ static const char *
 action_label(const char *action) {
   if(!strcmp(action ? action : "", "compress")) return "Compress";
   if(!strcmp(action ? action : "", "uncompress")) return "Unpack";
+  if(!strcmp(action ? action : "", "extract-image")) return "Extract";
   if(!strcmp(action ? action : "", "validate-repair")) return "Repair";
   if(!strcmp(action ? action : "", "validate-only")) return "Validate";
   if(!strcmp(action ? action : "", "move-to-usb")) return "Move";
@@ -38,6 +39,7 @@ static const char *
 action_past_label(const char *action) {
   if(!strcmp(action ? action : "", "compress")) return "Compressed";
   if(!strcmp(action ? action : "", "uncompress")) return "Unpacked";
+  if(!strcmp(action ? action : "", "extract-image")) return "Extracted";
   if(!strcmp(action ? action : "", "validate-repair")) {
     return "Validated and repaired";
   }
@@ -53,6 +55,7 @@ static const char *
 action_cancel_label(const char *action) {
   if(!strcmp(action ? action : "", "compress")) return "Cancelled compression";
   if(!strcmp(action ? action : "", "uncompress")) return "Cancelled unpack";
+  if(!strcmp(action ? action : "", "extract-image")) return "Cancelled extract";
   if(!strcmp(action ? action : "", "validate-repair")) {
     return "Cancelled validation and repair";
   }

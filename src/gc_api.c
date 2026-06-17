@@ -128,6 +128,7 @@ typedef enum gc_source_kind {
 typedef enum gc_action {
   GC_ACTION_COMPRESS = 1,
   GC_ACTION_UNCOMPRESS,
+  GC_ACTION_EXTRACT_IMAGE,
   GC_ACTION_VALIDATE_REPAIR,
   GC_ACTION_VALIDATE_ONLY,
   GC_ACTION_MOVE_TO_USB,
@@ -202,6 +203,7 @@ typedef struct gc_operation {
   char compression_profile[16];
   char stream_order[24];
   uint64_t stream_budget_bytes;
+  int skip_space_check;
   char target_root[1024];
   char preserve_original[16];
   char preserved_original_path[1024];
@@ -319,6 +321,7 @@ static const char *
 action_name(gc_action_t action) {
   if(action == GC_ACTION_COMPRESS) return "compress";
   if(action == GC_ACTION_UNCOMPRESS) return "uncompress";
+  if(action == GC_ACTION_EXTRACT_IMAGE) return "extract-image";
   if(action == GC_ACTION_VALIDATE_REPAIR) return "validate-repair";
   if(action == GC_ACTION_VALIDATE_ONLY) return "validate-only";
   if(action == GC_ACTION_MOVE_TO_USB) return "move-to-usb";
@@ -418,6 +421,75 @@ path_parent(const char *path, char *out, size_t out_size) {
   memcpy(out, path, len);
   out[len] = 0;
   return 0;
+}
+
+static int
+storage_statvfs_floor_for_path(const char *path, char *out, size_t out_size) {
+  if(!path || !out || out_size == 0) return 0;
+  if(!strcmp(path, "/data") || !strncmp(path, "/data/", 6)) {
+    snprintf(out, out_size, "%s", "/data");
+    return 1;
+  }
+  if(!strcmp(path, "/mnt/ext0") || !strncmp(path, "/mnt/ext0/", 10)) {
+    snprintf(out, out_size, "%s", "/mnt/ext0");
+    return 1;
+  }
+  if(!strcmp(path, "/mnt/ext1") || !strncmp(path, "/mnt/ext1/", 10)) {
+    snprintf(out, out_size, "%s", "/mnt/ext1");
+    return 1;
+  }
+  for(int i = 0; i < GC_USB_COUNT; i++) {
+    char root[32];
+    snprintf(root, sizeof(root), "/mnt/usb%d", i);
+    size_t n = strlen(root);
+    if(!strcmp(path, root) || (!strncmp(path, root, n) && path[n] == '/')) {
+      snprintf(out, out_size, "%s", root);
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int
+statvfs_with_storage_root_fallback(const char *path, struct statvfs *sv,
+                                   char *used_path, size_t used_path_size) {
+  char probe[1024];
+  char floor[1024] = {0};
+  int have_floor;
+  int first_errno = 0;
+  if(!path || !path[0] || !sv) {
+    errno = EINVAL;
+    return -1;
+  }
+  if(snprintf(probe, sizeof(probe), "%s", path) >= (int)sizeof(probe)) {
+    errno = ENAMETOOLONG;
+    return -1;
+  }
+  have_floor = storage_statvfs_floor_for_path(probe, floor, sizeof(floor));
+  for(;;) {
+    if(statvfs(probe, sv) == 0) {
+      if(used_path && used_path_size) {
+        snprintf(used_path, used_path_size, "%s", probe);
+      }
+      return 0;
+    }
+    if(!first_errno) first_errno = errno ? errno : EIO;
+    if(have_floor && !strcmp(probe, floor)) {
+      errno = first_errno;
+      return -1;
+    }
+    if(!strcmp(probe, "/")) {
+      errno = first_errno;
+      return -1;
+    }
+    char parent[1024];
+    if(path_parent(probe, parent, sizeof(parent)) != 0 ||
+       !strcmp(parent, probe)) {
+      errno = first_errno;
+      return -1;
+    }
+    snprintf(probe, sizeof(probe), "%s", parent);
+  }
 }
 
 static int
@@ -618,15 +690,24 @@ shadow_pfsc_hash_from_path(const char *image_path, const char *title_id,
 }
 
 static int
-free_bytes_for_output(const char *output_path, uint64_t *out) {
+free_bytes_for_output_ex(const char *output_path, uint64_t *out,
+                         char *probe_out, size_t probe_out_size) {
   char parent[1024];
   struct statvfs sv;
   if(path_parent(output_path, parent, sizeof(parent)) != 0) return -1;
-  if(statvfs(parent, &sv) != 0) return -1;
+  if(statvfs_with_storage_root_fallback(parent, &sv, probe_out,
+                                        probe_out_size) != 0) {
+    return -1;
+  }
   uint64_t block = sv.f_frsize ? (uint64_t)sv.f_frsize :
       (sv.f_bsize ? (uint64_t)sv.f_bsize : 1ULL);
   if(out) *out = saturating_mul((uint64_t)sv.f_bavail, block);
   return 0;
+}
+
+static int
+free_bytes_for_output(const char *output_path, uint64_t *out) {
+  return free_bytes_for_output_ex(output_path, out, NULL, 0);
 }
 
 static int
@@ -924,6 +1005,10 @@ queue_folder_game_size_rechecks(gc_game_t *games, size_t count) {
   pthread_mutex_unlock(&g_folder_size_recheck_lock);
   for(size_t i = 0; i < count; i++) {
     if(games[i].source_kind == GC_SOURCE_FOLDER && games[i].source_path[0]) {
+      if(!strcmp(storage_name_for_path(games[i].source_path), "usb")) {
+        gc_log("size estimate auto-skip usb path=%s", games[i].source_path);
+        continue;
+      }
       gc_size_cache_queue_recheck(games[i].source_path);
     }
   }
@@ -1242,6 +1327,217 @@ json_find_string_value(const char *json, const char *key,
   return pos > 0;
 }
 
+static const char *
+json_skip_ws(const char *p, const char *end) {
+  while(p && *p && (!end || p < end) && isspace((unsigned char)*p)) p++;
+  return p;
+}
+
+static const char *
+json_skip_string_span(const char *p, const char *end) {
+  if(!p || (!end && !*p) || (end && p >= end) || *p != '"') return p;
+  p++;
+  while(*p && (!end || p < end)) {
+    if(*p == '\\' && p[1]) {
+      p += 2;
+      continue;
+    }
+    if(*p == '"') return p + 1;
+    p++;
+  }
+  return p;
+}
+
+static const char *
+json_skip_value_span(const char *p, const char *end) {
+  char stack[32];
+  size_t depth = 0;
+  p = json_skip_ws(p, end);
+  if(!p || (!end && !*p) || (end && p >= end)) return p;
+  if(*p == '"') return json_skip_string_span(p, end);
+  if(*p != '{' && *p != '[') {
+    while(*p && (!end || p < end) && *p != ',' && *p != '}' && *p != ']') p++;
+    return p;
+  }
+  while(*p && (!end || p < end)) {
+    if(*p == '"') {
+      p = json_skip_string_span(p, end);
+      continue;
+    }
+    if(*p == '{' || *p == '[') {
+      if(depth < sizeof(stack)) stack[depth++] = *p == '{' ? '}' : ']';
+      p++;
+      continue;
+    }
+    if((*p == '}' || *p == ']') && depth > 0) {
+      char expected = stack[depth - 1];
+      char actual = *p;
+      depth--;
+      p++;
+      if(actual != expected) return p;
+      if(depth == 0) return p;
+      continue;
+    }
+    p++;
+  }
+  return p;
+}
+
+static int
+json_read_string_span(const char *p, const char *end,
+                      char *out, size_t out_size,
+                      const char **after_out) {
+  if(after_out) *after_out = p;
+  if(!p || out_size == 0 || (!end && !*p) || (end && p >= end) || *p != '"') {
+    return 0;
+  }
+  p++;
+  size_t pos = 0;
+  while(*p && (!end || p < end) && *p != '"') {
+    if(*p == '\\' && p[1] && (!end || p + 1 < end)) p++;
+    if(pos + 1 < out_size) out[pos++] = *p;
+    p++;
+  }
+  if(!*p || (end && p >= end) || *p != '"') {
+    if(out_size) out[0] = 0;
+    return 0;
+  }
+  out[pos] = 0;
+  if(after_out) *after_out = p + 1;
+  return pos > 0;
+}
+
+static int
+json_find_value_span(const char *start, const char *end, const char *key,
+                     const char **value_start, const char **value_end) {
+  char found[96];
+  const char *p = start;
+  if(value_start) *value_start = NULL;
+  if(value_end) *value_end = NULL;
+  if(!start || !key || !key[0]) return 0;
+  while(*p && (!end || p < end)) {
+    p = json_skip_ws(p, end);
+    if(!*p || (end && p >= end)) break;
+    if(*p != '"') {
+      p++;
+      continue;
+    }
+    const char *after_key = p;
+    if(!json_read_string_span(p, end, found, sizeof(found), &after_key)) {
+      p = json_skip_string_span(p, end);
+      continue;
+    }
+    const char *colon = json_skip_ws(after_key, end);
+    if(!*colon || (end && colon >= end) || *colon != ':') {
+      p = after_key;
+      continue;
+    }
+    const char *value = json_skip_ws(colon + 1, end);
+    const char *after_value = json_skip_value_span(value, end);
+    if(!strcmp(found, key)) {
+      if(value_start) *value_start = value;
+      if(value_end) *value_end = after_value;
+      return 1;
+    }
+    p = after_value;
+  }
+  return 0;
+}
+
+static int
+json_find_string_span(const char *start, const char *end, const char *key,
+                      char *out, size_t out_size) {
+  const char *value = NULL;
+  const char *after = NULL;
+  return json_find_value_span(start, end, key, &value, &after) &&
+         json_read_string_span(value, after, out, out_size, NULL);
+}
+
+static int
+json_find_localized_title_for_locale(const char *localized,
+                                     const char *localized_end,
+                                     const char *locale,
+                                     char *out, size_t out_size) {
+  const char *entry = NULL;
+  const char *entry_end = NULL;
+  if(!locale || !locale[0]) return 0;
+  if(!json_find_value_span(localized, localized_end, locale, &entry,
+                           &entry_end) ||
+     !entry || *entry != '{') {
+    return 0;
+  }
+  return json_find_string_span(entry, entry_end, "titleName", out, out_size) ||
+         json_find_string_span(entry, entry_end, "name", out, out_size);
+}
+
+static int
+json_find_localized_title_by_prefix(const char *localized,
+                                    const char *localized_end,
+                                    const char *prefix,
+                                    char *out, size_t out_size) {
+  char key[96];
+  const char *p = localized;
+  size_t prefix_len = strlen(prefix ? prefix : "");
+  while(*p && (!localized_end || p < localized_end)) {
+    p = json_skip_ws(p, localized_end);
+    if(!*p || (localized_end && p >= localized_end)) break;
+    if(*p != '"') {
+      p++;
+      continue;
+    }
+    const char *after_key = p;
+    if(!json_read_string_span(p, localized_end, key, sizeof(key),
+                              &after_key)) {
+      p = json_skip_string_span(p, localized_end);
+      continue;
+    }
+    const char *colon = json_skip_ws(after_key, localized_end);
+    if(!*colon || (localized_end && colon >= localized_end) || *colon != ':') {
+      p = after_key;
+      continue;
+    }
+    const char *value = json_skip_ws(colon + 1, localized_end);
+    const char *after_value = json_skip_value_span(value, localized_end);
+    if(value && *value == '{' &&
+       (!prefix || !prefix[0] || !strncasecmp(key, prefix, prefix_len)) &&
+       (json_find_string_span(value, after_value, "titleName", out, out_size) ||
+        json_find_string_span(value, after_value, "name", out, out_size))) {
+      return 1;
+    }
+    p = after_value;
+  }
+  return 0;
+}
+
+static int
+json_find_localized_title(const char *json, char *out, size_t out_size) {
+  const char *localized = NULL;
+  const char *localized_end = NULL;
+  char default_language[64];
+  if(!json_find_value_span(json, NULL, "localizedParameters", &localized,
+                           &localized_end) ||
+     !localized || *localized != '{') {
+    return 0;
+  }
+  if(json_find_string_span(localized, localized_end, "defaultLanguage",
+                           default_language, sizeof(default_language)) &&
+     json_find_localized_title_for_locale(localized, localized_end,
+                                          default_language, out, out_size)) {
+    return 1;
+  }
+  if(json_find_localized_title_for_locale(localized, localized_end, "en-US",
+                                          out, out_size) ||
+     json_find_localized_title_for_locale(localized, localized_end, "en-GB",
+                                          out, out_size) ||
+     json_find_localized_title_by_prefix(localized, localized_end, "en-",
+                                         out, out_size) ||
+     json_find_localized_title_by_prefix(localized, localized_end, NULL,
+                                         out, out_size)) {
+    return 1;
+  }
+  return 0;
+}
+
 static uint64_t
 json_find_u64_value(const char *json, const char *key, uint64_t fallback) {
   char pattern[96];
@@ -1266,7 +1562,8 @@ load_game_name(gc_game_t *g) {
            g->title_id);
   if(read_file_limited(path, &json, &json_size, 256 * 1024) != 0) return;
   (void)json_size;
-  if(!json_find_string_value(json, "titleName", g->name, sizeof(g->name)) &&
+  if(!json_find_localized_title(json, g->name, sizeof(g->name)) &&
+     !json_find_string_value(json, "titleName", g->name, sizeof(g->name)) &&
      !json_find_string_value(json, "name", g->name, sizeof(g->name))) {
     snprintf(g->name, sizeof(g->name), "%s", g->title_id);
   }
@@ -2385,6 +2682,63 @@ discover_games(gc_game_t *games, size_t max_games, size_t *count_out,
 }
 
 static int
+preferred_transfer_root_score(const char *parent, const char *storage_root) {
+  if(!parent || !parent[0] || !storage_root || !storage_root[0]) return 1000;
+  if(ends_with_ci(parent, "/homebrew")) return 0;
+  if(ends_with_ci(parent, "/etaHEN/games")) return 10;
+  if(paths_equal_ignoring_trailing_slash(parent, storage_root)) return 30;
+  return 20;
+}
+
+static int
+resolve_transfer_target_root(const char *storage_root,
+                             const char *fallback_root,
+                             char *out,
+                             size_t out_size) {
+  gc_game_t *games;
+  size_t count = 0;
+  int best_score = 1000;
+  char best[1024] = {0};
+
+  if(!storage_root || !storage_root[0] || !fallback_root ||
+     !fallback_root[0] || !out || out_size == 0) {
+    errno = EINVAL;
+    return -1;
+  }
+
+  games = calloc(GC_MAX_GAMES, sizeof(*games));
+  if(games) {
+    if(discover_games(games, GC_MAX_GAMES, &count, 0) == 0) {
+      for(size_t i = 0; i < count; i++) {
+        char parent[1024];
+        int score;
+        if(!games[i].source_path[0] ||
+           !path_under_root(games[i].source_path, storage_root) ||
+           path_parent(games[i].source_path, parent, sizeof(parent)) != 0 ||
+           !path_is_safe(parent) ||
+           !path_under_root(parent, storage_root)) {
+          continue;
+        }
+        score = preferred_transfer_root_score(parent, storage_root);
+        if(score < best_score) {
+          best_score = score;
+          snprintf(best, sizeof(best), "%s", parent);
+          if(score == 0) break;
+        }
+      }
+    }
+    free(games);
+  }
+
+  if(!best[0]) snprintf(best, sizeof(best), "%s", fallback_root);
+  if(snprintf(out, out_size, "%s", best) >= (int)out_size) {
+    errno = ENAMETOOLONG;
+    return -1;
+  }
+  return 0;
+}
+
+static int
 find_game_for_operation_source_path(const gc_operation_t *op, gc_game_t *out,
                                     int exact_folder_sizes) {
   gc_game_t candidate;
@@ -2697,6 +3051,8 @@ append_operation_json(json_buf_t *b, const gc_operation_t *op,
       json_string(b, op->stream_order[0] ? op->stream_order : "budgeted-gain") == 0 &&
       json_append(b, ",\"targetRoot\":") == 0 &&
       json_string(b, op->target_root) == 0 &&
+      json_appendf(b, ",\"skipSpaceCheck\":%s",
+                   op->skip_space_check ? "true" : "false") == 0 &&
       json_append(b, ",\"preserveOriginal\":") == 0 &&
       json_string(b, op->preserve_original) == 0 &&
       json_append(b, ",\"preservedOriginalPath\":") == 0 &&
@@ -4319,6 +4675,35 @@ build_uncompress_target_path(const char *target_root, const gc_game_t *game,
 }
 
 static int
+build_extract_image_target_path(const gc_game_t *game,
+                                char *out, size_t out_size,
+                                char *err, size_t err_size) {
+  char parent[1024];
+  if(!game || !game->source_path[0] || !game->title_id[0] ||
+     !out || out_size == 0) {
+    snprintf(err, err_size, "%s", "bad extract target");
+    errno = EINVAL;
+    return -1;
+  }
+  if(path_parent(game->source_path, parent, sizeof(parent)) != 0) {
+    snprintf(err, err_size, "%s", "bad image path");
+    return -1;
+  }
+  if(!upload_segment_safe(game->title_id)) {
+    snprintf(err, err_size, "%s", "bad title folder name");
+    errno = EINVAL;
+    return -1;
+  }
+  int n = snprintf(out, out_size, "%s/%s", parent, game->title_id);
+  if(n < 0 || (size_t)n >= out_size) {
+    snprintf(err, err_size, "%s", "extract target path too long");
+    errno = ENAMETOOLONG;
+    return -1;
+  }
+  return 0;
+}
+
+static int
 move_remount_expectations(const gc_game_t *game, const char *target_path,
                           char *expected_mount, size_t expected_mount_size,
                           char *expected_image, size_t expected_image_size,
@@ -5198,6 +5583,7 @@ run_compress_op(gc_operation_t *op) {
   int stream_delete = !strcmp(op->delete_policy, "stream");
   int delete_after = !strcmp(op->delete_policy, "after");
   int preserve_hide = !strcmp(op->preserve_original, "hide");
+  int skip_space_check = op->skip_space_check && !stream_delete;
   int delete_policy = stream_delete ?
       PFS_DELETE_STREAM : PFS_DELETE_KEEP;
   int pfs_delete_policy = delete_policy;
@@ -5226,6 +5612,8 @@ run_compress_op(gc_operation_t *op) {
   char compress_output_path[1024] = {0};
   char compress_write_path[1024] = {0};
   char staged_compress_path[1024] = {0};
+  char output_parent[1024] = {0};
+  char space_probe_path[1024] = {0};
   uint64_t target_free_bytes = 0;
   uint64_t stage_free_bytes = 0;
   int moving_to_target = 0;
@@ -5243,9 +5631,9 @@ run_compress_op(gc_operation_t *op) {
            format == PFS_COMPRESS_FORMAT_EXFAT ? "exfat" : "pfs");
   snprintf(op->compression_profile, sizeof(op->compression_profile), "%s",
            compression_profile_or_default(op->compression_profile));
-  gc_log("compress start op=%s title=%s format=%s policy=%s profile=%s", op->id,
-         op->title_id, op->format, op->delete_policy,
-         op->compression_profile);
+  gc_log("compress start op=%s title=%s format=%s policy=%s profile=%s skipSpaceCheck=%d",
+         op->id, op->title_id, op->format, op->delete_policy,
+         op->compression_profile, skip_space_check);
   append_operation_phase(op, "resolving");
   job_set_phase("resolving", 0, 0, "Resolving selected source");
   if(find_game_for_operation_source_path(op, &game, 0) != 0) {
@@ -5325,13 +5713,6 @@ run_compress_op(gc_operation_t *op) {
     game.source_size = info.scan_bytes;
     game.required_bytes = info.scan_bytes;
     game.size_pending = 0;
-    if(!moving_to_target) {
-      if(free_bytes_for_output(compress_output_path, &game.free_bytes) != 0) {
-        game.free_bytes = 0;
-      }
-      game.extra_needed = game.free_bytes >= game.required_bytes
-          ? 0 : game.required_bytes - game.free_bytes;
-    }
     gc_size_cache_store(game.source_path, info.scan_bytes);
     gc_log("compress scan title=%s storage=%s workers=%llu bytes=%llu files=%llu dirs=%llu entries=%llu elapsedMs=%llu path=%s",
            op->title_id, storage_name_for_path(game.source_path),
@@ -5342,6 +5723,50 @@ run_compress_op(gc_operation_t *op) {
            (unsigned long long)info.scan_entries,
            (unsigned long long)info.scan_elapsed_ms,
            game.source_path);
+  }
+  if(!moving_to_target) {
+    if(path_parent(compress_output_path, output_parent,
+                   sizeof(output_parent)) != 0) {
+      errno = EINVAL;
+    }
+    errno = 0;
+    if(!output_parent[0] || stat(output_parent, &st) != 0 ||
+       !S_ISDIR(st.st_mode)) {
+      int saved_errno = !output_parent[0] ? EINVAL :
+          (errno ? errno : ENOTDIR);
+      snprintf(op->error, sizeof(op->error), "%s",
+               "compression target folder is unavailable");
+      gc_log("compress target folder unavailable title=%s output=%s parent=%s err=%s",
+             op->title_id, compress_output_path, output_parent,
+             strerror(saved_errno));
+      COMPRESS_FAIL_RETURN();
+    }
+    if(free_bytes_for_output_ex(compress_output_path, &game.free_bytes,
+                                space_probe_path,
+                                sizeof(space_probe_path)) != 0) {
+      int saved_errno = errno ? errno : EIO;
+      if(skip_space_check) {
+        game.free_bytes = game.required_bytes;
+        gc_log("compress target free probe bypassed title=%s output=%s parent=%s err=%s",
+               op->title_id, compress_output_path, output_parent,
+               strerror(saved_errno));
+      } else {
+        snprintf(op->error, sizeof(op->error),
+                 "could not check free storage for compression target: %s",
+                 strerror(saved_errno));
+        gc_log("compress target free probe failed title=%s output=%s parent=%s err=%s",
+               op->title_id, compress_output_path, output_parent,
+               strerror(saved_errno));
+        COMPRESS_FAIL_RETURN();
+      }
+    }
+    game.extra_needed = game.free_bytes >= game.required_bytes
+        ? 0 : game.required_bytes - game.free_bytes;
+    if(space_probe_path[0] && strcmp(space_probe_path, output_parent)) {
+      gc_log("compress target free probe fallback title=%s output=%s parent=%s probe=%s free=%llu",
+             op->title_id, compress_output_path, output_parent,
+             space_probe_path, (unsigned long long)game.free_bytes);
+    }
   }
   gc_log("compress source title=%s kind=%s size=%llu free=%llu required=%llu path=%s output=%s targetRoot=%s",
          op->title_id, source_kind_name(game.source_kind),
@@ -5381,8 +5806,22 @@ run_compress_op(gc_operation_t *op) {
       gc_log("compress failed title=%s err=%s", op->title_id, op->error);
       COMPRESS_FAIL_RETURN();
     }
-    if(space_for_path(op->target_root, &target_free_bytes, NULL) != 0 ||
-       target_free_bytes < game.required_bytes) {
+    if(space_for_path(op->target_root, &target_free_bytes, NULL) != 0) {
+      int saved_errno = errno ? errno : EIO;
+      if(skip_space_check) {
+        target_free_bytes = game.required_bytes;
+        gc_log("compress target free probe bypassed title=%s targetRoot=%s err=%s",
+               op->title_id, op->target_root, strerror(saved_errno));
+      } else {
+        snprintf(op->error, sizeof(op->error),
+                 "could not check free storage on selected target storage: %s",
+                 strerror(saved_errno));
+        gc_log("compress target free probe failed title=%s targetRoot=%s err=%s",
+               op->title_id, op->target_root, strerror(saved_errno));
+        COMPRESS_FAIL_RETURN();
+      }
+    }
+    if(target_free_bytes < game.required_bytes) {
       uint64_t need = target_free_bytes < game.required_bytes
           ? game.required_bytes - target_free_bytes
           : game.required_bytes;
@@ -5393,8 +5832,24 @@ run_compress_op(gc_operation_t *op) {
       COMPRESS_FAIL_RETURN();
     }
     if(stage_usb_target &&
-       (free_bytes_for_output(staged_compress_path, &stage_free_bytes) != 0 ||
-        stage_free_bytes < game.required_bytes)) {
+       free_bytes_for_output_ex(staged_compress_path, &stage_free_bytes,
+                                space_probe_path,
+                                sizeof(space_probe_path)) != 0) {
+      int saved_errno = errno ? errno : EIO;
+      if(skip_space_check) {
+        stage_free_bytes = game.required_bytes;
+        gc_log("compress staging free probe bypassed title=%s stage=%s err=%s",
+               op->title_id, staged_compress_path, strerror(saved_errno));
+      } else {
+        snprintf(op->error, sizeof(op->error),
+                 "could not check internal staging space for USB compression: %s",
+                 strerror(saved_errno));
+        gc_log("compress staging free probe failed title=%s stage=%s err=%s",
+               op->title_id, staged_compress_path, strerror(saved_errno));
+        COMPRESS_FAIL_RETURN();
+      }
+    }
+    if(stage_usb_target && stage_free_bytes < game.required_bytes) {
       uint64_t need = stage_free_bytes < game.required_bytes
           ? game.required_bytes - stage_free_bytes
           : game.required_bytes;
@@ -5671,6 +6126,191 @@ run_compress_op(gc_operation_t *op) {
   return 0;
 }
 #undef COMPRESS_FAIL_RETURN
+
+static int
+run_extract_image_op(gc_operation_t *op) {
+  gc_game_t game = {0};
+  gc_game_t output_game = {0};
+  gc_hidden_instance_t hidden[GC_MAX_GAMES];
+  char err[256] = {0};
+  char restore_err[256] = {0};
+  char target_path[1024] = {0};
+  char temp_path[1024] = {0};
+  struct stat st;
+  pfs_app_info_t output_probe = {0};
+  uint64_t free_bytes = 0;
+  uint64_t copied = 0;
+  size_t hidden_count = 0;
+  int mount_missed = 0;
+
+  gc_checkpoint("extract find game");
+  gc_log("extract start op=%s title=%s", op->id, op->title_id);
+  append_operation_phase(op, "resolving");
+  job_set_phase("resolving", 0, 0, "Resolving mounted image");
+  if(find_game_for_operation_source_path(op, &game, 0) != 0 ||
+     game.source_kind != GC_SOURCE_IMAGE) {
+    snprintf(op->error, sizeof(op->error), "%s",
+             "mounted image is unavailable");
+    gc_log("extract failed title=%s err=%s", op->title_id, op->error);
+    return -1;
+  }
+  snprintf(op->source_path, sizeof(op->source_path), "%s", game.source_path);
+  snprintf(op->source_kind, sizeof(op->source_kind), "%s", "image");
+  if(!game.is_mounted || !game.mount_path[0] ||
+     stat(game.mount_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+    snprintf(op->error, sizeof(op->error), "%s",
+             "image must be mounted before extract");
+    gc_log("extract failed title=%s err=%s", op->title_id, op->error);
+    return -1;
+  }
+  if(build_extract_image_target_path(&game, target_path, sizeof(target_path),
+                                     err, sizeof(err)) != 0) {
+    snprintf(op->error, sizeof(op->error), "%s", err);
+    gc_log("extract failed title=%s err=%s", op->title_id, op->error);
+    return -1;
+  }
+  snprintf(op->output_path, sizeof(op->output_path), "%s", target_path);
+  if(stat(target_path, &st) == 0) {
+    snprintf(op->error, sizeof(op->error), "%s", "target folder already exists");
+    gc_log("extract failed title=%s err=%s", op->title_id, op->error);
+    return -1;
+  }
+  if(errno != ENOENT) {
+    snprintf(op->error, sizeof(op->error), "check target folder: %s",
+             strerror(errno));
+    gc_log("extract failed title=%s err=%s", op->title_id, op->error);
+    return -1;
+  }
+  if(game.source_size == 0) {
+    snprintf(op->error, sizeof(op->error), "%s",
+             "could not measure mounted image size");
+    gc_log("extract failed title=%s err=%s", op->title_id, op->error);
+    return -1;
+  }
+  if(free_bytes_for_output(target_path, &free_bytes) != 0 ||
+     free_bytes < game.source_size) {
+    uint64_t need = free_bytes < game.source_size
+        ? game.source_size - free_bytes
+        : game.source_size;
+    snprintf(op->error, sizeof(op->error),
+             "not enough free storage; free %llu more bytes",
+             (unsigned long long)need);
+    gc_log("extract failed title=%s err=%s", op->title_id, op->error);
+    return -1;
+  }
+  if(close_title_if_running(op->title_id, err, sizeof(err)) != 0) {
+    snprintf(op->error, sizeof(op->error), "%s",
+             err[0] ? err : "could not close game");
+    gc_log("extract close game failed title=%s err=%s", op->title_id,
+           op->error);
+    return -1;
+  }
+  if(hidden_sibling_temp_path(target_path, "gc-extracting",
+                              temp_path, sizeof(temp_path)) != 0) {
+    snprintf(op->error, sizeof(op->error), "%s",
+             "temporary extract path too long");
+    return -1;
+  }
+  remove_tree_gc(temp_path);
+  append_operation_phase(op, "copying");
+  job_set_phase("copying", 0, 0, "Extracting mounted image");
+  job_store_u64(&g_job.total_bytes, game.source_size);
+  atomic_store(&g_job.copied_bytes, 0);
+  gc_checkpoint("extract copy");
+  if(copy_tree_gc(game.mount_path, temp_path, &copied, err, sizeof(err)) != 0) {
+    snprintf(op->error, sizeof(op->error), "%s",
+             err[0] ? err : "extract failed");
+    remove_tree_gc(temp_path);
+    gc_log("extract copy failed title=%s err=%s", op->title_id, op->error);
+    return -1;
+  }
+  job_set_current("Finalizing extracted folder");
+  if(rename(temp_path, target_path) != 0) {
+    snprintf(op->error, sizeof(op->error), "rename extracted folder: %s",
+             strerror(errno));
+    remove_tree_gc(temp_path);
+    gc_log("extract finalize failed title=%s err=%s", op->title_id,
+           op->error);
+    return -1;
+  }
+  fsync_parent_dir_best_effort(target_path);
+  if(pfs_app_probe(target_path, &output_probe, err, sizeof(err)) != 0) {
+    snprintf(op->error, sizeof(op->error), "%s",
+             err[0] ? err : "extracted folder is not valid");
+    cleanup_failed_uncompress_output(target_path, op->title_id);
+    gc_log("extract verify failed title=%s err=%s", op->title_id, op->error);
+    return -1;
+  }
+  if(strcmp(output_probe.title_id, op->title_id)) {
+    snprintf(op->error, sizeof(op->error), "%s",
+             "extracted folder has wrong title id");
+    cleanup_failed_uncompress_output(target_path, op->title_id);
+    gc_log("extract verify failed title=%s err=%s", op->title_id, op->error);
+    return -1;
+  }
+
+  output_game = game;
+  snprintf(output_game.source_path, sizeof(output_game.source_path), "%s",
+           target_path);
+  snprintf(output_game.output_path, sizeof(output_game.output_path), "%s",
+           output_probe.output_path);
+  snprintf(output_game.mount_path, sizeof(output_game.mount_path), "%s",
+           target_path);
+  output_game.source_kind = GC_SOURCE_FOLDER;
+  output_game.source_size = copied;
+  output_game.required_bytes = copied;
+  output_game.output_exists = output_probe.output_exists;
+  set_game_mount_status(&output_game, 0, "not-mounted");
+
+  gc_checkpoint("extract mount output");
+  err[0] = 0;
+  if(mount_selected_instance_hidden_exclusive(
+         op, &output_game, hidden, GC_MAX_GAMES, &hidden_count, &mount_missed,
+         err, sizeof(err)) != 0) {
+    if(mount_switch_restore_after_operation(op, hidden, hidden_count,
+                                            restore_err,
+                                            sizeof(restore_err)) != 0) {
+      gc_log("extract mount restore failed title=%s err=%s", op->title_id,
+             restore_err[0] ? restore_err : "unknown");
+      operation_append_error_detail(op, restore_err);
+    }
+    snprintf(op->error, sizeof(op->error), "%s",
+             err[0] ? err : "ShadowMountPlus remount failed");
+    gc_log("extract remount failed title=%s err=%s", op->title_id, op->error);
+    return -1;
+  }
+  if(mount_missed) {
+    if(mount_switch_restore_after_operation(op, hidden, hidden_count,
+                                            restore_err,
+                                            sizeof(restore_err)) != 0) {
+      snprintf(op->error, sizeof(op->error), "%s",
+               restore_err[0] ? restore_err :
+               "could not restore duplicate instances");
+      gc_log("extract mount-missed restore failed title=%s err=%s",
+             op->title_id, op->error);
+      return -1;
+    }
+    operation_mark_not_mounted(op, err);
+    gc_size_cache_store(target_path, copied);
+    gc_log("extract complete not mounted title=%s output=%s detail=%s",
+           op->title_id, target_path, err[0] ? err : "");
+    return 0;
+  }
+  if(mount_switch_restore_after_operation_ex(op, hidden, hidden_count, 0,
+                                             restore_err,
+                                             sizeof(restore_err)) != 0) {
+    snprintf(op->error, sizeof(op->error), "%s",
+             restore_err[0] ? restore_err :
+             "could not restore duplicate instances");
+    gc_log("extract restore failed title=%s err=%s", op->title_id, op->error);
+    return -1;
+  }
+  gc_size_cache_store(target_path, copied);
+  snprintf(op->result, sizeof(op->result), "%s", "success");
+  gc_log("extract complete title=%s output=%s copied=%llu",
+         op->title_id, target_path, (unsigned long long)copied);
+  return 0;
+}
 
 static void operation_append_error_detail(gc_operation_t *op,
                                           const char *detail);
@@ -6824,6 +7464,7 @@ operation_thread(void *arg) {
   gc_checkpoint("operation running");
   if(op->action == GC_ACTION_COMPRESS) rc = run_compress_op(op);
   else if(op->action == GC_ACTION_UNCOMPRESS) rc = run_uncompress_op(op);
+  else if(op->action == GC_ACTION_EXTRACT_IMAGE) rc = run_extract_image_op(op);
   else if(op->action == GC_ACTION_VALIDATE_REPAIR) rc = run_validate_repair_op(op);
   else if(op->action == GC_ACTION_VALIDATE_ONLY) rc = run_validate_only_op(op);
   else if(op->action == GC_ACTION_MOVE_TO_USB ||
@@ -7015,6 +7656,7 @@ enqueue_action(const http_request_t *req, gc_action_t action) {
   char preserve_arg[24];
   char budget_arg[32];
   char order_arg[24];
+  char skip_space_arg[16];
   char usb_id[16] = "";
   char requested_delete_policy[16] = "";
   char preserve_original[16] = "";
@@ -7024,6 +7666,7 @@ enqueue_action(const http_request_t *req, gc_action_t action) {
   gc_game_t game;
   char delete_policy[16] = "after";
   char target_root[1024] = "";
+  int skip_space_check = 0;
   int uncompress_to_internal = 0;
   int compress_to_internal = 0;
 
@@ -7171,6 +7814,21 @@ enqueue_action(const http_request_t *req, gc_action_t action) {
     }
   }
   if(action == GC_ACTION_COMPRESS &&
+     websrv_get_query_arg(req, "skipSpaceCheck", skip_space_arg,
+                          sizeof(skip_space_arg))) {
+    if(!strcasecmp(skip_space_arg, "1") ||
+       !strcasecmp(skip_space_arg, "true") ||
+       !strcasecmp(skip_space_arg, "yes")) {
+      skip_space_check = 1;
+    } else if(!strcasecmp(skip_space_arg, "0") ||
+              !strcasecmp(skip_space_arg, "false") ||
+              !strcasecmp(skip_space_arg, "no")) {
+      skip_space_check = 0;
+    } else {
+      return serve_error(req, 400, "bad skipSpaceCheck");
+    }
+  }
+  if(action == GC_ACTION_COMPRESS &&
      websrv_get_query_arg(req, "usbId", usb_id, sizeof(usb_id))) {
     if(storage_target_root_for_id(usb_id, target_root,
                                   sizeof(target_root), NULL) != 0) {
@@ -7224,6 +7882,11 @@ enqueue_action(const http_request_t *req, gc_action_t action) {
       return serve_error(req, 400, "bad storage target");
     }
   }
+  if(action == GC_ACTION_COMPRESS && skip_space_check &&
+     requested_delete_policy[0] && !strcmp(requested_delete_policy, "stream")) {
+    return serve_error(req, 400,
+                       "skipSpaceCheck is not available for destructive compression");
+  }
   if(action == GC_ACTION_VALIDATE_REPAIR ||
      action == GC_ACTION_VALIDATE_ONLY ||
      action == GC_ACTION_REFRESH_MOUNT) {
@@ -7258,8 +7921,9 @@ enqueue_action(const http_request_t *req, gc_action_t action) {
            delete_policy);
 	  snprintf(op->compression_profile, sizeof(op->compression_profile), "%s",
 	           compression_profile_or_default(compression_profile));
-	  snprintf(op->stream_order, sizeof(op->stream_order), "%s", stream_order);
-	  op->stream_budget_bytes = stream_budget_bytes;
+  snprintf(op->stream_order, sizeof(op->stream_order), "%s", stream_order);
+  op->stream_budget_bytes = stream_budget_bytes;
+  op->skip_space_check = skip_space_check;
   snprintf(op->target_root, sizeof(op->target_root), "%s", target_root);
   snprintf(op->preserve_original, sizeof(op->preserve_original), "%s",
            preserve_original);
@@ -7436,8 +8100,6 @@ enqueue_move_action(const http_request_t *req, gc_action_t action) {
   if(transfer_action_to_external(action)) {
     const gc_storage_target_def_t *def;
     if(!websrv_get_query_arg(req, "usbId", usb_id, sizeof(usb_id)) ||
-       storage_target_root_for_id(usb_id, target_root,
-                                  sizeof(target_root), NULL) != 0 ||
        !(def = storage_target_def_for_id(usb_id))) {
       return serve_error(req, 400, "bad storage target");
     }
@@ -7445,10 +8107,19 @@ enqueue_move_action(const http_request_t *req, gc_action_t action) {
       return serve_error(req, 409,
                          "game is already on selected external storage");
     }
+    if(resolve_transfer_target_root(def->root, def->target_root,
+                                    target_root,
+                                    sizeof(target_root)) != 0) {
+      return serve_error(req, 400, "bad storage target");
+    }
   } else if(transfer_action_to_internal(action)) {
-    snprintf(target_root, sizeof(target_root), "%s", GC_INTERNAL_GAME_ROOT);
     if(path_under_root(source_path_arg, "/data")) {
       return serve_error(req, 409, "game is already on internal SSD");
+    }
+    if(resolve_transfer_target_root("/data", GC_INTERNAL_GAME_ROOT,
+                                    target_root,
+                                    sizeof(target_root)) != 0) {
+      return serve_error(req, 400, "bad internal target");
     }
   } else {
     return serve_error(req, 400, "bad transfer action");
@@ -7537,6 +8208,59 @@ enqueue_read_speed_test_action(const http_request_t *req) {
            source_kind_name_from_path(source_path_arg));
   snprintf(op->format, sizeof(op->format), "%s", "read");
   snprintf(op->delete_policy, sizeof(op->delete_policy), "%s", "none");
+  return enqueue_start_response_locked(req, op);
+}
+
+static int
+enqueue_extract_image_action(const http_request_t *req) {
+  char title_id[64];
+  char source_path_arg[1024] = "";
+  gc_game_t game;
+  gc_operation_t probe_op = {0};
+  char err[256] = {0};
+  char target_path[1024] = {0};
+
+  if(strcmp(req->method, "POST")) {
+    return serve_error(req, 405, "method not allowed");
+  }
+  const char *arg_err = read_title_source_args(req, title_id,
+                                               sizeof(title_id),
+                                               source_path_arg,
+                                               sizeof(source_path_arg));
+  if(arg_err) return serve_error(req, 400, arg_err);
+  if(title_operation_busy(title_id)) {
+    return serve_error(req, 409, "action already running for this game");
+  }
+
+  memset(&game, 0, sizeof(game));
+  snprintf(probe_op.title_id, sizeof(probe_op.title_id), "%s", title_id);
+  snprintf(probe_op.display_name, sizeof(probe_op.display_name), "%s",
+           title_id);
+  snprintf(probe_op.source_path, sizeof(probe_op.source_path), "%s",
+           source_path_arg);
+  if(find_game_for_operation_source_path(&probe_op, &game, 0) != 0 ||
+     game.source_kind != GC_SOURCE_IMAGE) {
+    return serve_error(req, 400, "game is not an image");
+  }
+  if(!game.is_mounted || !game.mount_path[0]) {
+    return serve_error(req, 409, "image must be mounted before extract");
+  }
+  if(build_extract_image_target_path(&game, target_path, sizeof(target_path),
+                                     err, sizeof(err)) != 0) {
+    return serve_error(req, 400, err[0] ? err : "bad extract target");
+  }
+
+  pthread_mutex_lock(&g_gc_lock);
+  int response = 0;
+  gc_operation_t *op = alloc_queued_operation_locked(
+      req, title_id, GC_ACTION_EXTRACT_IMAGE,
+      game.name[0] ? game.name : title_id, &response);
+  if(!op) return response;
+  snprintf(op->source_path, sizeof(op->source_path), "%s", source_path_arg);
+  snprintf(op->output_path, sizeof(op->output_path), "%s", target_path);
+  snprintf(op->source_kind, sizeof(op->source_kind), "%s", "image");
+  snprintf(op->format, sizeof(op->format), "%s", "folder");
+  snprintf(op->delete_policy, sizeof(op->delete_policy), "%s", "keep");
   return enqueue_start_response_locked(req, op);
 }
 
@@ -7726,9 +8450,12 @@ operation_fallback_game(const gc_operation_t *op, gc_game_t *game) {
   game->source_kind = source_kind_from_name(op->source_kind);
 	  if(game->source_kind == GC_SOURCE_UNKNOWN &&
 	     (op->action == GC_ACTION_UNCOMPRESS ||
+	      op->action == GC_ACTION_EXTRACT_IMAGE ||
 	      op->action == GC_ACTION_VALIDATE_REPAIR ||
 	      op->action == GC_ACTION_VALIDATE_ONLY)) {
-    game->source_kind = GC_SOURCE_COMPRESSED;
+    game->source_kind = op->action == GC_ACTION_EXTRACT_IMAGE
+        ? GC_SOURCE_IMAGE
+        : GC_SOURCE_COMPRESSED;
   }
   snprintf(game->source_path, sizeof(game->source_path), "%s",
            op->source_path[0] ? op->source_path : op->output_path);
@@ -8040,6 +8767,11 @@ usb_request(const http_request_t *req) {
     return -1;
   }
   for(size_t i = 0; i < count; i++) {
+    char target_root[1024];
+    if(resolve_transfer_target_root(targets[i].root, targets[i].target_root,
+                                    target_root, sizeof(target_root)) != 0) {
+      snprintf(target_root, sizeof(target_root), "%s", targets[i].target_root);
+    }
     if(i && json_append(&b, ",") != 0) {
       free(b.data);
       return -1;
@@ -8051,7 +8783,7 @@ usb_request(const http_request_t *req) {
        json_append(&b, ",\"path\":") != 0 ||
        json_string(&b, targets[i].root) != 0 ||
        json_append(&b, ",\"targetRoot\":") != 0 ||
-       json_string(&b, targets[i].target_root) != 0 ||
+       json_string(&b, target_root) != 0 ||
        json_appendf(&b, ",\"totalBytes\":%llu,\"freeBytes\":%llu}",
                     (unsigned long long)targets[i].total_bytes,
                     (unsigned long long)targets[i].free_bytes) != 0) {
@@ -8159,6 +8891,8 @@ job_speed_metric_bytes(const char *verb, const char *phase, long copied,
     }
   } else if(!strcmp(v, "uncompress")) {
     source = "unpacked-output";
+  } else if(!strcmp(v, "extract-image")) {
+    source = "extracted-output";
 	  } else if(!strcmp(v, "read-speed-test")) {
 	    source = "read-test";
 	  } else if(!strcmp(v, "move-to-usb") ||
@@ -8600,6 +9334,9 @@ gc_api_request(const http_request_t *req, const char *url) {
   }
   if(!strcmp(req->path, "/api/gc/uncompress")) {
     return enqueue_action(req, GC_ACTION_UNCOMPRESS);
+  }
+  if(!strcmp(req->path, "/api/gc/extract-image")) {
+    return enqueue_extract_image_action(req);
   }
   if(!strcmp(req->path, "/api/gc/validate-repair")) {
     return enqueue_action(req, GC_ACTION_VALIDATE_REPAIR);

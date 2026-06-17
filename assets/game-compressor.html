@@ -124,6 +124,19 @@
       padding: 12px;
     }
 
+    body.has-open-modal .game-list,
+    body.has-open-modal .detail,
+    body.has-open-modal .secondary-menu {
+      overflow: hidden;
+    }
+
+    body.has-open-modal .game-list::-webkit-scrollbar,
+    body.has-open-modal .detail::-webkit-scrollbar,
+    body.has-open-modal .secondary-menu::-webkit-scrollbar {
+      width: 0;
+      height: 0;
+    }
+
     .game-row {
       display: grid;
       grid-template-columns: 54px minmax(0, 1fr);
@@ -404,12 +417,65 @@
     }
 
     .topbar {
+      position: relative;
       display: flex;
       align-items: center;
       justify-content: flex-end;
       gap: 8px;
       padding: 12px 18px;
       border-bottom: 1px solid var(--line);
+    }
+
+    .terminate-reminder {
+      position: absolute;
+      top: calc(100% + 8px);
+      right: 18px;
+      z-index: 12;
+      width: min(320px, calc(100vw - 36px));
+      padding: 10px 12px;
+      border: 1px solid rgba(31, 47, 78, .14);
+      border-radius: 14px;
+      background: rgba(255, 255, 255, .96);
+      color: var(--text);
+      font-size: 12px;
+      line-height: 1.35;
+      font-weight: 640;
+      box-shadow: 0 16px 36px rgba(37, 51, 81, .14);
+      backdrop-filter: blur(18px);
+      pointer-events: none;
+      opacity: 1;
+      transform: translateY(0);
+      transition: opacity .18s ease, transform .18s ease;
+    }
+
+    .terminate-reminder.hidden {
+      opacity: 0;
+      transform: translateY(-4px);
+    }
+
+    .terminate-reminder::before {
+      content: "";
+      position: absolute;
+      top: -6px;
+      right: 19px;
+      width: 10px;
+      height: 10px;
+      border-left: 1px solid rgba(31, 47, 78, .14);
+      border-top: 1px solid rgba(31, 47, 78, .14);
+      background: rgba(255, 255, 255, .96);
+      transform: rotate(45deg);
+    }
+
+    .terminate-reminder strong {
+      display: block;
+      margin-bottom: 2px;
+      font-size: 12px;
+      font-weight: 760;
+    }
+
+    .terminate-reminder span {
+      color: var(--muted);
+      font-weight: 600;
     }
 
     .free-space-label {
@@ -444,6 +510,18 @@
       color: var(--accent);
       transform: translateY(-1px);
       box-shadow: 0 12px 28px rgba(37, 51, 81, .12);
+    }
+
+    .icon-btn.is-danger:hover {
+      color: var(--danger);
+      border-color: rgba(216, 76, 91, .28);
+    }
+
+    .icon-btn:disabled {
+      cursor: default;
+      opacity: .48;
+      transform: none;
+      box-shadow: none;
     }
 
     .info-launcher {
@@ -921,6 +999,7 @@
 
     .path-box {
       width: min(720px, 100%);
+      margin-top: 32px;
       color: var(--muted);
       font-size: 12px;
     }
@@ -1100,7 +1179,8 @@
       padding: 24px;
       background: rgba(35, 48, 71, .28);
       backdrop-filter: blur(18px);
-      z-index: 10;
+      z-index: 100;
+      isolation: isolate;
     }
 
     .modal-backdrop.hidden {
@@ -1631,6 +1711,12 @@
       <div class="topbar">
         <div class="free-space-label" id="free-space-label">Free Space <span>--</span></div>
         <button class="icon-btn" id="history-top" title="History" aria-label="History"></button>
+        <button class="icon-btn is-danger" id="terminate-top" title="Terminate Game Compressor"
+          aria-label="Terminate Game Compressor"></button>
+        <div class="terminate-reminder hidden" id="terminate-reminder" role="status" aria-live="polite">
+          <strong>Done processing.</strong>
+          <span>Before playing, terminate Game Compressor to avoid minor game performance effects.</span>
+        </div>
       </div>
       <section class="detail" id="detail">
         <div class="loading-state is-detail" role="status" aria-live="polite">
@@ -1968,6 +2054,8 @@
     let cancelingActiveId = '';
     let measureDotsTimer = 0;
     let measureDotsStep = 0;
+    let pendingFinishedOperationId = '';
+    const remindedFinishedOperationIds = new Set();
 
     const $ = (id) => document.getElementById(id);
 
@@ -2033,6 +2121,7 @@
         timer: '<path d="M9 2h6"/><path d="M12 6v2"/><circle cx="12" cy="14" r="8"/><path d="M12 10v4l3 2"/>',
         copy: '<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',
         refresh: '<path d="M21 12a9 9 0 0 1-15 6.7"/><path d="M3 12a9 9 0 0 1 15-6.7"/><path d="M18 3v5h-5"/><path d="M6 21v-5h5"/>',
+        power: '<path d="M12 2v10"/><path d="M18.4 6.6a9 9 0 1 1-12.8 0"/>',
         close: '<path d="M18 6 6 18"/><path d="m6 6 12 12"/>'
       };
       return '<svg viewBox="0 0 24 24" aria-hidden="true">' + (paths[name] || '') + '</svg>';
@@ -2267,6 +2356,9 @@
       if (action === 'copy-to-usb' || action === 'copy-to-internal') {
         return { label: 'Copying', className: 'moving' };
       }
+      if (action === 'extract-image') {
+        return { label: 'Extracting', className: 'moving' };
+      }
       if (phase === 'copying') {
         return { label: 'Repacking', className: 'repacking' };
       }
@@ -2339,11 +2431,13 @@
       const count = Number(job.phaseCount || 0);
       const step = Number(job.phaseStep || 0);
       if (count > 0 && (
-	        phase === 'copying' ||
-	        phase === 'unpacking' ||
-	        phase === 'moving' ||
-	        phase === 'restoring' ||
-	        phase === 'read-test')) {
+        phase === 'scanning' ||
+        phase === 'validating' ||
+        phase === 'copying' ||
+        phase === 'unpacking' ||
+        phase === 'moving' ||
+        phase === 'restoring' ||
+        phase === 'read-test')) {
         return {
           done: Math.max(0, Math.min(count, step)),
           total: count,
@@ -2526,6 +2620,7 @@
 	      if (!target || source === target) {
 	        if (action === 'compress') return source + ' compressed in place';
 	        if (action === 'uncompress') return source + ' unpacked in place';
+	        if (action === 'extract-image') return source + ' extracted to folder';
 	        return source;
 	      }
 	      return source + ' -> ' + target;
@@ -2584,6 +2679,12 @@
 	          phase.current.indexOf('scanning mounted') !== -1;
 	      }
 	      if (phase.action === 'uncompress') {
+	        return phase.opPhase === 'mounting' ||
+	          phase.jobPhase === 'mounting' ||
+	          phase.current.indexOf('mount') !== -1 ||
+	          phase.current.indexOf('shadowmount') !== -1;
+	      }
+	      if (phase.action === 'extract-image') {
 	        return phase.opPhase === 'mounting' ||
 	          phase.jobPhase === 'mounting' ||
 	          phase.current.indexOf('mount') !== -1 ||
@@ -2711,6 +2812,7 @@
       const action = String((op && op.action) || '').toLowerCase();
       return action === 'compress' ||
         action === 'uncompress' ||
+        action === 'extract-image' ||
         action === 'move-to-usb' ||
         action === 'move-to-internal' ||
         action === 'copy-to-usb' ||
@@ -3102,6 +3204,64 @@
         repairText;
     }
 
+    function operationCanRetrySkipSpaceCheck(op) {
+      if (!op || op.action !== 'compress' || op.status !== 'failed') return false;
+      if (op.skipSpaceCheck || String(op.deletePolicy || '') === 'stream') return false;
+      const error = String(op.error || '').toLowerCase();
+      return error.indexOf('could not check free storage') !== -1 ||
+        error.indexOf('could not check internal staging space') !== -1;
+    }
+
+    function operationById(id) {
+      return state.history.find((op) => String(op.id || '') === String(id || '')) || null;
+    }
+
+    async function storageTargetIdForRoot(targetRoot) {
+      const root = String(targetRoot || '');
+      if (!root) return '';
+      const fromState = (state.usb || []).find((usb) => String(usb.targetRoot || '') === root);
+      if (fromState && fromState.id) return fromState.id;
+      const data = await api('/api/gc/usb');
+      state.usb = data.usb || [];
+      const found = state.usb.find((usb) => String(usb.targetRoot || '') === root);
+      return found && found.id ? found.id : '';
+    }
+
+    async function retryCompressSkippingSpaceCheck(id) {
+      const op = operationById(id);
+      if (!operationCanRetrySkipSpaceCheck(op)) return;
+      const ok = confirm('Could not check free storage for this target.\n\nYou can continue, but compression may fail if storage is actually low. The original will be kept until the new file is complete and verified.');
+      if (!ok) return;
+      let url = '/api/gc/compress?titleId=' + encodeURIComponent(op.titleId || '') +
+        '&sourcePath=' + encodeURIComponent(op.sourcePath || '') +
+        '&format=' + encodeURIComponent(op.format || 'exfat') +
+        '&deletePolicy=' + encodeURIComponent(op.deletePolicy === 'keep' ? 'keep' : 'after') +
+        '&profile=' + encodeURIComponent(op.compressionProfile || 'space') +
+        '&skipSpaceCheck=1';
+      const targetRoot = String(op.targetRoot || '');
+      if (targetRoot === '/data/homebrew') {
+        url += '&destination=internal';
+      } else if (targetRoot) {
+        const usbId = await storageTargetIdForRoot(targetRoot);
+        if (!usbId) {
+          alert('Could not find the original target storage for this retry.');
+          return;
+        }
+        url += '&destination=usb&usbId=' + encodeURIComponent(usbId);
+      }
+      if (op.preserveOriginal === 'hide') {
+        url += '&preserveOriginal=hide';
+      }
+      try {
+        await api(url, { method: 'POST' });
+        hideModal('history-modal');
+        startPollBurst(6000);
+        await refreshAll();
+      } catch (err) {
+        alert(err.message);
+      }
+    }
+
     function iconPath(g) {
       if (!g || !g.hasIcon) return '';
       const version = iconVersion(g);
@@ -3186,7 +3346,8 @@
       return [
 	        op.id, op.titleId, op.displayName, op.action, op.status, op.phase,
 	        op.result, op.error, op.sourcePath, op.outputPath, op.sourceKind,
-	        op.targetRoot, op.deletePolicy, op.compressionProfile, op.repairSummary,
+	        op.targetRoot, op.deletePolicy, op.compressionProfile, op.skipSpaceCheck,
+        op.repairSummary,
 	        op.createdAt, op.startedAt, op.endedAt,
 	        op.compressionSourceSize, op.compressedSize, op.savedBytes,
 	        op.scanBytes, op.scanFiles, op.scanDirs, op.scanEntries,
@@ -3417,6 +3578,7 @@
       if (action === 'validate-repair' || action === 'validate-only') return 'Pending Validate';
       if (action === 'refresh-mount') return 'Pending Mount';
       if (action === 'uncompress') return 'Pending Unpack';
+      if (action === 'extract-image') return 'Pending Extract';
       if (action === 'move-to-usb') return 'Pending Move to External Storage';
       if (action === 'move-to-internal') return 'Pending Move to Internal SSD';
       if (action === 'copy-to-usb') return 'Pending Copy to External Storage';
@@ -3629,6 +3791,11 @@
         return Math.max(Math.min(doneBlocks, totalBlocks) * PFS_BLOCK_SIZE,
           Math.min(copiedBytes, totalBlocks * PFS_BLOCK_SIZE));
       }
+      if ((phase === 'scanning' || phase === 'validating') && totalBlocks > 0) {
+        const copiedBytes = Math.max(0, Number(job.copiedBytes || 0));
+        return Math.max(Math.min(doneBlocks, totalBlocks) * PFS_BLOCK_SIZE,
+          Math.min(copiedBytes, totalBlocks * PFS_BLOCK_SIZE));
+      }
       return Math.max(0, Number(job.copiedBytes || 0));
     }
 
@@ -3708,6 +3875,9 @@
       if (sourceKind === 'compressed' || actionFor(g) === 'validate-repair') {
         actions.push({ id: 'validate-only', label: 'Validate Only' });
         actions.push({ id: 'uncompress', label: 'Uncompress' });
+      }
+      if (sourceKind === 'image' && g.isMounted === true) {
+        actions.push({ id: 'extract-image', label: 'Extract to Folder' });
       }
       if (g.canMoveToUsb) {
         actions.push({ id: 'copy-usb', label: 'Copy to External Storage' });
@@ -3946,6 +4116,29 @@
       refreshPrimaryArea(selectedGame());
     }
 
+    function hasOpenModal() {
+      return !!document.querySelector('.modal-backdrop:not(.hidden)');
+    }
+
+    function syncModalState() {
+      document.body.classList.toggle('has-open-modal', hasOpenModal());
+    }
+
+    function showModal(id) {
+      closeSecondaryMenu();
+      const modal = $(id);
+      if (!modal) return;
+      modal.classList.remove('hidden');
+      syncModalState();
+    }
+
+    function hideModal(id) {
+      const modal = $(id);
+      if (!modal) return;
+      modal.classList.add('hidden');
+      syncModalState();
+    }
+
     function toggleSecondaryMenu(g) {
       if (!g) return;
       const key = gameInstanceId(g);
@@ -3959,6 +4152,8 @@
         startAction(g, false, 'validate-only');
       } else if (action === 'uncompress') {
         showUncompressModal(g);
+      } else if (action === 'extract-image') {
+        startAction(g, false, 'extract-image');
       } else if (action === 'move-usb') {
         showUsbModal(g, 'move');
       } else if (action === 'move-internal') {
@@ -4104,12 +4299,17 @@
 	        ].filter(Boolean).map((text) => (
 	          '<div class="history-meta">' + escapeHtml(text) + '</div>'
 	        )).join('');
+        const retryAction = operationCanRetrySkipSpaceCheck(op)
+          ? '<div class="history-meta"><button class="small-action" type="button" data-skip-space-retry="' +
+            escapeHtml(op.id || '') + '">Continue anyway</button></div>'
+          : '';
 	        return '<div class="history-row">' +
 	          '<div><div class="history-title">' + escapeHtml(op.displayName || op.titleId) + '</div>' +
 	          '<div class="history-meta">' + escapeHtml(op.action) + ' - ' + escapeHtml(result) + '</div>' +
 	          metaRows +
 	          repairMeta +
 	          (op.error ? '<div class="history-meta danger-text">' + escapeHtml(op.error) + '</div>' : '') +
+          retryAction +
 	          '</div><span class="chip ' + chipClass + '">' + escapeHtml(smallLabel(op.status)) + '</span></div>';
 	      }).join('');
     }
@@ -4283,9 +4483,45 @@
       updateActiveOperationVisual(visual);
     }
 
+    function queueFinishedOperationReminder(activeId) {
+      const id = String(activeId || '');
+      if (!id || remindedFinishedOperationIds.has(id)) return;
+      pendingFinishedOperationId = id;
+    }
+
+    function operationIsFinished(op) {
+      const status = String((op && op.status) || '').toLowerCase();
+      return status === 'success' || status === 'failed' || status === 'cancelled' ||
+        (status && status !== 'running' && status !== 'pending' && Number((op && op.endedAt) || 0) > 0);
+    }
+
+    function showTerminateReminder() {
+      const reminder = $('terminate-reminder');
+      if (!reminder) return;
+      reminder.classList.remove('hidden');
+    }
+
+    function hideTerminateReminder() {
+      const reminder = $('terminate-reminder');
+      if (!reminder || reminder.classList.contains('hidden')) return;
+      reminder.classList.add('hidden');
+    }
+
+    function maybeShowFinishedOperationReminder() {
+      const id = pendingFinishedOperationId;
+      if (!id || remindedFinishedOperationIds.has(id)) return;
+      const op = operationById(id);
+      if (!operationIsFinished(op)) return;
+      pendingFinishedOperationId = '';
+      remindedFinishedOperationIds.add(id);
+      showTerminateReminder();
+    }
+
 	    async function refreshAll() {
 	      if (refreshAllInFlight) return;
 	      refreshAllInFlight = true;
+	      const previousBusy = !!(state.job && state.job.busy);
+	      const previousActiveId = state.job && state.job.activeId ? String(state.job.activeId) : '';
 	      const previousSelection = state.selected;
 	      const previousSelected = selectedGame();
 	      const previousTitleId = previousSelected ? previousSelected.titleId : titleIdFromSelection(previousSelection);
@@ -4309,6 +4545,14 @@
 	          updateSpeedSample(job);
 	        }
 	        state.history = history.history || [];
+	        if (job) {
+	          const nextBusy = !!job.busy;
+	          const nextActiveId = job.activeId ? String(job.activeId) : '';
+	          if (previousBusy && previousActiveId && (!nextBusy || previousActiveId !== nextActiveId)) {
+	            queueFinishedOperationReminder(previousActiveId);
+	          }
+	        }
+	        maybeShowFinishedOperationReminder();
 	        state.games = games.games || [];
 	        applyOperationOutputPresentation();
 	        state.games = sortGamesForList(state.games);
@@ -4351,6 +4595,9 @@
         state.job = job;
         updateSpeedSample(job);
         if (previousBusy !== nextBusy || previousActiveId !== nextActiveId) {
+          if (previousBusy && previousActiveId && (!nextBusy || previousActiveId !== nextActiveId)) {
+            queueFinishedOperationReminder(previousActiveId);
+          }
           await refreshAll();
           return;
         }
@@ -4648,7 +4895,7 @@
       state.uncompressUsbOpen = false;
       $('uncompress-title').textContent = 'Uncompress ' + (g.name || g.titleId);
       updateUncompressModalSelection();
-      $('uncompress-modal').classList.remove('hidden');
+      showModal('uncompress-modal');
       Promise.all([
         api('/api/gc/uncompress-plan?' + gameQuery(g))
           .then((data) => {
@@ -4679,7 +4926,7 @@
     }
 
     function closeUncompressModal() {
-      $('uncompress-modal').classList.add('hidden');
+      hideModal('uncompress-modal');
       state.uncompressGame = null;
       state.uncompressPlan = null;
       state.uncompressPlanLoading = false;
@@ -4719,12 +4966,12 @@
       state.deleteGame = g;
       state.deleteBusy = false;
       updateDeleteModal();
-      $('delete-modal').classList.remove('hidden');
+      showModal('delete-modal');
     }
 
     function closeDeleteModal() {
       if (state.deleteBusy) return;
-      $('delete-modal').classList.add('hidden');
+      hideModal('delete-modal');
       state.deleteGame = null;
     }
 
@@ -4756,7 +5003,7 @@
         (state.moveMode === 'copy' ? 'Copy ' : 'Move ') +
         (g.name || g.titleId) + ' to External Storage';
       $('usb-body').innerHTML = '<div class="empty">Loading external storage</div>';
-      $('usb-modal').classList.remove('hidden');
+      showModal('usb-modal');
       try {
         const data = await api('/api/gc/usb');
         state.usb = data.usb || [];
@@ -4767,7 +5014,7 @@
     }
 
     function closeUsbModal() {
-      $('usb-modal').classList.add('hidden');
+      hideModal('usb-modal');
       state.moveGame = null;
       state.moveMode = 'move';
     }
@@ -4916,7 +5163,7 @@
       $('format-pfs-name').textContent = 'Experimental - pfs_image.dat';
       $('format-exfat-name').textContent = (g.titleId || '<TITLE_ID>') + '.exfat';
       updateCompressModalSelection();
-      $('format-modal').classList.remove('hidden');
+      showModal('format-modal');
       state.compressUsbLoading = true;
       updateCompressModalSelection();
       api('/api/gc/usb')
@@ -4935,7 +5182,7 @@
     }
 
     function closeCompressFormatModal() {
-      $('format-modal').classList.add('hidden');
+      hideModal('format-modal');
       state.compressGame = null;
       state.compressDestination = 'keep';
       state.compressSourcePolicy = 'after';
@@ -5064,6 +5311,8 @@
         if (usbId) url += '&usbId=' + encodeURIComponent(usbId);
       } else if (action === 'uncompress') {
         url = '/api/gc/uncompress?' + gameQuery(g);
+      } else if (action === 'extract-image') {
+        url = '/api/gc/extract-image?' + gameQuery(g);
       } else if (action === 'validate-only') {
         url = '/api/gc/validate-only?' + gameQuery(g);
       } else {
@@ -5141,10 +5390,32 @@
       await refreshAll();
     }
 
+    async function terminateProgram() {
+      const btn = $('terminate-top');
+      if (!confirm('Terminate Game Compressor now?\n\nRecommended before playing games because leaving it running can have minor effects on game performance.')) {
+        return;
+      }
+      if (btn) {
+        btn.disabled = true;
+        btn.title = 'Terminating Game Compressor';
+      }
+      try {
+        await api('/api/control/shutdown', { method: 'POST' });
+        if (btn) btn.title = 'Game Compressor terminated';
+      } catch (err) {
+        if (btn) {
+          btn.disabled = false;
+          btn.title = 'Terminate Game Compressor';
+        }
+        alert(err.message);
+      }
+    }
+
     document.addEventListener('DOMContentLoaded', () => {
       restoreSelectedGame();
       $('info-top').innerHTML = icon('info');
       $('history-top').innerHTML = icon('history');
+      $('terminate-top').innerHTML = icon('power');
       $('info-close').innerHTML = icon('close');
       $('history-close').innerHTML = icon('close');
       $('usb-close').innerHTML = icon('close');
@@ -5152,10 +5423,11 @@
       $('uncompress-close').innerHTML = icon('close');
       $('delete-close').innerHTML = icon('close');
 
-      $('info-top').addEventListener('click', () => $('info-modal').classList.remove('hidden'));
-      $('info-close').addEventListener('click', () => $('info-modal').classList.add('hidden'));
-      $('history-top').addEventListener('click', () => $('history-modal').classList.remove('hidden'));
-      $('history-close').addEventListener('click', () => $('history-modal').classList.add('hidden'));
+      $('info-top').addEventListener('click', () => showModal('info-modal'));
+      $('info-close').addEventListener('click', () => hideModal('info-modal'));
+      $('history-top').addEventListener('click', () => showModal('history-modal'));
+      $('history-close').addEventListener('click', () => hideModal('history-modal'));
+      $('terminate-top').addEventListener('click', terminateProgram);
       $('usb-close').addEventListener('click', closeUsbModal);
       $('format-close').addEventListener('click', closeCompressFormatModal);
       $('uncompress-close').addEventListener('click', closeUncompressModal);
@@ -5235,10 +5507,17 @@
           else if (modal.id === 'format-modal') closeCompressFormatModal();
           else if (modal.id === 'uncompress-modal') closeUncompressModal();
           else if (modal.id === 'delete-modal') closeDeleteModal();
-          else modal.classList.add('hidden');
+          else hideModal(modal.id);
         });
       });
       document.addEventListener('click', (event) => {
+        hideTerminateReminder();
+        const retry = event.target.closest('[data-skip-space-retry]');
+        if (retry) {
+          event.preventDefault();
+          retryCompressSkippingSpaceCheck(retry.getAttribute('data-skip-space-retry') || '');
+          return;
+        }
         if (!state.secondaryMenuFor) return;
         if (event.target.closest('.secondary-menu')) return;
         if (event.target.closest('.action-row')) return;

@@ -1470,6 +1470,10 @@ journal_recount(repair_ctx_t *ctx) {
 }
 
 static int
+journal_create_new(repair_ctx_t *ctx, const pfsc_image_t *img,
+                   char *err, size_t err_size);
+
+static int
 journal_load_existing(repair_ctx_t *ctx, const pfsc_image_t *img,
                       char *err, size_t err_size) {
   unsigned char hdr[JOURNAL_HEADER_SIZE];
@@ -1488,6 +1492,21 @@ journal_load_existing(repair_ctx_t *ctx, const pfsc_image_t *img,
     errno = EINVAL;
     return -1;
   }
+  uint64_t header_scanned = rd64(hdr + JOURNAL_OFF_SCANNED_BLOCKS);
+  uint64_t header_matched = rd64(hdr + JOURNAL_OFF_MATCHED_BLOCKS);
+  uint64_t header_repaired = rd64(hdr + JOURNAL_OFF_REPAIRED_BLOCKS);
+  if(header_scanned > img->block_count ||
+     header_matched > header_scanned ||
+     header_repaired > header_scanned ||
+     header_matched + header_repaired != header_scanned) {
+    progress_line(ctx,
+                  "JOURNAL_DISCARD reason=bad_counters scanned=%llu matched=%llu repair=%llu",
+                  (unsigned long long)header_scanned,
+                  (unsigned long long)header_matched,
+                  (unsigned long long)header_repaired);
+    ctx->info.resumed = 0;
+    return journal_create_new(ctx, img, err, err_size);
+  }
   struct stat st;
   if(fstat(ctx->journal_fd, &st) != 0 || st.st_size < 0) {
     set_err(err, err_size, "stat journal: %s", strerror(errno));
@@ -1502,7 +1521,7 @@ journal_load_existing(repair_ctx_t *ctx, const pfsc_image_t *img,
   uint64_t available = (uint64_t)st.st_size > JOURNAL_HEADER_SIZE
       ? (uint64_t)st.st_size - JOURNAL_HEADER_SIZE
       : 0;
-  if(available > img->block_count) available = img->block_count;
+  if(available > header_scanned) available = header_scanned;
   if(available > 0 &&
      read_exact_at(ctx->journal_fd, ctx->journal_states, (size_t)available,
                    JOURNAL_HEADER_SIZE, err, err_size) != 0) {
@@ -1510,9 +1529,45 @@ journal_load_existing(repair_ctx_t *ctx, const pfsc_image_t *img,
   }
   ctx->journal_phase = phase;
   journal_recount(ctx);
+  if(ctx->info.scanned_blocks != header_scanned ||
+     ctx->info.matched_blocks != header_matched ||
+     ctx->info.repaired_blocks != header_repaired) {
+    progress_line(ctx,
+                  "JOURNAL_DISCARD reason=state_counter_mismatch header=%llu/%llu/%llu states=%llu/%llu/%llu",
+                  (unsigned long long)header_scanned,
+                  (unsigned long long)header_matched,
+                  (unsigned long long)header_repaired,
+                  (unsigned long long)ctx->info.scanned_blocks,
+                  (unsigned long long)ctx->info.matched_blocks,
+                  (unsigned long long)ctx->info.repaired_blocks);
+    memset(ctx->journal_states, 0, (size_t)img->block_count);
+    ctx->info.resumed = 0;
+    ctx->info.scanned_blocks = 0;
+    ctx->info.matched_blocks = 0;
+    ctx->info.repaired_blocks = 0;
+    return journal_create_new(ctx, img, err, err_size);
+  }
   ctx->journal_flushed_blocks =
       journal_known_prefix(ctx->journal_states, img->block_count);
   ctx->journal_last_sync_at = time(NULL);
+  return 0;
+}
+
+static int
+journal_zero_state_area(repair_ctx_t *ctx, const pfsc_image_t *img,
+                        char *err, size_t err_size) {
+  unsigned char zero[4096];
+  memset(zero, 0, sizeof(zero));
+  uint64_t done = 0;
+  while(done < img->block_count) {
+    uint64_t left = img->block_count - done;
+    size_t chunk = left > sizeof(zero) ? sizeof(zero) : (size_t)left;
+    if(write_exact_at(ctx->journal_fd, zero, chunk,
+                      JOURNAL_HEADER_SIZE + done, err, err_size) != 0) {
+      return -1;
+    }
+    done += (uint64_t)chunk;
+  }
   return 0;
 }
 
@@ -1530,7 +1585,9 @@ journal_create_new(repair_ctx_t *ctx, const pfsc_image_t *img,
                     0, err, err_size) != 0) {
     return -1;
   }
+  if(journal_zero_state_area(ctx, img, err, err_size) != 0) return -1;
   ctx->journal_phase = JOURNAL_PHASE_SCAN;
+  ctx->journal_flushed_blocks = 0;
   if(fsync(ctx->journal_fd) != 0) {
     set_err(err, err_size, "sync journal: %s", strerror(errno));
     return -1;
