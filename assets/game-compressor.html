@@ -2638,21 +2638,29 @@
 	    }
 
 	    function gameAprIndexedFromLastState(g) {
+	      if (g && g.aprIndexed) return true;
 	      if (!g || !Array.isArray(state.history)) return false;
 	      const titleId = String(g.titleId || '');
 	      const current = normalizedPath(g.sourcePath);
 	      const sourceKind = String(g.sourceKind || '').toLowerCase();
-	      if (!titleId || !current || sourceKind !== 'folder') return false;
+	      if (!titleId || !current) return false;
 	      let latest = null;
 	      let latestTime = -1;
 	      for (const op of state.history) {
 	        if (!op) continue;
 	        if (String(op.titleId || '') !== titleId) continue;
-	        if (normalizedPath(op.sourcePath) !== current) continue;
 	        const action = String(op.action || '').toLowerCase();
 	        if (action !== 'build-ampr-index' &&
 	          action !== 'compress' &&
 	          action !== 'delete-game-data') {
+	          continue;
+	        }
+	        if (sourceKind === 'compressed') {
+	          if (normalizedPath(op.outputPath) !== current &&
+	            normalizedPath(op.sourcePath) !== current) {
+	            continue;
+	          }
+	        } else if (normalizedPath(op.sourcePath) !== current) {
 	          continue;
 	        }
 	        const time = operationTime(op);
