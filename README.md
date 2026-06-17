@@ -44,10 +44,12 @@ the selected game screen and operation history show `APR indexed`.
 ## Requirements
 
 - A PS5 homebrew environment capable of running payload ELFs.
-- ShadowMountPlus already installed and managing mounted titles.
-- Payload Manager or another way to launch `game-compressor.elf`.
-- FTP access to deploy the payload if you are not copying it manually.
-- PS5 Payload SDK for building from source.
+- [ShadowMountPlus](https://github.com/drakmor/ShadowMountPlus) latest version,
+  installed and managing mounted titles.
+- [KStuff Lite](https://github.com/EchoStretch/kstuff-lite/releases/tag/v1.07)
+  1.07 Beta or later.
+- [Payload Manager](https://github.com/itsPLK/ps5-payload-manager) or another
+  method to launch `game-compressor.elf`.
 
 This project assumes you already understand the risks of running PS5 homebrew
 payloads. Keep backups of important data and test with non-critical titles
