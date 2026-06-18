@@ -1366,34 +1366,6 @@
       font-size: 12px;
     }
 
-    .profile-title-line {
-      display: flex;
-      align-items: center;
-      gap: 7px;
-      min-width: 0;
-    }
-
-    .profile-risk-badge {
-      display: inline-flex;
-      align-items: center;
-      height: 18px;
-      padding: 0 7px;
-      border-radius: 999px;
-      border: 1px solid rgba(220, 38, 38, .26);
-      background: #fee2e2;
-      color: #b91c1c;
-      font-size: 10px;
-      font-weight: 760;
-      line-height: 1;
-      text-transform: uppercase;
-      white-space: nowrap;
-    }
-
-    .profile-risk-meta {
-      color: #b91c1c;
-      font-weight: 650;
-    }
-
     .history-chips {
       display: flex;
       flex-wrap: wrap;
@@ -1900,27 +1872,6 @@
             <span class="chip">Select</span>
           </button>
         </div>
-        <div class="format-section-title">Optimization</div>
-        <div class="format-grid">
-          <button class="format-row is-default-choice" type="button" data-compress-profile="space">
-            <div>
-              <div class="history-title">Optimize for Space</div>
-              <div class="history-meta">Up to 30% less space than Fast, 5x time to compress, slightly faster read speed
-              </div>
-            </div>
-            <span class="chip">Select</span>
-          </button>
-          <button class="format-row" type="button" data-compress-profile="fast">
-            <div>
-              <div class="profile-title-line">
-                <div class="history-title">Optimize for Speed</div>
-                <span class="profile-risk-badge">Experimental</span>
-              </div>
-              <div class="history-meta profile-risk-meta">Fast compression may cause bugs in some games</div>
-            </div>
-            <span class="chip">Select</span>
-          </button>
-        </div>
         <div class="format-section-title">Destination</div>
         <div class="format-grid">
           <button class="format-row is-default-choice" type="button" data-compress-destination="keep">
@@ -2116,7 +2067,6 @@
       moveMode: 'move',
       compressGame: null,
       compressFormat: 'exfat',
-      compressProfile: 'space',
       compressDeletePolicy: 'after',
       compressSourcePolicy: 'after',
       compressSourcePolicyTouched: false,
@@ -3405,7 +3355,6 @@
         '&sourcePath=' + encodeURIComponent(op.sourcePath || '') +
         '&format=' + encodeURIComponent(op.format || 'exfat') +
         '&deletePolicy=' + encodeURIComponent(op.deletePolicy === 'keep' ? 'keep' : 'after') +
-        '&profile=' + encodeURIComponent(op.compressionProfile || 'space') +
         '&skipSpaceCheck=1';
       const targetRoot = String(op.targetRoot || '');
       if (targetRoot === '/data/homebrew') {
@@ -3515,7 +3464,7 @@
       return [
 	        op.id, op.titleId, op.displayName, op.action, op.status, op.phase,
 	        op.result, op.error, op.sourcePath, op.outputPath, op.sourceKind,
-	        op.targetRoot, op.deletePolicy, op.compressionProfile, op.skipSpaceCheck,
+	        op.targetRoot, op.deletePolicy, op.skipSpaceCheck,
         op.repairSummary,
 	        op.createdAt, op.startedAt, op.endedAt,
 	        op.compressionSourceSize, op.compressedSize, op.savedBytes,
@@ -5302,9 +5251,8 @@
 	      $('format-stream-space').textContent = destructiveSpaceText(g);
 	      $('compress-usb-panel').classList.toggle('hidden', !effectiveMovingToUsb);
 	      renderCompressUsbSelect();
-      document.querySelectorAll('[data-compress-format], [data-compress-profile], [data-compress-policy], [data-compress-source-policy], [data-compress-destination]').forEach((button) => {
+      document.querySelectorAll('[data-compress-format], [data-compress-policy], [data-compress-source-policy], [data-compress-destination]').forEach((button) => {
         const format = button.getAttribute('data-compress-format');
-        const profile = button.getAttribute('data-compress-profile');
         const policy = button.getAttribute('data-compress-policy');
         const sourcePolicy = button.getAttribute('data-compress-source-policy');
 	        const destination = button.getAttribute('data-compress-destination');
@@ -5313,13 +5261,11 @@
 	          (destination === 'usb' && hideUsbDestination);
         const selected = format
           ? format === state.compressFormat
-          : (profile
-            ? profile === state.compressProfile
-            : (destination
-              ? destination === state.compressDestination
-              : (sourcePolicy
-                ? sourcePolicy === state.compressSourcePolicy
-                : policy === state.compressDeletePolicy)));
+          : (destination
+            ? destination === state.compressDestination
+            : (sourcePolicy
+              ? sourcePolicy === state.compressSourcePolicy
+              : policy === state.compressDeletePolicy));
         const storageModeDisabled = !!policy && state.compressSourcePolicy === 'keep';
         const disabled = hiddenDestination ||
           (destination === 'usb' && usbDestinationUnavailable) ||
@@ -5345,7 +5291,6 @@
     function showCompressFormatModal(g) {
       state.compressGame = g;
       state.compressFormat = 'exfat';
-      state.compressProfile = 'space';
       state.compressDeletePolicy = 'after';
       state.compressSourcePolicy = 'after';
       state.compressSourcePolicyTouched = false;
@@ -5427,7 +5372,6 @@
     async function startSelectedCompress() {
       const g = state.compressGame;
       const format = state.compressFormat;
-      const profile = state.compressProfile;
       const destination = state.compressDestination || 'keep';
       const movingElsewhere = destination === 'usb' || destination === 'internal';
       const deletePolicy = state.compressSourcePolicy === 'keep'
@@ -5448,7 +5392,7 @@
       }
       closeCompressFormatModal();
       if (format !== 'pfs' && format !== 'exfat') return;
-      await startAction(g, false, 'compress', format, deletePolicy, profile, usbId, destination);
+      await startAction(g, false, 'compress', format, deletePolicy, usbId, destination);
     }
 
     async function startSelectedUncompress() {
@@ -5485,7 +5429,7 @@
       }
     }
 
-    async function startAction(g, confirmStream, overrideAction, compressFormat, deletePolicy, compressionProfile, usbId, compressionDestination) {
+    async function startAction(g, confirmStream, overrideAction, compressFormat, deletePolicy, usbId, compressionDestination) {
       const action = overrideAction || actionFor(g);
       if (!action) return;
       if (!g || !g.sourcePath) return;
@@ -5498,7 +5442,6 @@
         url = '/api/gc/compress?' + gameQuery(g) +
           '&format=' + encodeURIComponent(compressFormat);
         if (deletePolicy) url += '&deletePolicy=' + encodeURIComponent(deletePolicy);
-        if (compressionProfile) url += '&profile=' + encodeURIComponent(compressionProfile);
         if (compressionDestination && compressionDestination !== 'keep') {
           url += '&destination=' + encodeURIComponent(compressionDestination);
         }
@@ -5540,7 +5483,7 @@
           if (data.canStreamDelete) {
             const msg = 'Not enough free storage for the safer path.\n\nDelete while processing can damage the original source if the operation stops.\n\n' + base;
             if (confirm(msg)) {
-              await startAction(g, true, overrideAction, compressFormat, deletePolicy, compressionProfile, usbId, compressionDestination);
+              await startAction(g, true, overrideAction, compressFormat, deletePolicy, usbId, compressionDestination);
               return;
             }
           } else {
@@ -5667,12 +5610,6 @@
       document.querySelectorAll('[data-compress-format]').forEach((button) => {
         button.addEventListener('click', () => {
           state.compressFormat = button.getAttribute('data-compress-format') || 'exfat';
-          updateCompressModalSelection();
-        });
-      });
-      document.querySelectorAll('[data-compress-profile]').forEach((button) => {
-        button.addEventListener('click', () => {
-          state.compressProfile = button.getAttribute('data-compress-profile') || 'space';
           updateCompressModalSelection();
         });
       });

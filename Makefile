@@ -34,7 +34,6 @@ C_SRCS += src/pfs_decompress.c
 C_SRCS += src/pfs_repair.c
 C_SRCS += src/pfs_block_pipeline.c
 C_SRCS += src/pfs_validate_hash.c
-C_SRCS += src/miniz_tdef.c
 C_SRCS += src/miniz_tinfl.c
 
 ASSETS := $(wildcard assets/*)
@@ -50,7 +49,7 @@ CFLAGS_COMMON += -DVERSION_TAG=\"game-compressor\"
 CFLAGS_COMMON += -DBUILD_VERSION=\"$(BUILD_VERSION)\"
 CFLAGS_COMMON += -DMINIZ_USE_UNALIGNED_LOADS_AND_STORES=1
 
-FAST_SRCS := src/pfs_compress.c src/pfs_decompress.c src/pfs_repair.c src/pfs_block_pipeline.c src/pfs_validate_hash.c src/miniz_tinfl.c src/miniz_tdef.c
+FAST_SRCS := src/pfs_compress.c src/pfs_decompress.c src/pfs_repair.c src/pfs_block_pipeline.c src/pfs_validate_hash.c src/miniz_tinfl.c
 FAST_OBJS := $(patsubst %.c,build/%.o,$(FAST_SRCS))
 
 PFSC_ENCODER ?= runtime

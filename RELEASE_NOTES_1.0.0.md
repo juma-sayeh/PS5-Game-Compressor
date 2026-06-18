@@ -23,8 +23,8 @@ Compared against `v0.9.9`.
 - Improves same-device compression stability by keeping default compression
   worker counts conservative instead of overloading PS5 storage and UI
   responsiveness.
-- Marks the Fast compression profile as experimental in the UI and warns that it
-  may cause bugs in some games.
+- Removes the compression optimization selector and the old Fast compression
+  profile path.
 - Improves delete/cleanup behavior by removing validation sidecars such as
   `.vhash` when compressed outputs are deleted or cleaned up after failure.
 - Updates the terminate flow. The terminate button removes the Game Compressor

@@ -18,7 +18,6 @@ typedef struct pfs_app_info {
   int  nested_type;
   int  source_type;
   int  delete_policy;
-  int  compression_profile;
   int  output_exists;
   uint64_t stream_budget_bytes;
   uint64_t stream_reserve_bytes;
@@ -55,9 +54,6 @@ typedef struct pfs_decompress_info {
 #define PFS_DELETE_AFTER  1
 #define PFS_DELETE_STREAM 2
 
-#define PFS_COMPRESS_PROFILE_SPACE 1
-#define PFS_COMPRESS_PROFILE_FAST  2
-
 #define PFS_STREAM_DEFAULT_BUDGET_BYTES 1073741824ULL
 #define PFS_STREAM_ORDER_PATH          0
 #define PFS_STREAM_ORDER_BUDGETED_GAIN 1
@@ -82,20 +78,18 @@ int pfs_app_probe(const char *path, pfs_app_info_t *info,
 int pfs_image_probe(const char *path, pfs_app_info_t *info,
                     char *err, size_t err_size);
 
-int pfs_compress_source_to_ffpfsc_opts_profile_output_ex(
+int pfs_compress_source_to_ffpfsc_opts_output_ex(
                                       const char *path, int overwrite,
                                       int workers, int format,
                                       int delete_policy,
-                                      int compression_profile,
                                       const char *output_path,
                                       const pfs_stream_options_t *stream_opts,
                                       pfs_app_info_t *info,
                                       char *err, size_t err_size);
-int pfs_compress_prepare_source_to_ffpfsc_opts_profile_output_ex(
+int pfs_compress_prepare_source_to_ffpfsc_opts_output_ex(
                                       const char *path, int overwrite,
                                       int format,
                                       int delete_policy,
-                                      int compression_profile,
                                       const char *output_path,
                                       const pfs_stream_options_t *stream_opts,
                                       pfs_compress_plan_t **plan_out,

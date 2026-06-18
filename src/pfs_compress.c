@@ -21,7 +21,6 @@
 #include <unistd.h>
 
 #include <zlib.h>
-#include "miniz.h"
 #if defined(GAME_COMPRESSOR_VERSION)
 #include "gc_diag.h"
 #define PFSC_WINDOW_LOG(...) gc_log(__VA_ARGS__)
@@ -78,7 +77,6 @@
 #define PFSC_BLOCK_OFFSETS_OFFSET 0x400
 #define PFSC_INITIAL_DATA_OFFSET 0x10000ULL
 #define PFSC_OFFSET_ENTRY_SIZE 8
-#define PFSC_FAST_ZLIB_LEVEL MZ_BEST_SPEED
 #define PFSC_SLOTS_PER_WORKER 32
 #define PFSC_OUTPUT_BUFFER_SIZE (16U * 1024U * 1024U)
 #define PFSC_OUTPUT_BUFFER_MIN_SIZE (64U * 1024U)
@@ -316,16 +314,11 @@ typedef struct pfsc_slot {
 #ifndef GC_PFSC_FORCE_RAW_EXEC
 #define GC_PFSC_FORCE_RAW_EXEC 0
 #endif
-typedef tdefl_compressor pfsc_comp_state_t;
-
 typedef struct pfsc_comp_config {
-  int profile;
   int zlib_level;
   int threshold_gain;
   int force_raw_exec;
-  int fast_deflate;
   int raw_only;
-  mz_uint miniz_flags;
 } pfsc_comp_config_t;
 
 typedef struct pfsc_pool {
@@ -5380,12 +5373,6 @@ pfs_vhash_writer_resume_local(pfs_vhash_writer_t *w, const char *path,
 }
 
 static int
-pfs_compress_profile_normalize(int profile) {
-  return profile == PFS_COMPRESS_PROFILE_FAST ?
-      PFS_COMPRESS_PROFILE_FAST : PFS_COMPRESS_PROFILE_SPACE;
-}
-
-static int
 pfsc_compressed_block_meets_gain(size_t comp_len, int threshold_gain) {
   if(comp_len >= (size_t)PFS_BLOCK_SIZE) return 0;
   if(threshold_gain <= 0) return 1;
@@ -5396,26 +5383,7 @@ pfsc_compressed_block_meets_gain(size_t comp_len, int threshold_gain) {
 static size_t
 pfsc_compress_block_smaller(const unsigned char *raw, unsigned char *out,
                             const pfsc_comp_config_t *config,
-                            pfsc_comp_state_t *comp, z_stream *zcomp) {
-  if(config && (config->profile == PFS_COMPRESS_PROFILE_FAST ||
-                config->fast_deflate)) {
-    size_t in_size = (size_t)PFS_BLOCK_SIZE;
-    size_t out_size = (size_t)PFS_BLOCK_SIZE - 1;
-    if(!comp ||
-       tdefl_init(comp, NULL, NULL, (int)config->miniz_flags) !=
-           TDEFL_STATUS_OKAY) {
-      return 0;
-    }
-    tdefl_status st = tdefl_compress(comp, raw, &in_size, out, &out_size,
-                                     TDEFL_FINISH);
-    if(st == TDEFL_STATUS_DONE &&
-       in_size == (size_t)PFS_BLOCK_SIZE &&
-       pfsc_compressed_block_meets_gain(out_size, config->threshold_gain)) {
-      return out_size;
-    }
-    return 0;
-  }
-
+                            z_stream *zcomp) {
   size_t out_size = (size_t)PFS_BLOCK_SIZE - 1;
   int zlib_level = config ? config->zlib_level : GC_PFSC_ZLIB_LEVEL;
   int threshold_gain = config ? config->threshold_gain : GC_PFSC_THRESHOLD_GAIN;
@@ -5466,17 +5434,9 @@ pfsc_pool_set_error(pfsc_pool_t *pool, int err) {
 static void *
 pfsc_worker_main(void *arg) {
   pfsc_pool_t *pool = arg;
-  pfsc_comp_state_t *comp = NULL;
   z_stream zcomp;
   int zcomp_initialized = 0;
-  if(pool->comp_config.profile == PFS_COMPRESS_PROFILE_FAST ||
-     pool->comp_config.fast_deflate) {
-    comp = malloc(sizeof(*comp));
-    if(!comp) {
-      pfsc_pool_set_error(pool, ENOMEM);
-      return NULL;
-    }
-  } else if(!pool->comp_config.raw_only) {
+  if(!pool->comp_config.raw_only) {
     memset(&zcomp, 0, sizeof(zcomp));
     int zrc = deflateInit(&zcomp, pool->comp_config.zlib_level);
     if(zrc != Z_OK) {
@@ -5510,7 +5470,7 @@ pfsc_worker_main(void *arg) {
       atomic_fetch_add(&g_job.skipped_zlib_blocks, 1);
     } else {
       slot->comp_len = pfsc_compress_block_smaller(slot->raw, slot->comp,
-                                                   &pool->comp_config, comp,
+                                                   &pool->comp_config,
                                                    zcomp_initialized ?
                                                        &zcomp : NULL);
     }
@@ -5523,7 +5483,6 @@ pfsc_worker_main(void *arg) {
   }
 
   if(zcomp_initialized) deflateEnd(&zcomp);
-  free(comp);
   return NULL;
 }
 
@@ -5820,7 +5779,7 @@ pfsc_window_read_task(pfsc_window_pool_t *pool, pfsc_window_task_t *task) {
 
 static void
 pfsc_window_compress_task(pfsc_window_pool_t *pool, pfsc_window_task_t *task,
-                          pfsc_comp_state_t *comp, z_stream *zcomp) {
+                          z_stream *zcomp) {
   pfsc_window_lane_t *lane = &task->window->lanes[task->lane_index];
   const pfsc_comp_config_t *config = pool->comp_config;
 
@@ -5854,8 +5813,7 @@ pfsc_window_compress_task(pfsc_window_pool_t *pool, pfsc_window_task_t *task,
       result->compressed = 0;
       atomic_fetch_add(&g_job.skipped_zlib_blocks, 1);
     } else {
-      size_t comp_len = pfsc_compress_block_smaller(raw, out, config, comp,
-                                                    zcomp);
+      size_t comp_len = pfsc_compress_block_smaller(raw, out, config, zcomp);
       if(comp_len > 0 && comp_len < (size_t)PFS_BLOCK_SIZE) {
         result->stored_len = (uint32_t)comp_len;
         result->compressed = 1;
@@ -6095,7 +6053,6 @@ pfsc_window_commit_lane_ordered(pfsc_window_pool_t *pool,
 static void *
 pfsc_window_worker_main(void *arg) {
   pfsc_window_pool_t *pool = arg;
-  pfsc_comp_state_t *comp = NULL;
   z_stream zcomp;
   int zcomp_initialized = 0;
   for(;;) {
@@ -6115,16 +6072,7 @@ pfsc_window_worker_main(void *arg) {
         pfsc_window_read_task(pool, task);
         break;
       case PFSC_WINDOW_TASK_COMPRESS:
-        if(!comp && pool->comp_config &&
-           (pool->comp_config->profile == PFS_COMPRESS_PROFILE_FAST ||
-            pool->comp_config->fast_deflate)) {
-          comp = malloc(sizeof(*comp));
-          if(!comp) {
-            pfsc_window_pool_set_error(pool, ENOMEM, "out of memory");
-            break;
-          }
-        }
-        if(!comp && !zcomp_initialized && pool->comp_config &&
+        if(!zcomp_initialized && pool->comp_config &&
            !pool->comp_config->raw_only) {
           memset(&zcomp, 0, sizeof(zcomp));
           int zrc = deflateInit(&zcomp, pool->comp_config->zlib_level);
@@ -6134,7 +6082,7 @@ pfsc_window_worker_main(void *arg) {
           }
           zcomp_initialized = 1;
         }
-        pfsc_window_compress_task(pool, task, comp,
+        pfsc_window_compress_task(pool, task,
                                   zcomp_initialized ? &zcomp : NULL);
         break;
       case PFSC_WINDOW_TASK_WRITE:
@@ -6148,7 +6096,6 @@ pfsc_window_worker_main(void *arg) {
     free(task);
   }
   if(zcomp_initialized) deflateEnd(&zcomp);
-  free(comp);
   return NULL;
 }
 
@@ -6487,11 +6434,10 @@ compress_nested_to_pfsc_windowed(int fd, uint64_t file_start,
                                  int requested_workers,
                                  const char *nested_name,
                                  int nested_type,
-	                                 const char *vhash_path,
-	                                 uint64_t *stored_size,
-	                                 int compression_profile,
+                                 const char *vhash_path,
+                                 uint64_t *stored_size,
                                  int allow_io_overlap,
-	                                 char *err, size_t err_size) {
+                                 char *err, size_t err_size) {
   uint64_t block_count = ceil_div_u64(nested->image_size, PFS_BLOCK_SIZE);
   uint64_t logical_size = block_count * PFS_BLOCK_SIZE;
   uint64_t header_size = pfsc_header_span(block_count);
@@ -6504,18 +6450,11 @@ compress_nested_to_pfsc_windowed(int fd, uint64_t file_start,
   int vhash_open = 0;
   int rc = -1;
   uint64_t data_pos = header_size;
-  int profile = pfs_compress_profile_normalize(compression_profile);
   pfsc_comp_config_t comp_config = {
-    .profile = profile,
     .zlib_level = GC_PFSC_ZLIB_LEVEL,
-    .threshold_gain = profile == PFS_COMPRESS_PROFILE_FAST ?
-        0 : GC_PFSC_THRESHOLD_GAIN,
-    .force_raw_exec = profile == PFS_COMPRESS_PROFILE_FAST ?
-        1 : GC_PFSC_FORCE_RAW_EXEC,
-    .fast_deflate = profile == PFS_COMPRESS_PROFILE_FAST,
+    .threshold_gain = GC_PFSC_THRESHOLD_GAIN,
+    .force_raw_exec = GC_PFSC_FORCE_RAW_EXEC,
     .raw_only = 0,
-    .miniz_flags = tdefl_create_comp_flags_from_zip_params(
-        PFSC_FAST_ZLIB_LEVEL, 15, MZ_DEFAULT_STRATEGY),
   };
 
   memset(&pool, 0, sizeof(pool));
@@ -6584,13 +6523,12 @@ compress_nested_to_pfsc_windowed(int fd, uint64_t file_start,
   snprintf(label, sizeof(label), "Compressing %s",
            nested_name && nested_name[0] ? nested_name : "nested image");
   job_set_current(label);
-  PFSC_WINDOW_LOG("pfsc window start blocks=%llu lanes=%d laneBytes=%llu workers=%d readPermits=%d writePermits=%d profile=%d zlibLevel=%d thresholdGain=%d fastDeflate=%d rawOnly=%d",
+  PFSC_WINDOW_LOG("pfsc window start blocks=%llu lanes=%d laneBytes=%llu workers=%d readPermits=%d writePermits=%d zlibLevel=%d thresholdGain=%d rawOnly=%d",
                   (unsigned long long)block_count, PFSC_WINDOW_LANES,
                   (unsigned long long)PFSC_WINDOW_LANE_SIZE,
                   tuning.max_workers, tuning.read_permits,
-                  tuning.write_permits, comp_config.profile,
+                  tuning.write_permits,
                   comp_config.zlib_level, comp_config.threshold_gain,
-                  comp_config.fast_deflate,
                   comp_config.raw_only);
   PFSC_WINDOW_LOG("pfsc window mode=ordered-commit ioPolicy=%s",
                   allow_io_overlap ? "pipelined" : "serial");
@@ -6734,7 +6672,7 @@ compress_nested_to_pfsc(int fd, uint64_t file_start, pfs_layout_t *nested,
                         const pfs_app_info_t *stream_info, int format,
                         destructive_stream_ctx_t *stream,
                         const char *source_root, int *delete_started,
-                        uint64_t *stored_size, int compression_profile,
+                        uint64_t *stored_size,
                         int allow_io_overlap, char *err, size_t err_size) {
   uint64_t block_count = ceil_div_u64(nested->image_size, PFS_BLOCK_SIZE);
   uint64_t logical_size = block_count * PFS_BLOCK_SIZE;
@@ -6754,18 +6692,10 @@ compress_nested_to_pfsc(int fd, uint64_t file_start, pfs_layout_t *nested,
   int rc = -1;
   uint64_t data_pos = header_size;
   int offsets_owned = 1;
-  int profile = pfs_compress_profile_normalize(compression_profile);
-  if(delete_stream) profile = PFS_COMPRESS_PROFILE_FAST;
   pfsc_comp_config_t comp_config = {
-    .profile = profile,
     .zlib_level = GC_PFSC_ZLIB_LEVEL,
-    .threshold_gain = profile == PFS_COMPRESS_PROFILE_FAST ?
-        0 : GC_PFSC_THRESHOLD_GAIN,
-    .force_raw_exec = profile == PFS_COMPRESS_PROFILE_FAST ?
-        1 : GC_PFSC_FORCE_RAW_EXEC,
-    .fast_deflate = profile == PFS_COMPRESS_PROFILE_FAST,
-    .miniz_flags = tdefl_create_comp_flags_from_zip_params(
-        PFSC_FAST_ZLIB_LEVEL, 15, MZ_DEFAULT_STRATEGY),
+    .threshold_gain = GC_PFSC_THRESHOLD_GAIN,
+    .force_raw_exec = GC_PFSC_FORCE_RAW_EXEC,
   };
 
   memset(&pool, 0, sizeof(pool));
@@ -6788,7 +6718,7 @@ compress_nested_to_pfsc(int fd, uint64_t file_start, pfs_layout_t *nested,
   if(!delete_stream) {
     int window_rc = compress_nested_to_pfsc_windowed(
         fd, file_start, nested, requested_workers, nested_name, nested_type,
-        vhash_path, stored_size, compression_profile, allow_io_overlap,
+        vhash_path, stored_size, allow_io_overlap,
         err, err_size);
     if(window_rc == 0) {
       rc = 0;
@@ -7639,7 +7569,6 @@ pfs_compress_prepare_probed_to_ffpfsc_opts(pfs_compress_plan_t *plan,
                                            const pfs_app_info_t *src_info,
                                            int overwrite, int format,
                                            int delete_policy,
-                                           int compression_profile,
                                            const pfs_stream_options_t *stream_opts,
                                            pfs_app_info_t *info_out,
                                            char *err, size_t err_size) {
@@ -7688,11 +7617,8 @@ pfs_compress_prepare_probed_to_ffpfsc_opts(pfs_compress_plan_t *plan,
   }
   info->format = format;
   info->delete_policy = delete_policy;
-  info->compression_profile =
-      pfs_compress_profile_normalize(compression_profile);
   if(info->source_type == PFS_COMPRESS_SOURCE_APP &&
      delete_policy == PFS_DELETE_STREAM) {
-    info->compression_profile = PFS_COMPRESS_PROFILE_FAST;
     pfs_stream_options_t normalized;
     stream_options_normalize(stream_opts, &normalized);
     info->stream_budget_bytes = normalized.budget_bytes;
@@ -7858,7 +7784,7 @@ pfs_compress_execute_prepared_to_ffpfsc(pfs_compress_plan_t *plan,
                              destructive_stream ? &stream_ctx : NULL,
                              info->source_path,
                              &delete_started, &stored_size,
-                             info->compression_profile, allow_io_overlap,
+                             allow_io_overlap,
                              err, err_size) != 0) {
     goto done;
   }
@@ -7962,7 +7888,6 @@ static int
 pfs_compress_probed_to_ffpfsc_opts(pfs_app_info_t *info, int overwrite,
                                    int workers, int format,
                                    int delete_policy,
-                                   int compression_profile,
                                    const pfs_stream_options_t *stream_opts,
                                    char *err, size_t err_size) {
   pfs_compress_plan_t *plan = calloc(1, sizeof(*plan));
@@ -7973,7 +7898,7 @@ pfs_compress_probed_to_ffpfsc_opts(pfs_app_info_t *info, int overwrite,
     return -1;
   }
   rc = pfs_compress_prepare_probed_to_ffpfsc_opts(
-      plan, info, overwrite, format, delete_policy, compression_profile,
+      plan, info, overwrite, format, delete_policy,
       stream_opts, info, err, err_size);
   if(rc == 0) {
     rc = pfs_compress_execute_prepared_to_ffpfsc(
@@ -7984,11 +7909,10 @@ pfs_compress_probed_to_ffpfsc_opts(pfs_app_info_t *info, int overwrite,
 }
 
 int
-pfs_compress_prepare_source_to_ffpfsc_opts_profile_output_ex(
+pfs_compress_prepare_source_to_ffpfsc_opts_output_ex(
                                            const char *path, int overwrite,
                                            int format,
                                            int delete_policy,
-                                           int compression_profile,
                                            const char *output_path,
                                            const pfs_stream_options_t *stream_opts,
                                            pfs_compress_plan_t **plan_out,
@@ -8025,7 +7949,7 @@ pfs_compress_prepare_source_to_ffpfsc_opts_profile_output_ex(
     return -1;
   }
   rc = pfs_compress_prepare_probed_to_ffpfsc_opts(
-      plan, info, overwrite, format, delete_policy, compression_profile,
+      plan, info, overwrite, format, delete_policy,
       stream_opts, info, err, err_size);
   if(rc != 0) {
     pfs_compress_plan_free(plan);
@@ -8036,11 +7960,10 @@ pfs_compress_prepare_source_to_ffpfsc_opts_profile_output_ex(
 }
 
 int
-pfs_compress_source_to_ffpfsc_opts_profile_output_ex(
+pfs_compress_source_to_ffpfsc_opts_output_ex(
                                            const char *path, int overwrite,
                                            int workers, int format,
                                            int delete_policy,
-                                           int compression_profile,
                                            const char *output_path,
                                            const pfs_stream_options_t *stream_opts,
                                            pfs_app_info_t *info,
@@ -8061,7 +7984,6 @@ pfs_compress_source_to_ffpfsc_opts_profile_output_ex(
   }
   return pfs_compress_probed_to_ffpfsc_opts(info, overwrite, workers,
                                             format, delete_policy,
-                                            compression_profile,
                                             stream_opts,
                                             err, err_size);
 }

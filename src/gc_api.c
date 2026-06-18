@@ -202,7 +202,6 @@ typedef struct gc_operation {
   char source_kind[32];
   char format[16];
   char delete_policy[16];
-  char compression_profile[16];
   char stream_order[24];
   uint64_t stream_budget_bytes;
   int skip_space_check;
@@ -336,20 +335,6 @@ action_name(gc_action_t action) {
   if(action == GC_ACTION_READ_SPEED_TEST) return "read-speed-test";
   if(action == GC_ACTION_BUILD_AMPR_INDEX) return "build-ampr-index";
   return "unknown";
-}
-
-static const char *
-compression_profile_or_default(const char *profile) {
-  if(!strcasecmp(profile ? profile : "", "fast")) return "fast";
-  return "space";
-}
-
-static int
-compression_profile_value(const char *profile) {
-  if(!strcmp(compression_profile_or_default(profile), "fast")) {
-    return PFS_COMPRESS_PROFILE_FAST;
-  }
-  return PFS_COMPRESS_PROFILE_SPACE;
 }
 
 static const char *
@@ -3129,8 +3114,6 @@ append_operation_json(json_buf_t *b, const gc_operation_t *op,
       json_string(b, op->format) == 0 &&
       json_append(b, ",\"deletePolicy\":") == 0 &&
       json_string(b, op->delete_policy) == 0 &&
-      json_append(b, ",\"compressionProfile\":") == 0 &&
-      json_string(b, compression_profile_or_default(op->compression_profile)) == 0 &&
       json_append(b, ",\"streamOrder\":") == 0 &&
       json_string(b, op->stream_order[0] ? op->stream_order : "budgeted-gain") == 0 &&
       json_append(b, ",\"targetRoot\":") == 0 &&
@@ -5730,7 +5713,6 @@ run_compress_op(gc_operation_t *op) {
   int delete_policy = stream_delete ?
       PFS_DELETE_STREAM : PFS_DELETE_KEEP;
   int pfs_delete_policy = delete_policy;
-  int compression_profile = compression_profile_value(op->compression_profile);
   uint64_t stream_budget_bytes = op->stream_budget_bytes ?
       op->stream_budget_bytes : PFS_STREAM_DEFAULT_BUDGET_BYTES;
   pfs_stream_options_t stream_opts = {
@@ -5740,9 +5722,6 @@ run_compress_op(gc_operation_t *op) {
         PFS_STREAM_ORDER_PATH : PFS_STREAM_ORDER_BUDGETED_GAIN,
   };
   if(stream_delete) {
-    compression_profile = PFS_COMPRESS_PROFILE_FAST;
-    snprintf(op->compression_profile, sizeof(op->compression_profile), "%s",
-             "fast");
     if(!op->stream_order[0]) {
       snprintf(op->stream_order, sizeof(op->stream_order), "%s",
                "budgeted-gain");
@@ -5772,11 +5751,9 @@ run_compress_op(gc_operation_t *op) {
   gc_checkpoint("compress find game");
   snprintf(op->format, sizeof(op->format), "%s",
            format == PFS_COMPRESS_FORMAT_EXFAT ? "exfat" : "pfs");
-  snprintf(op->compression_profile, sizeof(op->compression_profile), "%s",
-           compression_profile_or_default(op->compression_profile));
-  gc_log("compress start op=%s title=%s format=%s policy=%s profile=%s skipSpaceCheck=%d",
+  gc_log("compress start op=%s title=%s format=%s policy=%s skipSpaceCheck=%d",
          op->id, op->title_id, op->format, op->delete_policy,
-         op->compression_profile, skip_space_check);
+         skip_space_check);
   append_operation_phase(op, "resolving");
   job_set_phase("resolving", 0, 0, "Resolving selected source");
   if(find_game_for_operation_source_path(op, &game, 0) != 0) {
@@ -5842,8 +5819,8 @@ run_compress_op(gc_operation_t *op) {
   }
   if(game.source_kind == GC_SOURCE_FOLDER) {
     gc_checkpoint("compress prepare scan");
-    if(pfs_compress_prepare_source_to_ffpfsc_opts_profile_output_ex(
-           game.source_path, 0, format, pfs_delete_policy, compression_profile,
+    if(pfs_compress_prepare_source_to_ffpfsc_opts_output_ex(
+           game.source_path, 0, format, pfs_delete_policy,
            moving_to_target ? compress_write_path : NULL,
            stream_delete ? &stream_opts : NULL,
            &compress_plan, &info, err, sizeof(err)) != 0) {
@@ -6069,9 +6046,9 @@ run_compress_op(gc_operation_t *op) {
     pfs_compress_plan_free(compress_plan);
     compress_plan = NULL;
   } else {
-    compress_rc = pfs_compress_source_to_ffpfsc_opts_profile_output_ex(
+    compress_rc = pfs_compress_source_to_ffpfsc_opts_output_ex(
         game.source_path, 0, PFS_COMPRESS_DEFAULT_WORKERS,
-        format, pfs_delete_policy, compression_profile,
+        format, pfs_delete_policy,
         moving_to_target ? compress_write_path : NULL,
         stream_delete ? &stream_opts : NULL,
         &info, err, sizeof(err));
@@ -7874,7 +7851,6 @@ enqueue_action(const http_request_t *req, gc_action_t action) {
   char format_arg[16];
   char mode_arg[16];
   char destination_arg[24] = "";
-  char profile_arg[24];
   char delete_policy_arg[24];
   char preserve_arg[24];
   char budget_arg[32];
@@ -7883,7 +7859,6 @@ enqueue_action(const http_request_t *req, gc_action_t action) {
   char usb_id[16] = "";
   char requested_delete_policy[16] = "";
   char preserve_original[16] = "";
-  char compression_profile[16] = "space";
   char stream_order[24] = "budgeted-gain";
   uint64_t stream_budget_bytes = PFS_STREAM_DEFAULT_BUDGET_BYTES;
   gc_game_t game;
@@ -7960,18 +7935,6 @@ enqueue_action(const http_request_t *req, gc_action_t action) {
       /* usbId is parsed after storage discovery. */
     } else {
       return serve_error(req, 400, "bad uncompress destination");
-    }
-  }
-  if(action == GC_ACTION_COMPRESS &&
-     (websrv_get_query_arg(req, "profile", profile_arg, sizeof(profile_arg)) ||
-      websrv_get_query_arg(req, "compressionProfile", profile_arg,
-                           sizeof(profile_arg)))) {
-    if(!strcasecmp(profile_arg, "fast")) {
-      snprintf(compression_profile, sizeof(compression_profile), "%s", "fast");
-    } else if(!strcasecmp(profile_arg, "space")) {
-      snprintf(compression_profile, sizeof(compression_profile), "%s", "space");
-    } else {
-      return serve_error(req, 400, "bad compression profile");
     }
   }
   if(websrv_get_query_arg(req, "deletePolicy", delete_policy_arg,
@@ -8142,8 +8105,6 @@ enqueue_action(const http_request_t *req, gc_action_t action) {
   snprintf(op->format, sizeof(op->format), "%s", format);
   snprintf(op->delete_policy, sizeof(op->delete_policy), "%s",
            delete_policy);
-	  snprintf(op->compression_profile, sizeof(op->compression_profile), "%s",
-	           compression_profile_or_default(compression_profile));
   snprintf(op->stream_order, sizeof(op->stream_order), "%s", stream_order);
   op->stream_budget_bytes = stream_budget_bytes;
   op->skip_space_check = skip_space_check;

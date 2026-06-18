@@ -34,18 +34,4 @@
 #endif
 
 #include "miniz_common.h"
-#include "miniz_tdef.h"
 #include "miniz_tinfl.h"
-
-enum {
-    MZ_DEFAULT_STRATEGY = 0,
-    MZ_FILTERED = 1,
-    MZ_HUFFMAN_ONLY = 2,
-    MZ_RLE = 3,
-    MZ_FIXED = 4
-};
-
-enum {
-    MZ_BEST_SPEED = 1,
-    MZ_DEFAULT_LEVEL = 6
-};

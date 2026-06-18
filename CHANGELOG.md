@@ -46,8 +46,8 @@ Full release notes: [RELEASE_NOTES_1.0.0.md](RELEASE_NOTES_1.0.0.md).
 - The `APR indexed` indicator is no longer shown in the sidebar. It is scoped to
   the main game screen and history, and is based on the latest app-recorded
   state for that exact folder.
-- The Fast compression profile is now marked as experimental with a visible
-  warning that it may cause bugs in some games.
+- Removed the compression optimization selector and the old Fast compression
+  profile path.
 - The terminate button removes the Game Compressor home-screen tile before
   stopping the payload.
 
