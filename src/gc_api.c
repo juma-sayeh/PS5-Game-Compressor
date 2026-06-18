@@ -9884,7 +9884,9 @@ job_request(const http_request_t *req) {
   char current[512], phase[32], verb[16], err[256], active_id[32] = {0};
   char cancel_disabled_reason[128] = {0};
   time_t started_at = 0;
+  time_t phase_started_at = 0;
   long elapsed_seconds = 0;
+  long phase_elapsed_seconds = 0;
   long speed_metric_bytes = 0;
   long speed_bytes_per_second = 0;
   const char *speed_source = "none";
@@ -9897,11 +9899,15 @@ job_request(const http_request_t *req) {
   snprintf(cancel_disabled_reason, sizeof(cancel_disabled_reason), "%s",
            g_job.cancel_disabled_reason);
   started_at = g_job.started_at;
+  phase_started_at = g_job.phase_started_at;
   pthread_mutex_unlock(&g_job.lock);
 
   if(busy && started_at > 0) {
     time_t now = time(NULL);
     if(now > started_at) elapsed_seconds = (long)(now - started_at);
+    if(phase_started_at > 0 && now > phase_started_at) {
+      phase_elapsed_seconds = (long)(now - phase_started_at);
+    }
   }
   pthread_mutex_lock(&g_gc_lock);
   gc_operation_t *active = active_op_locked();
@@ -9971,7 +9977,9 @@ job_request(const http_request_t *req) {
     cancel_disabled_reason[0] = 0;
     active_id[0] = 0;
     started_at = 0;
+    phase_started_at = 0;
     elapsed_seconds = 0;
+    phase_elapsed_seconds = 0;
     speed_metric_bytes = 0;
     speed_bytes_per_second = 0;
     speed_source = "none";
@@ -10044,18 +10052,20 @@ job_request(const http_request_t *req) {
      json_string(&b, cancel_disabled_reason) != 0 ||
      json_appendf(&b,
 		                  ",\"cancelRequested\":%s,"
-		                  "\"rollbackRequested\":%s,"
-		                  "\"startedAt\":%ld,"
-		                  "\"elapsedSeconds\":%ld,"
-		                  "\"speedMetricBytes\":%ld,"
-		                  "\"speedBytesPerSec\":%ld,"
+			                  "\"rollbackRequested\":%s,"
+			                  "\"startedAt\":%ld,"
+			                  "\"elapsedSeconds\":%ld,"
+			                  "\"phaseElapsedSeconds\":%ld,"
+			                  "\"speedMetricBytes\":%ld,"
+			                  "\"speedBytesPerSec\":%ld,"
 		                  "\"compressBytesPerSecond\":%ld,"
 		                  "\"speedSource\":",
 		                  cancel_requested ? "true" : "false",
-		                  rollback_requested ? "true" : "false",
-		                  (long)started_at, elapsed_seconds,
-		                  speed_metric_bytes, speed_bytes_per_second,
-		                  speed_bytes_per_second) != 0 ||
+			                  rollback_requested ? "true" : "false",
+			                  (long)started_at, elapsed_seconds,
+			                  phase_elapsed_seconds,
+			                  speed_metric_bytes, speed_bytes_per_second,
+			                  speed_bytes_per_second) != 0 ||
      json_string(&b, speed_source) != 0 ||
      json_append(&b, "}") != 0) {
     free(b.data);

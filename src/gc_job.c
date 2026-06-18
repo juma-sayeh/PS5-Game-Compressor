@@ -260,8 +260,20 @@ job_set_current(const char *path) {
 
 void
 job_set_phase(const char *phase, long step, long count, const char *current) {
+  const char *next_phase = phase ? phase : "";
+  long prev_step;
+  long prev_count;
+  int reset_phase_timer;
   pthread_mutex_lock(&g_job.lock);
-  snprintf(g_job.phase, sizeof(g_job.phase), "%s", phase ? phase : "");
+  prev_step = atomic_load(&g_job.phase_step);
+  prev_count = atomic_load(&g_job.phase_count);
+  reset_phase_timer = strcmp(g_job.phase, next_phase) != 0 ||
+      (count > 0 && prev_count <= 0) ||
+      (count > 0 && step < prev_step);
+  if(reset_phase_timer) {
+    g_job.phase_started_at = time(NULL);
+  }
+  snprintf(g_job.phase, sizeof(g_job.phase), "%s", next_phase);
   snprintf(g_job.current, sizeof(g_job.current), "%s", current ? current : "");
   atomic_store(&g_job.phase_step, step);
   atomic_store(&g_job.phase_count, count);
@@ -333,6 +345,7 @@ job_begin(const char *verb) {
   g_job.error[0] = 0;
   g_job.cancel_disabled_reason[0] = 0;
   g_job.started_at = time(NULL);
+  g_job.phase_started_at = g_job.started_at;
   g_job.ended_at = 0;
   pthread_mutex_unlock(&g_job.lock);
   return 1;

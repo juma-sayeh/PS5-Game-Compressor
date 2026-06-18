@@ -3931,13 +3931,15 @@
 	    function progressTiming(job) {
 	      job = job || activeJob() || {};
 	      const elapsed = Math.max(0, Number(job.elapsedSeconds || 0));
+	      const phaseElapsed = Math.max(0, Number(job.phaseElapsedSeconds || 0));
       const units = progressUnits(job);
       const percent = progressPercent(job);
       const fraction = units.countable && units.total > 0 ? units.done / units.total : 0;
+      const etaElapsed = validationJobUsesPhaseEta(job) ? phaseElapsed : elapsed;
       const remaining = fraction >= 1
         ? 0
-        : fraction > 0.001 && elapsed > 0
-          ? Math.max(0, elapsed * (1 - fraction) / fraction)
+        : fraction > 0.001 && etaElapsed > 0
+          ? Math.max(0, etaElapsed * (1 - fraction) / fraction)
           : null;
       const reportedSpeed = reportedSpeedBytesPerSecond(job);
       const sampledSpeed = String(state.speed.activeId || '') === String(job.activeId || '')
@@ -4037,13 +4039,26 @@
 	      return null;
 	    }
 
+    function validationJobUsesPhaseEta(job) {
+      const action = String((job && job.verb) || '').toLowerCase();
+      const phase = String((job && job.phase) || '').toLowerCase();
+      const count = Number((job && job.phaseCount) || 0);
+      return (action === 'validate-repair' || action === 'validate-only') &&
+        count > 0 &&
+        (phase === 'scanning' || phase === 'validating' ||
+          phase === 'repairing' || phase === 'copying' ||
+          phase === 'metadata');
+    }
+
 	    function operationProgressTiming(job, visual, op, g) {
 	      const progress = progressTiming(job);
 	      const phaseProgress = operationProgressInfoForVisual(visual, job, op, g);
 	      if (!phaseProgress || !phaseProgress.countable || phaseProgress.total <= 0) {
 	        return progress;
 	      }
-	      const elapsed = Math.max(0, Number((job && job.elapsedSeconds) || 0));
+	      const elapsed = validationJobUsesPhaseEta(job)
+	        ? Math.max(0, Number((job && job.phaseElapsedSeconds) || 0))
+	        : Math.max(0, Number((job && job.elapsedSeconds) || 0));
 	      const fraction = Math.max(0, Math.min(1, phaseProgress.scanned / phaseProgress.total));
 	      const remaining = fraction >= 1
 	        ? 0
