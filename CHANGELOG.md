@@ -158,9 +158,8 @@ Full release notes: [RELEASE_NOTES_0.9.7.md](RELEASE_NOTES_0.9.7.md).
   rescan, cache invalidation, and startup cleanup for interrupted delete temp
   paths.
 - Added ShadowMountPlus config/manual-list management for source-specific scans,
-  `pfsc_direct_game=1`, title-aware manual list replacement, and Payload Manager
-  fallback launch when a running ShadowMountPlus process cannot be restarted
-  directly.
+  title-aware manual list replacement, and Payload Manager fallback launch when
+  a running ShadowMountPlus process cannot be restarted directly.
 - Added scan and measurement progress metadata to jobs and history rows for
   large folder scans and compression preflight work.
 - USB and external-storage workflows now preserve exact target roots in

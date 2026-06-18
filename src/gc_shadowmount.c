@@ -415,95 +415,6 @@ line_matches_image_mode(const char *line, const char *image_name) {
 }
 
 static int
-line_matches_config_key(const char *line, const char *key) {
-  char tmp[512];
-  int n = snprintf(tmp, sizeof(tmp), "%s", line ? line : "");
-  if(n < 0 || (size_t)n >= sizeof(tmp)) return 0;
-
-  char *p = trim_left(tmp);
-  if(!*p || *p == '#' || *p == ';') return 0;
-  char *eq = strchr(p, '=');
-  if(!eq) return 0;
-  *eq = 0;
-  trim_right(p);
-  return !strcasecmp(p, key ? key : "");
-}
-
-static int
-upsert_config_key_value(const char *key, const char *value,
-                        char *err, size_t err_size) {
-  char line[384];
-  FILE *in = NULL;
-  FILE *out = NULL;
-  int found = 0;
-  int rc = -1;
-
-  if(!key || !key[0] || !value) {
-    set_err(err, err_size, "bad ShadowMount config key");
-    return -1;
-  }
-  if(mkdir_if_needed(SHADOWMOUNT_DIR) != 0) {
-    set_errno_err(err, err_size, "create /data/shadowmount");
-    return -1;
-  }
-  int n = snprintf(line, sizeof(line), "%s=%s\n", key, value);
-  if(n < 0 || (size_t)n >= sizeof(line)) {
-    set_err(err, err_size, "ShadowMount config line too long");
-    return -1;
-  }
-
-  in = fopen(SHADOWMOUNT_CONFIG, "r");
-  out = fopen(SHADOWMOUNT_CONFIG_TMP, "w");
-  if(!out) {
-    if(in) fclose(in);
-    set_errno_err(err, err_size, "open ShadowMount config temp");
-    return -1;
-  }
-
-  if(in) {
-    char existing[512];
-    while(fgets(existing, sizeof(existing), in)) {
-      if(line_matches_config_key(existing, key)) {
-        if(!found && fputs(line, out) == EOF) {
-          set_errno_err(err, err_size, "write ShadowMount config key");
-          goto done;
-        }
-        found = 1;
-        continue;
-      }
-      if(fputs(existing, out) == EOF) {
-        set_errno_err(err, err_size, "write ShadowMount config");
-        goto done;
-      }
-    }
-    if(ferror(in)) {
-      set_errno_err(err, err_size, "read ShadowMount config");
-      goto done;
-    }
-  }
-
-  if(!found && fputs(line, out) == EOF) {
-    set_errno_err(err, err_size, "append ShadowMount config key");
-    goto done;
-  }
-  if(replace_shadowmount_temp(&out, SHADOWMOUNT_CONFIG_TMP,
-                              SHADOWMOUNT_CONFIG,
-                              "flush ShadowMount config",
-                              "close ShadowMount config temp",
-                              "replace ShadowMount config",
-                              err, err_size) != 0) {
-    goto done;
-  }
-  rc = 0;
-
-done:
-  if(in) fclose(in);
-  if(out) fclose(out);
-  if(rc != 0) unlink(SHADOWMOUNT_CONFIG_TMP);
-  return rc;
-}
-
-static int
 upsert_image_mode_hint(const char *path_or_name, int read_only,
                        char *err, size_t err_size) {
   char image_name[256];
@@ -876,7 +787,6 @@ gc_shadowmount_prepare_pfsc_hints_for_title(const char *title_id,
                                             char *err,
                                             size_t err_size) {
   if(err && err_size) err[0] = 0;
-  if(gc_shadowmount_enable_pfsc_direct_game(err, err_size) != 0) return -1;
   if(gc_shadowmount_remove_title_pfsc_hints(title_id, outer_path,
                                            err, err_size) != 0) {
     return -1;
@@ -931,12 +841,6 @@ gc_shadowmount_remove_outer_sector_hint(const char *outer_path,
   if(err && err_size) err[0] = 0;
   if(!outer_path || !outer_path[0]) return 0;
   return remove_sector_hint(outer_path, err, err_size);
-}
-
-int
-gc_shadowmount_enable_pfsc_direct_game(char *err, size_t err_size) {
-  if(err && err_size) err[0] = 0;
-  return upsert_config_key_value("pfsc_direct_game", "1", err, err_size);
 }
 
 static int

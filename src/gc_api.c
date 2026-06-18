@@ -832,6 +832,8 @@ can_move_to_external_storage(const char *source_path) {
   return 0;
 }
 
+static int paths_equal_ignoring_trailing_slash(const char *a, const char *b);
+
 static const char *const GC_SHADOW_SOURCE_ROOTS[] = {
   "/data/homebrew",
   "/data/etaHEN/games",
@@ -867,6 +869,51 @@ static const char *const GC_SHADOW_SOURCE_ROOTS[] = {
   "/mnt/usb7/etaHEN/games",
   NULL,
 };
+
+static int
+unmountable_game_folder_segment(const char *name) {
+  if(!name || !name[0]) return 0;
+  if(name[0] == '.') return 1;
+  return !strcasecmp(name, "$RECYCLE.BIN") ||
+      !strcasecmp(name, "System Volume Information") ||
+      !strcasecmp(name, "RECYCLER") ||
+      !strcasecmp(name, "RECYCLED") ||
+      !strcasecmp(name, "found.000") ||
+      !strcasecmp(name, "lost+found");
+}
+
+static int
+path_has_unmountable_game_folder_segment(const char *path) {
+  const char *p = path;
+  if(!p || !p[0]) return 1;
+  while(*p) {
+    char segment[256];
+    size_t len = 0;
+    while(*p == '/') p++;
+    while(p[len] && p[len] != '/') len++;
+    if(len >= sizeof(segment)) return 1;
+    if(len > 0) {
+      memcpy(segment, p, len);
+      segment[len] = 0;
+      if(unmountable_game_folder_segment(segment)) return 1;
+    }
+    p += len;
+  }
+  return 0;
+}
+
+static int
+path_is_shadowmount_game_root(const char *path) {
+  if(!path || !path[0] || path_has_unmountable_game_folder_segment(path)) {
+    return 0;
+  }
+  for(int i = 0; GC_SHADOW_SOURCE_ROOTS[i]; i++) {
+    if(paths_equal_ignoring_trailing_slash(path, GC_SHADOW_SOURCE_ROOTS[i])) {
+      return 1;
+    }
+  }
+  return 0;
+}
 
 static uint64_t
 source_size_bytes_exact_ex(const char *path, gc_source_kind_t kind,
@@ -2459,6 +2506,7 @@ scan_roots_add(gc_scan_roots_t *roots, const char *path) {
   struct stat st;
   if(!roots || !path || !path[0] || roots->count >= GC_MAX_SCAN_ROOTS ||
      !path_is_safe(path) || path_is_system_app_path(path) ||
+     path_has_unmountable_game_folder_segment(path) ||
      stat(path, &st) != 0 || !S_ISDIR(st.st_mode)) {
     return;
   }
@@ -2511,8 +2559,10 @@ candidate_game_from_path(const char *source_path, const char *name,
 
   if(!source_path || !name || !out) return -1;
   if(path_is_system_app_path(source_path)) return -1;
+  if(path_has_unmountable_game_folder_segment(source_path)) return -1;
   if(lstat(source_path, &st) != 0) return -1;
   if(name[0] == '.') return -1;
+  if(unmountable_game_folder_segment(name)) return -1;
   if(strstr(name, GC_FORCE_REMOUNT_PREFIX)) return -1;
 
   if(S_ISREG(st.st_mode) && ends_with_ci(name, ".ffpfsc")) {
@@ -2581,6 +2631,7 @@ scan_artifacts_uncached(const gc_game_t *mounted_games, size_t mounted_count,
       gc_game_t candidate;
       if(!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) continue;
       if(!upload_segment_safe(ent->d_name)) continue;
+      if(unmountable_game_folder_segment(ent->d_name)) continue;
       if(snprintf(source_path, sizeof(source_path), "%s/%s",
                   roots.roots[i], ent->d_name) >= (int)sizeof(source_path)) {
         continue;
@@ -2713,10 +2764,11 @@ discover_games(gc_game_t *games, size_t max_games, size_t *count_out,
 static int
 preferred_transfer_root_score(const char *parent, const char *storage_root) {
   if(!parent || !parent[0] || !storage_root || !storage_root[0]) return 1000;
+  if(!path_is_shadowmount_game_root(parent)) return 1000;
   if(ends_with_ci(parent, "/homebrew")) return 0;
   if(ends_with_ci(parent, "/etaHEN/games")) return 10;
   if(paths_equal_ignoring_trailing_slash(parent, storage_root)) return 30;
-  return 20;
+  return 1000;
 }
 
 static int
@@ -2745,10 +2797,12 @@ resolve_transfer_target_root(const char *storage_root,
            !path_under_root(games[i].source_path, storage_root) ||
            path_parent(games[i].source_path, parent, sizeof(parent)) != 0 ||
            !path_is_safe(parent) ||
-           !path_under_root(parent, storage_root)) {
+           !path_under_root(parent, storage_root) ||
+           !path_is_shadowmount_game_root(parent)) {
           continue;
         }
         score = preferred_transfer_root_score(parent, storage_root);
+        if(score >= 1000) continue;
         if(score < best_score) {
           best_score = score;
           snprintf(best, sizeof(best), "%s", parent);
@@ -4531,6 +4585,12 @@ build_move_target_path(const char *target_root, const char *source_path,
     errno = EINVAL;
     return -1;
   }
+  if(!path_is_shadowmount_game_root(target_root)) {
+    snprintf(err, err_size, "%s",
+             "target folder is not a ShadowMountPlus game folder");
+    errno = EINVAL;
+    return -1;
+  }
   int n = snprintf(out, out_size, "%s/%s", target_root, name);
   if(n < 0 || (size_t)n >= out_size) {
     snprintf(err, err_size, "%s", "move target path too long");
@@ -4547,6 +4607,12 @@ build_compress_target_path(const char *target_root, const gc_game_t *game,
   const char *name = NULL;
   if(!target_root || !target_root[0] || !game || !out || out_size == 0) {
     snprintf(err, err_size, "%s", "bad compression target");
+    errno = EINVAL;
+    return -1;
+  }
+  if(!path_is_shadowmount_game_root(target_root)) {
+    snprintf(err, err_size, "%s",
+             "compression target is not a ShadowMountPlus game folder");
     errno = EINVAL;
     return -1;
   }
@@ -4719,6 +4785,12 @@ build_uncompress_target_path(const char *target_root, const gc_game_t *game,
     errno = EINVAL;
     return -1;
   }
+  if(!path_is_shadowmount_game_root(target_root)) {
+    snprintf(err, err_size, "%s",
+             "uncompress target is not a ShadowMountPlus game folder");
+    errno = EINVAL;
+    return -1;
+  }
   name = path_basename(game->output_path);
   if(!name || !upload_segment_safe(name)) {
     snprintf(err, err_size, "%s", "bad uncompress target name");
@@ -4747,6 +4819,12 @@ build_extract_image_target_path(const gc_game_t *game,
   }
   if(path_parent(game->source_path, parent, sizeof(parent)) != 0) {
     snprintf(err, err_size, "%s", "bad image path");
+    return -1;
+  }
+  if(!path_is_shadowmount_game_root(parent)) {
+    snprintf(err, err_size, "%s",
+             "extract target is not a ShadowMountPlus game folder");
+    errno = EINVAL;
     return -1;
   }
   if(!upload_segment_safe(game->title_id)) {
@@ -5804,6 +5882,13 @@ run_compress_op(gc_operation_t *op) {
       gc_log("compress target folder unavailable title=%s output=%s parent=%s err=%s",
              op->title_id, compress_output_path, output_parent,
              strerror(saved_errno));
+      COMPRESS_FAIL_RETURN();
+    }
+    if(!path_is_shadowmount_game_root(output_parent)) {
+      snprintf(op->error, sizeof(op->error), "%s",
+               "compression target folder is not a ShadowMountPlus game folder");
+      gc_log("compress target folder rejected title=%s output=%s parent=%s",
+             op->title_id, compress_output_path, output_parent);
       COMPRESS_FAIL_RETURN();
     }
     if(free_bytes_for_output_ex(compress_output_path, &game.free_bytes,
