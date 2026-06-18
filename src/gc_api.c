@@ -8593,9 +8593,14 @@ enqueue_action(const http_request_t *req, gc_action_t action) {
   }
   if(makes_image &&
      websrv_get_query_arg(req, "usbId", usb_id, sizeof(usb_id))) {
+    const gc_storage_target_def_t *def = storage_target_def_for_id(usb_id);
     if(storage_target_root_for_id(usb_id, target_root,
-                                  sizeof(target_root), NULL) != 0) {
+                                  sizeof(target_root), NULL) != 0 || !def) {
       return serve_error(req, 400, "bad storage target");
+    }
+    if(path_under_root(source_path_arg, def->root)) {
+      return serve_error(req, 409,
+                         "game is already on selected external storage");
     }
     if(requested_delete_policy[0] && !strcmp(requested_delete_policy, "stream")) {
       return serve_error(req, 400,

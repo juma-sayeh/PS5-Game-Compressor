@@ -279,9 +279,10 @@ dispatch_request(const http_request_t *req) {
       return shutdown_request(req);
     }
     if(!strcmp(req->path, "/api/gc/job/cancel") ||
-       !strcmp(req->path, "/api/gc/queue/cancel") ||
-	       !strcmp(req->path, "/api/gc/compress") ||
-	       !strcmp(req->path, "/api/gc/uncompress") ||
+	       !strcmp(req->path, "/api/gc/queue/cancel") ||
+		       !strcmp(req->path, "/api/gc/compress") ||
+		       !strcmp(req->path, "/api/gc/make-image") ||
+		       !strcmp(req->path, "/api/gc/uncompress") ||
 	       !strcmp(req->path, "/api/gc/extract-image") ||
 	       !strcmp(req->path, "/api/gc/validate-repair") ||
 	       !strcmp(req->path, "/api/gc/validate-only") ||

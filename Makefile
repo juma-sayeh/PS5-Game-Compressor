@@ -70,7 +70,7 @@ endif
 
 FAST_CFLAGS := $(filter-out -Os,$(CFLAGS_COMMON)) -O2
 LDFLAGS_COMMON := -Wl,--gc-sections -flto
-LDADD := -lSceNotification -lSceIpmi -lSceSystemService
+LDADD := -lSceNotification -lSceSystemService
 LDADD += $(ZLIB_LIB)
 
 all: $(BIN)

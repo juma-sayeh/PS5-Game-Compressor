@@ -1901,7 +1901,7 @@
   <div class="modal-backdrop hidden" id="usb-modal">
     <div class="modal" role="dialog" aria-modal="true" aria-labelledby="usb-title">
       <div class="modal-head">
-        <div class="modal-title" id="usb-title">Move to External Storage</div>
+        <div class="modal-title" id="usb-title">Move to...</div>
         <button class="icon-btn" id="usb-close" aria-label="Close"></button>
       </div>
       <div class="modal-body" id="usb-body"></div>
@@ -1943,7 +1943,7 @@
           </button>
           <button class="format-row" type="button" data-compress-destination="internal">
             <div>
-              <div class="history-title">Internal SSD</div>
+              <div class="history-title" id="format-destination-internal-title">Internal SSD</div>
               <div class="history-meta" id="format-destination-internal">Write compressed file to /data/homebrew</div>
             </div>
             <span class="chip">Select</span>
@@ -2126,6 +2126,7 @@
       compressUsbId: '',
       compressUsbLoading: false,
       compressUsbOpen: false,
+      compressDestinationChooserOpen: false,
       uncompressGame: null,
       uncompressPlan: null,
       uncompressPlanLoading: false,
@@ -2547,6 +2548,7 @@
       const copied = Number(job.copiedBytes || 0);
       if (total > 0 && (
 	        phase === 'copying' ||
+	        phase === 'making-image' ||
 	        phase === 'unpacking' ||
 	        phase === 'moving' ||
 	        phase === 'restoring')) {
@@ -4157,13 +4159,9 @@
       if (sourceKind === 'image' && g.isMounted === true) {
         actions.push({ id: 'extract-image', label: 'Extract to Folder' });
       }
-      if (g.canMoveToUsb) {
-        actions.push({ id: 'copy-usb', label: 'Copy to External Storage' });
-        actions.push({ id: 'move-usb', label: 'Move to External Storage' });
-      }
-      if (g.canMoveToInternal) {
-        actions.push({ id: 'copy-internal', label: 'Copy to Internal SSD' });
-        actions.push({ id: 'move-internal', label: 'Move to Internal SSD' });
+      if (g.canMoveToUsb || g.canMoveToInternal) {
+        actions.push({ id: 'copy-to', label: 'Copy to...' });
+        actions.push({ id: 'move-to', label: 'Move to...' });
       }
       actions.push({ id: 'delete-game-data', label: 'Delete Game Data', danger: true });
       return actions;
@@ -4436,11 +4434,11 @@
         startAction(g, false, 'extract-image');
       } else if (action === 'build-ampr-index') {
         startAction(g, false, 'build-ampr-index');
-      } else if (action === 'move-usb') {
+      } else if (action === 'move-to' || action === 'move-usb') {
         showUsbModal(g, 'move');
       } else if (action === 'move-internal') {
         startMoveToInternal(g);
-      } else if (action === 'copy-usb') {
+      } else if (action === 'copy-to' || action === 'copy-usb') {
         showUsbModal(g, 'copy');
       } else if (action === 'copy-internal') {
         startCopyToInternal(g);
@@ -4930,31 +4928,57 @@
       }, 250);
     }
 
-	    function renderUsbList() {
-	      const body = $('usb-body');
-	      const copyMode = state.moveMode === 'copy';
-      const targets = state.moveGame
-        ? state.usb.filter((usb) => !pathUnderRoot(state.moveGame.sourcePath, usb.path))
+    function moveTargetInternalRowHtml() {
+      return '<button class="usb-row" data-target="internal">' +
+        '<div><div class="history-title">Internal SSD</div>' +
+        '<div class="history-meta">/data/homebrew</div></div>' +
+        '<span class="chip">Select</span>' +
+        '</button>';
+    }
+
+    function moveTargetUsbRowHtml(usb) {
+      return '<button class="usb-row" data-target="usb" data-id="' + escapeHtml(usb.id) + '">' +
+        '<div><div class="history-title">' + escapeHtml(usbTargetLabel(usb)) + '</div>' +
+        '<div class="history-meta">' + escapeHtml(usb.targetRoot || usb.path) + '</div>' +
+        '<div class="history-meta">' + shortSize(usb.freeBytes) + ' free of ' +
+        shortSize(usb.totalBytes) + '</div></div>' +
+        '<span class="chip">Select</span>' +
+        '</button>';
+    }
+
+    function renderUsbList() {
+      const body = $('usb-body');
+      const copyMode = state.moveMode === 'copy';
+      const g = state.moveGame;
+      const usbTargets = g
+        ? state.usb.filter((usb) => !pathUnderRoot(g.sourcePath, usb.path))
         : state.usb;
-      if (!targets.length) {
-        body.innerHTML = '<div class="empty">No other external storage with 10 MB free</div>';
+      const rows = [];
+      if (g && g.canMoveToInternal) {
+        rows.push(moveTargetInternalRowHtml());
+      }
+      usbTargets.forEach((usb) => rows.push(moveTargetUsbRowHtml(usb)));
+      if (!rows.length) {
+        body.innerHTML = '<div class="empty">No available storage target</div>';
         return;
       }
-	      body.innerHTML = targets.map((usb) => (
-	        '<button class="usb-row" data-id="' + escapeHtml(usb.id) + '">' +
-	        '<div><div class="history-title">' + escapeHtml(usbTargetLabel(usb)) + '</div>' +
-	        '<div class="history-meta">' + escapeHtml(usb.targetRoot || usb.path) + '</div>' +
-	        '<div class="history-meta">' + shortSize(usb.freeBytes) + ' free of ' + shortSize(usb.totalBytes) + '</div></div>' +
-	        '<span class="chip">Select</span>' +
-	        '</button>'
-      )).join('');
+      body.innerHTML = rows.join('');
       body.querySelectorAll('.usb-row').forEach((row) => {
         row.addEventListener('click', () => {
           if (!state.moveGame) return;
+          const target = row.getAttribute('data-target') || 'usb';
           if (copyMode) {
-            startCopyToUsb(state.moveGame, row.getAttribute('data-id'));
+            if (target === 'internal') {
+              startCopyToInternal(state.moveGame);
+            } else {
+              startCopyToUsb(state.moveGame, row.getAttribute('data-id'));
+            }
           } else {
-            startMoveToUsb(state.moveGame, row.getAttribute('data-id'));
+            if (target === 'internal') {
+              startMoveToInternal(state.moveGame);
+            } else {
+              startMoveToUsb(state.moveGame, row.getAttribute('data-id'));
+            }
           }
         });
       });
@@ -4963,6 +4987,22 @@
 	    function selectedCompressUsb() {
 	      return (state.usb || []).find((usb) => usb.id === state.compressUsbId) || null;
 	    }
+
+    function sourceUsbTarget(g) {
+      const sourcePath = String((g && g.sourcePath) || '');
+      if (!sourcePath) return null;
+      return (state.usb || []).find((usb) => pathUnderRoot(sourcePath, usb.path)) || null;
+    }
+
+    function alternateCompressUsbTargets(g) {
+      const source = sourceUsbTarget(g);
+      if (!source) return [];
+      return (state.usb || []).filter((usb) => !pathUnderRoot(g.sourcePath, usb.path));
+    }
+
+    function hasAlternateCompressUsbTargets(g) {
+      return !!sourceUsbTarget(g) && alternateCompressUsbTargets(g).length > 0;
+    }
 
 	    function usbTargetLabel(usb) {
 	      if (!usb) return '';
@@ -4984,7 +5024,7 @@
         '</button>';
     }
 
-	    function usbPickerTriggerHtml(usb, expanded, attrName) {
+    function usbPickerTriggerHtml(usb, expanded, attrName) {
 	      return '<button class="usb-picker-trigger" type="button" ' + attrName +
 	        ' aria-haspopup="listbox" aria-expanded="' + (expanded ? 'true' : 'false') + '">' +
 	        '<div><div class="history-title">' + escapeHtml(usb.name) + '</div>' +
@@ -4993,6 +5033,80 @@
 	        shortSize(usb.totalBytes) + '</div></div>' +
         '<span class="chip">' + (expanded ? 'Close' : 'Change') + '</span>' +
         '</button>';
+    }
+
+    function compressDestinationChoiceHtml(title, meta, detail, selected, attrName, value) {
+      return '<button class="usb-picker-option' + (selected ? ' is-selected' : '') +
+        '" type="button" ' + attrName + '="' + escapeHtml(value) + '">' +
+        '<div><div class="history-title">' + escapeHtml(title) + '</div>' +
+        '<div class="history-meta">' + escapeHtml(meta) + '</div>' +
+        (detail ? '<div class="history-meta">' + escapeHtml(detail) + '</div>' : '') +
+        '</div><span class="chip' + (selected ? ' run' : '') + '">' +
+        (selected ? 'Selected' : 'Select') + '</span></button>';
+    }
+
+    function renderCompressDestinationChooser() {
+      const picker = $('compress-usb-picker');
+      const meta = $('compress-usb-meta');
+      const g = state.compressGame;
+      const makeImage = state.compressAction === 'make-image';
+      if (!picker || !meta) return;
+      if (state.compressUsbLoading) {
+        picker.innerHTML = '<div class="usb-picker-empty">Loading storage targets</div>';
+        meta.textContent = '';
+        return;
+      }
+      const targets = alternateCompressUsbTargets(g);
+      if (!targets.length) {
+        picker.innerHTML = '<div class="usb-picker-empty">No other USB with 10 MB free</div>';
+        meta.textContent = 'Connect another USB target with at least 10 MB free';
+        return;
+      }
+      const internalSelected = state.compressDestination === 'internal';
+      picker.innerHTML =
+        compressDestinationChoiceHtml(
+          'Internal SSD',
+          '/data/homebrew',
+          '',
+          internalSelected,
+          'data-compress-destination-choice',
+          'internal'
+        ) +
+        targets.map((usb) => compressDestinationChoiceHtml(
+          usb.name || 'USB',
+          usb.targetRoot || usb.path || '',
+          shortSize(usb.freeBytes) + ' free of ' + shortSize(usb.totalBytes),
+          state.compressDestination === 'usb' && state.compressUsbId === usb.id,
+          'data-compress-usb-choice',
+          usb.id || ''
+        )).join('');
+      picker.querySelectorAll('[data-compress-destination-choice]').forEach((button) => {
+        button.addEventListener('click', () => {
+          state.compressDestination = button.getAttribute('data-compress-destination-choice') || 'internal';
+          state.compressUsbOpen = false;
+          updateCompressModalSelection();
+        });
+      });
+      picker.querySelectorAll('[data-compress-usb-choice]').forEach((button) => {
+        button.addEventListener('click', () => {
+          state.compressDestination = 'usb';
+          state.compressUsbId = button.getAttribute('data-compress-usb-choice') || '';
+          state.compressUsbOpen = false;
+          updateCompressModalSelection();
+        });
+      });
+      if (state.compressDestination === 'usb') {
+        const usb = selectedCompressUsb();
+        meta.textContent = usb
+          ? (makeImage ? 'Image target: ' : 'Compression target: ') + usbTargetLabel(usb)
+          : '';
+      } else if (state.compressDestination === 'internal') {
+        meta.textContent = makeImage
+          ? 'Image target: Internal SSD'
+          : 'Compression target: Internal SSD';
+      } else {
+        meta.textContent = 'Choose Internal SSD or another USB target';
+      }
     }
 
     function renderCompressUsbSelect() {
@@ -5302,15 +5416,20 @@
       state.moveMode = mode === 'copy' ? 'copy' : 'move';
       $('usb-title').textContent =
         (state.moveMode === 'copy' ? 'Copy ' : 'Move ') +
-        (g.name || g.titleId) + ' to External Storage';
-      $('usb-body').innerHTML = '<div class="empty">Loading external storage</div>';
+        (g.name || g.titleId) + ' to...';
+      $('usb-body').innerHTML = '<div class="empty">Loading storage targets</div>';
       showModal('usb-modal');
       try {
         const data = await api('/api/gc/usb');
         state.usb = data.usb || [];
         renderUsbList();
       } catch (err) {
-        $('usb-body').innerHTML = '<div class="empty">' + escapeHtml(err.message) + '</div>';
+        state.usb = [];
+        if (g.canMoveToInternal) {
+          renderUsbList();
+        } else {
+          $('usb-body').innerHTML = '<div class="empty">' + escapeHtml(err.message) + '</div>';
+        }
       }
     }
 
@@ -5384,14 +5503,16 @@
       const makeImage = state.compressAction === 'make-image';
       const sourceStorage = String((g && g.storage) || '').toLowerCase();
       const showInternal = sourceStorage !== 'internal';
-      const showUsb = !storageIsExternal(sourceStorage);
-      const hideUsbDestination = !showUsb;
+      const useDestinationChooser = showInternal && hasAlternateCompressUsbTargets(g);
+      const showUsb = !storageIsExternal(sourceStorage) || useDestinationChooser;
+      const hideUsbDestination = !showUsb || useDestinationChooser;
       const usbDestinationUnavailable =
-        !state.compressUsbLoading && !state.usb.length;
+        !state.compressUsbLoading &&
+        !(useDestinationChooser ? alternateCompressUsbTargets(g).length : state.usb.length);
       if (!showInternal && state.compressDestination === 'internal') {
         state.compressDestination = 'keep';
       }
-      if ((hideUsbDestination || usbDestinationUnavailable) &&
+      if (((hideUsbDestination && !useDestinationChooser) || usbDestinationUnavailable) &&
         state.compressDestination === 'usb') {
         state.compressDestination = 'keep';
       }
@@ -5406,19 +5527,34 @@
       if (!effectiveMovingToUsb) {
         state.compressUsbOpen = false;
       }
+      if (!useDestinationChooser && state.compressDestination !== 'usb') {
+        state.compressDestinationChooserOpen = false;
+      }
       $('format-safe-space').textContent = safeSpaceText(g);
       $('format-stream-space').textContent = makeImage ? 'Not available for image creation' : destructiveSpaceText(g);
       $('format-destination-keep').textContent = makeImage
         ? 'Write image next to the current game'
         : 'Write next to the current game';
-	      $('format-destination-internal').textContent = makeImage
-	        ? 'Write image to /data/homebrew'
-	        : 'Write compressed file to /data/homebrew';
+      $('format-destination-internal-title').textContent = useDestinationChooser
+        ? (makeImage ? 'Make image to...' : 'Compress to...')
+        : 'Internal SSD';
+	      $('format-destination-internal').textContent = useDestinationChooser
+          ? 'Choose Internal SSD or another USB'
+          : (makeImage
+	          ? 'Write image to /data/homebrew'
+	          : 'Write compressed file to /data/homebrew');
       $('format-destination-usb').textContent = makeImage
         ? 'Write image to the USB target below'
         : 'Write compressed file to the USB target below';
-      $('compress-usb-panel').classList.toggle('hidden', !effectiveMovingToUsb);
-      renderCompressUsbSelect();
+      $('compress-usb-panel').classList.toggle('hidden',
+        useDestinationChooser
+          ? !state.compressDestinationChooserOpen
+          : !effectiveMovingToUsb);
+      if (useDestinationChooser) {
+        renderCompressDestinationChooser();
+      } else {
+        renderCompressUsbSelect();
+      }
       document.querySelectorAll('[data-compress-format], [data-compress-handling], [data-compress-destination]').forEach((button) => {
         const format = button.getAttribute('data-compress-format');
         const handling = button.getAttribute('data-compress-handling');
@@ -5431,7 +5567,11 @@
         const selected = format
           ? format === state.compressFormat
           : (destination
-              ? destination === state.compressDestination
+              ? (useDestinationChooser && destination === 'internal'
+                  ? state.compressDestinationChooserOpen ||
+                    state.compressDestination === 'internal' ||
+                    state.compressDestination === 'usb'
+                  : destination === state.compressDestination)
               : handling === selectedHandling);
         const disabled = hiddenDestination ||
           (destination === 'usb' && usbDestinationUnavailable) ||
@@ -5463,6 +5603,7 @@
       state.compressUsbId = '';
       state.compressUsbLoading = false;
       state.compressUsbOpen = false;
+      state.compressDestinationChooserOpen = false;
       $('format-title').textContent = (makeImage ? 'Make Image ' : 'Compress ') + (g.name || g.titleId);
       $('format-pfs-name').textContent = makeImage ? (g.titleId || '<TITLE_ID>') + '.ffpfs' : 'Experimental - pfs_image.dat';
       $('format-exfat-name').textContent = (g.titleId || '<TITLE_ID>') + '.exfat';
@@ -5496,6 +5637,7 @@
       state.compressUsbId = '';
       state.compressUsbLoading = false;
       state.compressUsbOpen = false;
+      state.compressDestinationChooserOpen = false;
       updateCompressModalSelection();
     }
 
@@ -5800,7 +5942,16 @@
       document.querySelectorAll('[data-compress-destination]').forEach((button) => {
         button.addEventListener('click', () => {
           if (button.disabled) return;
-          state.compressDestination = button.getAttribute('data-compress-destination') || 'keep';
+          const destination = button.getAttribute('data-compress-destination') || 'keep';
+          if (destination === 'internal' && hasAlternateCompressUsbTargets(state.compressGame)) {
+            state.compressDestinationChooserOpen = !state.compressDestinationChooserOpen;
+            if (state.compressDestination !== 'internal' && state.compressDestination !== 'usb') {
+              state.compressDestination = 'internal';
+            }
+          } else {
+            state.compressDestination = destination;
+            state.compressDestinationChooserOpen = false;
+          }
           syncCompressSourcePolicyFromDestination();
           if (state.compressDestination === 'usb' && !state.compressUsbId && state.usb[0]) {
             state.compressUsbId = state.usb[0].id || '';
