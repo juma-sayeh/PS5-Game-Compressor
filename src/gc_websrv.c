@@ -20,7 +20,6 @@
 #include "asset.h"
 #include "gc_app_installer.h"
 #include "gc_api.h"
-#include "gc_diag.h"
 #include "gc_json_escape.h"
 #include "websrv.h"
 
@@ -204,19 +203,11 @@ status_request(const http_request_t *req) {
 static int
 shutdown_request(const http_request_t *req) {
   char remove_tile[16];
-  int remove_tile_param =
+  int remove_tile_requested =
       websrv_get_query_arg(req, "removeTile", remove_tile,
                            sizeof(remove_tile)) &&
       (!strcmp(remove_tile, "1") || !strcasecmp(remove_tile, "true"));
-  if(remove_tile_param) {
-    /*
-     * Keep in-app shutdown equivalent to Payload Manager close. Removing the
-     * launcher through AppInst during shutdown has crashed at least one newer FW.
-     */
-    gc_log("shutdown removeTile ignored; stopping payload only");
-  }
-  int remove_tile_requested = 0;
-  int remove_tile_rc = 0;
+  int remove_tile_rc = remove_tile_requested ? gc_launcher_remove() : 0;
 
   char body[128];
   int n = snprintf(body, sizeof(body),

@@ -172,9 +172,8 @@ repair, move, or unpack games. After your games are compressed and you no longer
 need the web UI, it is preferred that Game Compressor is no longer running.
 
 Use the terminate button in the top bar when you are done. Game Compressor
-stops the payload and leaves a final screen telling you to exit the browser
-window. The home-screen launcher tile stays installed for the next time you need
-the web UI.
+removes its home-screen tile, stops the payload, and leaves a final screen
+telling you to exit the browser window.
 
 ## Notes
 

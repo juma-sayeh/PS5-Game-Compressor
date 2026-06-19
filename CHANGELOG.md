@@ -1,13 +1,5 @@
 # Changelog
 
-## Unreleased
-
-### Fixed
-
-- Changed the terminate button to stop the payload without removing the
-  home-screen launcher tile, matching Payload Manager close behavior and avoiding
-  AppInst uninstall during shutdown on newer firmware.
-
 ## 1.0.1 - 2026-06-18
 
 Compared `new_release_items` against `v1.0.0`.
