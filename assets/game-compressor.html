@@ -5,6 +5,13 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Game Compressor</title>
+  <script>
+    (function () {
+      var match = document.cookie.match(/(?:^|;\s*)game_compressor_theme=([^;]*)/);
+      var theme = match ? decodeURIComponent(match[1]) : '';
+      if (theme === 'dark') document.documentElement.setAttribute('data-theme', 'dark');
+    })();
+  </script>
   <style>
     :root {
       --bg: #f6f8fc;
@@ -21,6 +28,45 @@
       --shadow: rgba(37, 51, 81, .16);
       --soft-shadow: 0 18px 46px rgba(39, 54, 84, .10);
       --button-shadow: 0 18px 42px rgba(23, 105, 255, .24);
+      --app-bg: linear-gradient(145deg, #ffffff 0%, #f3f7ff 42%, #f8fbff 100%);
+      --panel-bg: rgba(255, 255, 255, .74);
+      --elevated-soft: rgba(255, 255, 255, .64);
+      --elevated-muted: rgba(255, 255, 255, .52);
+      --row-hover-bg: rgba(255, 255, 255, .72);
+      --row-output-bg: rgba(234, 242, 255, .52);
+      --row-selected-shadow: 0 14px 34px rgba(37, 51, 81, .12);
+      --thumb-bg: linear-gradient(145deg, #eef4ff, #dce8fb);
+      --thumb-shadow: inset 0 1px 0 rgba(255, 255, 255, .92), 0 10px 24px rgba(37, 51, 81, .12);
+      --chip-bg: rgba(255, 255, 255, .72);
+      --row-tag-bg: rgba(255, 255, 255, .62);
+      --menu-bg: rgba(255, 255, 255, .94);
+      --menu-hover-bg: #eef4ff;
+      --menu-danger-hover-bg: #fff0f2;
+      --progress-bg: #f4f5f7;
+      --progress-fg: #374151;
+      --progress-fg-soft: #4b5563;
+      --bar-track: #dfe7f4;
+      --loading-pill-bg: #eaf2ff;
+      --loading-pill-border: rgba(19, 102, 255, .18);
+      --modal-bg: rgba(255, 255, 255, .92);
+      --modal-backdrop: rgba(35, 48, 71, .28);
+      --card-bg: rgba(255, 255, 255, .68);
+      --card-bg-soft: rgba(255, 255, 255, .48);
+      --card-bg-strong: rgba(255, 255, 255, .78);
+      --card-bg-faint: rgba(255, 255, 255, .38);
+      --selection-bg: #eef4ff;
+      --notice-bg: #fff0f2;
+      --terminate-bg: rgba(255, 255, 255, .96);
+      --icon-btn-bg: rgba(255, 255, 255, .64);
+      --icon-btn-shadow: 0 8px 20px rgba(37, 51, 81, .08);
+      --icon-btn-shadow-hover: 0 12px 28px rgba(37, 51, 81, .12);
+      --focus-ring: rgba(31, 111, 255, .28);
+      --accent-border: rgba(19, 102, 255, .28);
+      --accent-border-strong: rgba(23, 105, 255, .48);
+      --accent-focus: rgba(23, 105, 255, .5);
+      --accent-focus-ring: rgba(23, 105, 255, .12);
+      --hero-shadow: 0 24px 60px rgba(37, 51, 81, .18);
+      --terminated-bg: rgba(255, 240, 242, .92);
     }
 
     * {
@@ -52,8 +98,25 @@
     }
 
     button:focus-visible {
-      outline: 3px solid rgba(31, 111, 255, .28);
+      outline: 3px solid var(--focus-ring);
       outline-offset: 3px;
+    }
+
+    .app,
+    .sidebar,
+    .content,
+    .modal,
+    .secondary-menu,
+    .game-row,
+    .chip,
+    .icon-btn,
+    .free-space-label,
+    .path-line,
+    .progress-box,
+    .pending-box,
+    .more-btn,
+    .small-action {
+      transition: background-color .28s ease, color .28s ease, border-color .28s ease, box-shadow .28s ease;
     }
 
     .app {
@@ -63,8 +126,7 @@
       min-height: 0;
       padding: 18px;
       gap: 18px;
-      background:
-        linear-gradient(145deg, #ffffff 0%, #f3f7ff 42%, #f8fbff 100%);
+      background: var(--app-bg);
     }
 
     .app.is-terminated {
@@ -84,7 +146,8 @@
       cursor: pointer;
     }
 
-    .icon-btn svg {
+    .icon-btn svg,
+    .theme-toggle-icon {
       width: 20px;
       height: 20px;
       stroke: currentColor;
@@ -92,6 +155,43 @@
       fill: none;
       stroke-linecap: round;
       stroke-linejoin: round;
+    }
+
+    .theme-toggle {
+      overflow: hidden;
+    }
+
+    .theme-toggle-icons {
+      position: relative;
+      width: 20px;
+      height: 20px;
+    }
+
+    .theme-toggle-icon {
+      position: absolute;
+      inset: 0;
+      transition: transform .38s cubic-bezier(.2, .8, .2, 1), opacity .28s ease;
+      transform-origin: center;
+    }
+
+    .theme-toggle-icon-moon {
+      opacity: 1;
+      transform: rotate(0deg) scale(1);
+    }
+
+    .theme-toggle-icon-sun {
+      opacity: 0;
+      transform: rotate(90deg) scale(.55);
+    }
+
+    html[data-theme="dark"] .theme-toggle-icon-moon {
+      opacity: 0;
+      transform: rotate(-90deg) scale(.55);
+    }
+
+    html[data-theme="dark"] .theme-toggle-icon-sun {
+      opacity: 1;
+      transform: rotate(0deg) scale(1);
     }
 
     .sidebar {
@@ -162,7 +262,7 @@
 
     .game-row:hover {
       transform: translateY(-1px);
-      background: rgba(255, 255, 255, .72);
+      background: var(--row-hover-bg);
     }
 
     .game-row:active {
@@ -171,7 +271,7 @@
 
     .game-row.is-selected {
       background: var(--surface-solid);
-      box-shadow: 0 14px 34px rgba(37, 51, 81, .12);
+      box-shadow: var(--row-selected-shadow);
     }
 
     .game-row.is-unmounted {
@@ -184,7 +284,7 @@
 	    }
 
 	    .game-row.is-output {
-	      background: rgba(234, 242, 255, .52);
+	      background: var(--row-output-bg);
 	    }
 
     .thumb,
@@ -193,9 +293,9 @@
       place-items: center;
       overflow: hidden;
       border-radius: 16px;
-      background: linear-gradient(145deg, #eef4ff, #dce8fb);
+      background: var(--thumb-bg);
       color: var(--accent);
-      box-shadow: inset 0 1px 0 rgba(255, 255, 255, .92), 0 10px 24px rgba(37, 51, 81, .12);
+      box-shadow: var(--thumb-shadow);
     }
 
     .thumb {
@@ -254,7 +354,7 @@
 	      padding: 0 6px;
 	      border: 1px solid var(--line);
 	      border-radius: 999px;
-	      background: rgba(255, 255, 255, .62);
+	      background: var(--row-tag-bg);
 	      color: var(--muted);
 	      font-size: 10px;
 	      font-weight: 560;
@@ -272,9 +372,7 @@
       padding: 0 9px;
       border-radius: 999px;
       border: 1px solid var(--line);
-      background: rgba(255, 255, 255, .72);
-      color: var(--muted);
-      font-size: 11px;
+      background: var(--chip-bg);
       font-weight: 500;
       font-variant-numeric: tabular-nums;
       font-feature-settings: "tnum" 1;
@@ -324,7 +422,7 @@
     .chip.bad {
       color: #bc3047;
       border-color: rgba(216, 76, 91, .18);
-      background: #fff0f2;
+      background: var(--menu-danger-hover-bg);
     }
 
     .chip.compressing {
@@ -417,7 +515,7 @@
       grid-template-rows: 64px 1fr;
       border: 1px solid var(--line);
       border-radius: 32px;
-      background: rgba(255, 255, 255, .74);
+      background: var(--panel-bg);
       box-shadow: var(--soft-shadow);
       overflow: hidden;
       backdrop-filter: blur(22px);
@@ -442,7 +540,7 @@
       padding: 10px 12px;
       border: 1px solid rgba(31, 47, 78, .14);
       border-radius: 14px;
-      background: rgba(255, 255, 255, .96);
+      background: var(--terminate-bg);
       color: var(--text);
       font-size: 12px;
       line-height: 1.35;
@@ -469,7 +567,7 @@
       height: 10px;
       border-left: 1px solid rgba(31, 47, 78, .14);
       border-top: 1px solid rgba(31, 47, 78, .14);
-      background: rgba(255, 255, 255, .96);
+      background: var(--terminate-bg);
       transform: rotate(45deg);
     }
 
@@ -500,7 +598,7 @@
       place-items: center;
       border-radius: 46px;
       border: 1px solid rgba(216, 76, 91, .24);
-      background: rgba(255, 240, 242, .92);
+      background: var(--terminated-bg);
       color: var(--danger);
       box-shadow: 0 24px 60px rgba(216, 76, 91, .18);
     }
@@ -538,12 +636,12 @@
       padding: 0 12px;
       border-radius: 14px;
       border: 1px solid var(--line);
-      background: rgba(255, 255, 255, .64);
+      background: var(--elevated-soft);
       color: var(--muted);
       font-size: 13px;
       font-weight: 680;
       white-space: nowrap;
-      box-shadow: 0 8px 20px rgba(37, 51, 81, .08);
+      box-shadow: var(--icon-btn-shadow);
     }
 
     .free-space-label span {
@@ -552,9 +650,9 @@
     }
 
     .icon-btn {
-      background: rgba(255, 255, 255, .64);
+      background: var(--icon-btn-bg);
       border: 1px solid var(--line);
-      box-shadow: 0 8px 20px rgba(37, 51, 81, .08);
+      box-shadow: var(--icon-btn-shadow);
       transition: transform .18s ease, background .18s ease, box-shadow .18s ease;
     }
 
@@ -562,7 +660,7 @@
       background: var(--surface-solid);
       color: var(--accent);
       transform: translateY(-1px);
-      box-shadow: 0 12px 28px rgba(37, 51, 81, .12);
+      box-shadow: var(--icon-btn-shadow-hover);
     }
 
     .icon-btn.is-danger:hover {
@@ -619,7 +717,7 @@
       font-size: 36px;
       font-weight: 780;
       border-radius: 46px;
-      box-shadow: 0 24px 60px rgba(37, 51, 81, .18);
+      box-shadow: var(--hero-shadow);
     }
 
     .hero-icon.is-new-icon {
@@ -777,7 +875,7 @@
       padding: 8px;
       border-radius: 18px;
       border: 1px solid var(--line);
-      background: rgba(255, 255, 255, .94);
+      background: var(--menu-bg);
       box-shadow: 0 24px 64px rgba(37, 51, 81, .18);
       backdrop-filter: blur(22px);
       animation: menu-in .16s cubic-bezier(.2, .8, .2, 1);
@@ -796,7 +894,7 @@
     }
 
     .menu-action:hover {
-      background: #eef4ff;
+      background: var(--menu-hover-bg);
       color: var(--accent);
       transform: translateX(1px);
     }
@@ -806,7 +904,7 @@
     }
 
     .menu-action.is-danger:hover {
-      background: #fff0f2;
+      background: var(--menu-danger-hover-bg);
       color: #bc3047;
     }
 
@@ -827,8 +925,8 @@
       display: grid;
       gap: 10px;
       align-content: center;
-      color: #374151;
-      background: #f4f5f7;
+      color: var(--progress-fg);
+      background: var(--progress-bg);
     }
 
     .progress-heading {
@@ -837,7 +935,7 @@
       justify-content: center;
       gap: 6px;
       min-width: 0;
-      color: #374151;
+      color: var(--progress-fg);
       font-weight: 400;
       text-align: center;
     }
@@ -874,7 +972,7 @@
 	    }
 
 	    .progress-direction {
-	      color: #4b5563;
+	      color: var(--progress-fg-soft);
 	    }
 
 	    .progress-current-file {
@@ -887,7 +985,7 @@
       font-size: 16px;
       line-height: 1;
       font-weight: 400;
-      color: #4b5563;
+      color: var(--progress-fg-soft);
       text-align: right;
       font-variant-numeric: tabular-nums;
       font-feature-settings: "tnum" 1;
@@ -1052,7 +1150,7 @@
     .bar {
       height: 8px;
       border-radius: 999px;
-      background: #dfe7f4;
+      background: var(--bar-track);
       overflow: hidden;
     }
 
@@ -1086,7 +1184,7 @@
       padding: 10px 12px;
       border: 1px solid var(--line);
       border-radius: 14px;
-      background: rgba(255, 255, 255, .52);
+      background: var(--elevated-muted);
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
@@ -1181,8 +1279,8 @@
       min-width: 58px;
       height: 28px;
       border-radius: 999px;
-      border: 1px solid rgba(19, 102, 255, .18);
-      background: #eaf2ff;
+      border: 1px solid var(--loading-pill-border);
+      background: var(--loading-pill-bg);
       color: var(--accent);
     }
 
@@ -1244,7 +1342,7 @@
       display: grid;
       place-items: center;
       padding: 24px;
-      background: rgba(35, 48, 71, .28);
+      background: var(--modal-backdrop);
       backdrop-filter: blur(18px);
       z-index: 100;
       isolation: isolate;
@@ -1259,7 +1357,7 @@
       max-height: min(680px, 90vh);
       display: grid;
       grid-template-rows: auto 1fr;
-      background: rgba(255, 255, 255, .92);
+      background: var(--modal-bg);
       border: 1px solid var(--line);
       border-radius: 28px;
       box-shadow: 0 24px 80px var(--shadow);
@@ -1292,7 +1390,7 @@
       padding: 18px;
       border-radius: 20px;
       border: 1px solid var(--line);
-      background: rgba(255, 255, 255, .68);
+      background: var(--card-bg);
       text-align: center;
     }
 
@@ -1350,7 +1448,7 @@
       border-radius: 18px;
       border: 1px solid var(--line);
       margin-bottom: 10px;
-      background: rgba(255, 255, 255, .68);
+      background: var(--card-bg);
     }
 
     .history-title {
@@ -1384,7 +1482,7 @@
       border-radius: 18px;
       border: 1px solid var(--line);
       margin-bottom: 10px;
-      background: rgba(255, 255, 255, .68);
+      background: var(--card-bg);
       text-align: left;
       cursor: pointer;
     }
@@ -1446,7 +1544,7 @@
       padding: 10px;
       border: 1px solid var(--line);
       border-radius: 18px;
-      background: rgba(255, 255, 255, .48);
+      background: var(--card-bg-soft);
     }
 
     .compress-usb-panel.hidden {
@@ -1469,7 +1567,7 @@
       align-items: center;
       border: 1px solid var(--line);
       border-radius: 14px;
-      background: rgba(255, 255, 255, .78);
+      background: var(--card-bg-strong);
       color: var(--text);
       font: inherit;
       padding: 10px 12px;
@@ -1499,12 +1597,12 @@
     .usb-picker-option {
       min-height: 48px;
       border-radius: 12px;
-      background: rgba(255, 255, 255, .66);
+      background: var(--card-bg);
     }
 
     .usb-picker-option.is-selected {
       border-color: rgba(23, 105, 255, .48);
-      background: #eef4ff;
+      background: var(--menu-hover-bg);
     }
 
     .usb-picker-empty {
@@ -1517,7 +1615,7 @@
       color: var(--muted);
       font-size: 13px;
       font-weight: 680;
-      background: rgba(255, 255, 255, .38);
+      background: var(--card-bg-faint);
     }
 
     .compress-usb-meta {
@@ -1529,7 +1627,7 @@
 
     .format-row.is-selected {
       border-color: rgba(23, 105, 255, .48);
-      background: #eef4ff;
+      background: var(--menu-hover-bg);
     }
 
     .format-row:disabled,
@@ -1598,7 +1696,7 @@
       padding: 13px 15px;
       border: 1px solid rgba(216, 76, 91, .26);
       border-radius: 14px;
-      background: #fff0f2;
+      background: var(--notice-bg);
       color: var(--danger);
       box-shadow: 0 18px 40px rgba(37, 51, 81, .18);
       pointer-events: auto;
@@ -1621,11 +1719,138 @@
       padding: 14px;
       border: 1px solid rgba(216, 76, 91, .2);
       border-radius: 14px;
-      background: #fff0f2;
+      background: var(--notice-bg);
     }
 
     .delete-warning .history-meta {
       overflow-wrap: anywhere;
+    }
+
+    html[data-theme="dark"] {
+      color-scheme: dark;
+      --bg: #0a0f16;
+      --surface: rgba(18, 24, 34, .92);
+      --surface-solid: #151c28;
+      --surface-2: #1a2331;
+      --line: rgba(148, 163, 184, .16);
+      --text: #e8edf5;
+      --muted: #93a0b5;
+      --accent: #5b9dff;
+      --accent-2: #84b4ff;
+      --danger: #f07178;
+      --focus: #6aa8ff;
+      --shadow: rgba(0, 0, 0, .42);
+      --soft-shadow: 0 18px 46px rgba(0, 0, 0, .34);
+      --button-shadow: 0 18px 42px rgba(23, 105, 255, .16);
+      --app-bg: linear-gradient(145deg, #0d121a 0%, #101722 42%, #0a1018 100%);
+      --panel-bg: rgba(18, 24, 34, .82);
+      --elevated-soft: rgba(24, 31, 43, .78);
+      --elevated-muted: rgba(24, 31, 43, .62);
+      --row-hover-bg: rgba(255, 255, 255, .05);
+      --row-output-bg: rgba(91, 157, 255, .10);
+      --row-selected-shadow: 0 14px 34px rgba(0, 0, 0, .28);
+      --thumb-bg: linear-gradient(145deg, #1a2433, #121a26);
+      --thumb-shadow: inset 0 1px 0 rgba(255, 255, 255, .05), 0 10px 24px rgba(0, 0, 0, .28);
+      --chip-bg: rgba(255, 255, 255, .06);
+      --row-tag-bg: rgba(255, 255, 255, .05);
+      --menu-bg: rgba(20, 27, 38, .96);
+      --menu-hover-bg: rgba(91, 157, 255, .12);
+      --menu-danger-hover-bg: rgba(240, 113, 120, .12);
+      --progress-bg: #1a2230;
+      --progress-fg: #d5deea;
+      --progress-fg-soft: #a8b4c7;
+      --bar-track: #273142;
+      --loading-pill-bg: rgba(91, 157, 255, .14);
+      --loading-pill-border: rgba(91, 157, 255, .24);
+      --modal-bg: rgba(20, 27, 38, .96);
+      --modal-backdrop: rgba(0, 0, 0, .58);
+      --card-bg: rgba(24, 31, 43, .82);
+      --card-bg-soft: rgba(24, 31, 43, .58);
+      --card-bg-strong: rgba(24, 31, 43, .92);
+      --card-bg-faint: rgba(24, 31, 43, .42);
+      --selection-bg: rgba(91, 157, 255, .14);
+      --notice-bg: rgba(240, 113, 120, .12);
+      --terminate-bg: rgba(20, 27, 38, .96);
+      --icon-btn-bg: rgba(24, 31, 43, .78);
+      --icon-btn-shadow: 0 8px 20px rgba(0, 0, 0, .22);
+      --icon-btn-shadow-hover: 0 12px 28px rgba(0, 0, 0, .28);
+      --focus-ring: rgba(106, 168, 255, .34);
+      --accent-border: rgba(91, 157, 255, .28);
+      --accent-border-strong: rgba(91, 157, 255, .42);
+      --accent-focus: rgba(91, 157, 255, .52);
+      --accent-focus-ring: rgba(91, 157, 255, .18);
+      --hero-shadow: 0 24px 60px rgba(0, 0, 0, .32);
+      --terminated-bg: rgba(240, 113, 120, .12);
+    }
+
+    html[data-theme="dark"] .chip.ok {
+      color: #6dd4a0;
+      border-color: rgba(109, 212, 160, .24);
+      background: rgba(20, 137, 91, .18);
+    }
+
+    html[data-theme="dark"] .chip.warn {
+      color: #f0b44d;
+      border-color: rgba(240, 180, 77, .24);
+      background: rgba(165, 106, 5, .18);
+    }
+
+    html[data-theme="dark"] .chip.run,
+    html[data-theme="dark"] .chip.compressing {
+      color: #84b4ff;
+      border-color: rgba(132, 180, 255, .24);
+      background: rgba(91, 157, 255, .14);
+    }
+
+    html[data-theme="dark"] .chip.bad {
+      color: #ff8f98;
+      border-color: rgba(255, 143, 152, .24);
+      background: rgba(216, 76, 91, .16);
+    }
+
+    html[data-theme="dark"] .chip.closing,
+    html[data-theme="dark"] .chip.finalizing {
+      color: #b4becf;
+      border-color: rgba(180, 190, 207, .22);
+      background: rgba(89, 97, 109, .18);
+    }
+
+    html[data-theme="dark"] .chip.mounting,
+    html[data-theme="dark"] .chip.moving,
+    html[data-theme="dark"] .chip.scanning,
+    html[data-theme="dark"] .chip.size-pending {
+      color: #79c7e8;
+      border-color: rgba(121, 199, 232, .22);
+      background: rgba(56, 97, 118, .18);
+    }
+
+    html[data-theme="dark"] .chip.validating {
+      color: #66d4c6;
+      border-color: rgba(102, 212, 198, .22);
+      background: rgba(15, 118, 110, .18);
+    }
+
+    html[data-theme="dark"] .chip.repacking {
+      color: #f0c56a;
+      border-color: rgba(240, 197, 106, .22);
+      background: rgba(168, 112, 12, .18);
+    }
+
+    html[data-theme="dark"] .chip.restoring,
+    html[data-theme="dark"] .chip.unpacking {
+      color: #c4a8f0;
+      border-color: rgba(196, 168, 240, .22);
+      background: rgba(107, 75, 161, .18);
+    }
+
+    html[data-theme="dark"] .terminated-icon {
+      border-color: rgba(240, 113, 120, .28);
+      background: var(--terminated-bg);
+      box-shadow: 0 24px 60px rgba(240, 113, 120, .12);
+    }
+
+    html[data-theme="dark"] .menu-action.is-danger:hover {
+      color: #ff8f98;
     }
 
     @keyframes icon-arrive {
@@ -1844,6 +2069,18 @@
     <main class="content">
       <div class="topbar">
         <div class="free-space-label" id="free-space-label">Free Space <span>--</span></div>
+        <button class="icon-btn theme-toggle" id="theme-top" type="button" title="Dark mode"
+          aria-label="Switch to dark mode" aria-pressed="false">
+          <span class="theme-toggle-icons" aria-hidden="true">
+            <svg class="theme-toggle-icon theme-toggle-icon-moon" viewBox="0 0 24 24">
+              <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>
+            </svg>
+            <svg class="theme-toggle-icon theme-toggle-icon-sun" viewBox="0 0 24 24">
+              <circle cx="12" cy="12" r="4"></circle>
+              <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"></path>
+            </svg>
+          </span>
+        </button>
         <button class="icon-btn" id="history-top" title="History" aria-label="History"></button>
         <button class="icon-btn is-danger" id="terminate-top" title="Terminate Game Compressor"
           aria-label="Terminate Game Compressor"></button>
@@ -2091,6 +2328,7 @@
 
   <script>
     const SELECTED_GAME_COOKIE = 'game_compressor_selected_title';
+    const THEME_COOKIE = 'game_compressor_theme';
     const PFS_BLOCK_SIZE = 64 * 1024;
     const SPEED_SAMPLE_WINDOW_MS = 8 * 1000;
     const SPEED_MIN_SAMPLE_MS = 1000;
@@ -2191,6 +2429,43 @@
       const maxAge = Math.max(1, Math.floor(Number(maxAgeDays || 180))) * 24 * 60 * 60;
       document.cookie = encodeURIComponent(name) + '=' + encodeURIComponent(value) +
         '; Max-Age=' + maxAge + '; Path=/; SameSite=Lax';
+    }
+
+    function currentTheme() {
+      return document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'light';
+    }
+
+    function applyTheme(theme) {
+      const next = theme === 'dark' ? 'dark' : 'light';
+      if (next === 'dark') {
+        document.documentElement.setAttribute('data-theme', 'dark');
+      } else {
+        document.documentElement.removeAttribute('data-theme');
+      }
+      writeCookie(THEME_COOKIE, next, 365);
+      updateThemeToggle();
+    }
+
+    function toggleTheme() {
+      applyTheme(currentTheme() === 'dark' ? 'light' : 'dark');
+    }
+
+    function updateThemeToggle() {
+      const btn = $('theme-top');
+      if (!btn) return;
+      const dark = currentTheme() === 'dark';
+      btn.title = dark ? 'Light mode' : 'Dark mode';
+      btn.setAttribute('aria-label', dark ? 'Switch to light mode' : 'Switch to dark mode');
+      btn.setAttribute('aria-pressed', dark ? 'true' : 'false');
+    }
+
+    function restoreTheme() {
+      const saved = cookieValue(THEME_COOKIE);
+      if (saved === 'dark' || saved === 'light') {
+        applyTheme(saved);
+        return;
+      }
+      updateThemeToggle();
     }
 
     function gameInstanceId(g) {
@@ -5921,6 +6196,7 @@
     }
 
     document.addEventListener('DOMContentLoaded', () => {
+      restoreTheme();
       restoreSelectedGame();
       $('info-top').innerHTML = icon('info');
       $('history-top').innerHTML = icon('history');
@@ -5935,6 +6211,7 @@
       $('info-top').addEventListener('click', () => showModal('info-modal'));
       $('info-close').addEventListener('click', () => hideModal('info-modal'));
       $('history-top').addEventListener('click', () => showModal('history-modal'));
+      $('theme-top').addEventListener('click', toggleTheme);
       $('history-close').addEventListener('click', () => hideModal('history-modal'));
       $('terminate-top').addEventListener('click', terminateProgram);
       $('usb-close').addEventListener('click', closeUsbModal);
