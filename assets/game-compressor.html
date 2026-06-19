@@ -7402,7 +7402,7 @@
     }
 
     function requestShutdownAfterTerminate() {
-      const url = '/api/control/shutdown?removeTile=1&t=' + encodeURIComponent(Date.now());
+      const url = '/api/control/shutdown?t=' + encodeURIComponent(Date.now());
       const frame = document.createElement('iframe');
       frame.hidden = true;
       frame.setAttribute('aria-hidden', 'true');

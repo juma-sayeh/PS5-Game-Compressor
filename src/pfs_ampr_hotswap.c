@@ -51,6 +51,7 @@
 #define HS_IO_CHUNK (1024U * 1024U)
 #define HS_AMPR_SLACK_CLUSTERS 16U
 #define HS_MAX_AMPR_CLUSTERS 4096U
+#define HS_EXFAT_NAME_SKIP 1
 
 typedef int (*hs_read_fn)(void *ctx, uint64_t off, void *out, size_t size,
                           char *err, size_t err_size);
@@ -143,6 +144,13 @@ typedef struct hs_changed_blocks {
   size_t count;
   size_t cap;
 } hs_changed_blocks_t;
+
+typedef enum hs_pfsc_apply_strategy {
+  HS_PFSC_APPLY_OVERWRITE = 0,
+  HS_PFSC_APPLY_MOVE_LEFT,
+  HS_PFSC_APPLY_MOVE_RIGHT,
+  HS_PFSC_APPLY_MIXED,
+} hs_pfsc_apply_strategy_t;
 
 static void
 hs_set_err(char *err, size_t err_size, const char *fmt, ...) {
@@ -735,9 +743,7 @@ hs_exfat_decode_name(const unsigned char *set, size_t entry_count,
     for(size_t i = 0; i < 15 && pos < name_len; i++) {
       uint16_t ch = hs_rd16(fn + 2 + i * 2);
       if(ch == 0 || ch >= 0x80) {
-        hs_set_err(err, err_size, "unsupported exFAT filename");
-        errno = EINVAL;
-        return -1;
+        return HS_EXFAT_NAME_SKIP;
       }
       name[pos++] = (char)ch;
     }
@@ -749,9 +755,7 @@ hs_exfat_decode_name(const unsigned char *set, size_t entry_count,
   }
   name[pos] = 0;
   if(!path_segment_supported(name)) {
-    hs_set_err(err, err_size, "unsafe exFAT path segment");
-    errno = EINVAL;
-    return -1;
+    return HS_EXFAT_NAME_SKIP;
   }
   return 0;
 }
@@ -975,9 +979,14 @@ hs_exfat_collect_index_entries(const hs_exfat_t *ex, uint32_t dir_cluster,
       return -1;
     }
     char name[256];
-    if(hs_exfat_decode_name(set, entry_count, stream[3], name, sizeof(name),
-                            err, err_size) != 0) {
+    int name_rc = hs_exfat_decode_name(set, entry_count, stream[3],
+                                       name, sizeof(name), err, err_size);
+    if(name_rc < 0) {
       return -1;
+    }
+    if(name_rc == HS_EXFAT_NAME_SKIP) {
+      off += entry_count * 32ULL;
+      continue;
     }
     uint16_t attrs = hs_rd16(set + 4);
     uint8_t flags = stream[1];
@@ -1043,9 +1052,14 @@ hs_exfat_find_in_dir(const hs_exfat_t *ex, uint32_t dir_cluster,
       return -1;
     }
     char name[64];
-    if(hs_exfat_decode_name(set, entry_count, stream[3], name, sizeof(name),
-                            err, err_size) != 0) {
+    int name_rc = hs_exfat_decode_name(set, entry_count, stream[3],
+                                       name, sizeof(name), err, err_size);
+    if(name_rc < 0) {
       return -1;
+    }
+    if(name_rc == HS_EXFAT_NAME_SKIP) {
+      off += entry_count * 32ULL;
+      continue;
     }
     if(!strcasecmp(name, segs[seg_index])) {
       uint16_t attrs = hs_rd16(set + 4);
@@ -1330,9 +1344,14 @@ hs_exfat_find_root_index_slot(const hs_exfat_t *ex, hs_exfat_file_t *file,
       return -1;
     }
     char name[256];
-    if(hs_exfat_decode_name(set, entry_count, stream[3], name, sizeof(name),
-                            err, err_size) != 0) {
+    int name_rc = hs_exfat_decode_name(set, entry_count, stream[3],
+                                       name, sizeof(name), err, err_size);
+    if(name_rc < 0) {
       return -1;
+    }
+    if(name_rc == HS_EXFAT_NAME_SKIP) {
+      off += entry_count * 32ULL;
+      continue;
     }
     if(!strcasecmp(name, "ampr_emu.index")) {
       uint16_t attrs = hs_rd16(set + 4);
@@ -1439,9 +1458,14 @@ hs_exfat_find_root_index_slot_for_write(const hs_exfat_t *ex,
       return -1;
     }
     char name[256];
-    if(hs_exfat_decode_name(set, entry_count, stream[3], name, sizeof(name),
-                            err, err_size) != 0) {
+    int name_rc = hs_exfat_decode_name(set, entry_count, stream[3],
+                                       name, sizeof(name), err, err_size);
+    if(name_rc < 0) {
       return -1;
+    }
+    if(name_rc == HS_EXFAT_NAME_SKIP) {
+      off += entry_count * 32ULL;
+      continue;
     }
     if(!strcasecmp(name, "ampr_emu.index")) {
       uint16_t attrs = hs_rd16(set + 4);
@@ -2810,39 +2834,59 @@ hs_changed_at(hs_changed_blocks_t *blocks, size_t *cursor, uint64_t index) {
   return NULL;
 }
 
+static hs_changed_block_t *
+hs_changed_find(const hs_changed_blocks_t *blocks, uint64_t index) {
+  if(!blocks) return NULL;
+  for(size_t i = 0; i < blocks->count; i++) {
+    if(blocks->items[i].index == index) return &blocks->items[i];
+  }
+  return NULL;
+}
+
 static int
-hs_rebuild_pfsc_with_changed_blocks(const char *path, hs_pfsc_image_t *img,
-                                    hs_changed_blocks_t *blocks,
-                                    pfs_ampr_hotswap_info_t *info,
-                                    char *err, size_t err_size) {
+hs_pfsc_final_size(uint64_t stored_size, uint64_t *out,
+                   char *err, size_t err_size) {
+  uint64_t file_blocks = hs_ceil_div_u64(stored_size, HS_BLOCK_SIZE);
+  if(file_blocks == 0) file_blocks = 1;
+  if(file_blocks > UINT64_MAX / HS_BLOCK_SIZE - 6ULL) {
+    hs_set_err(err, err_size, "hot-swap PFSC final size overflow");
+    errno = EOVERFLOW;
+    return -1;
+  }
+  *out = (6ULL + file_blocks) * HS_BLOCK_SIZE;
+  return 0;
+}
+
+static int
+hs_prepare_pfsc_rewrite(const hs_pfsc_image_t *img,
+                        hs_changed_blocks_t *blocks,
+                        uint64_t **new_offsets_out,
+                        unsigned char **changed_out,
+                        char *err, size_t err_size) {
   uint64_t *new_offsets = NULL;
   unsigned char *changed = NULL;
-  char temp_path[1024];
-  char parent[1024];
-  char base[256];
-  int temp_fd = -1;
-  int rc = -1;
-  struct stat st;
-  hs_rebuild_progress_t progress = {0};
 
+  if(new_offsets_out) *new_offsets_out = NULL;
+  if(changed_out) *changed_out = NULL;
   if(blocks->count == 0) {
     hs_set_err(err, err_size, "no PFSC blocks changed");
     errno = EINVAL;
     return -1;
   }
-  new_offsets = calloc((size_t)(img->block_count + 1ULL), sizeof(*new_offsets));
+  new_offsets = calloc((size_t)(img->block_count + 1ULL),
+                       sizeof(*new_offsets));
   changed = calloc((size_t)img->block_count, 1);
   if(!new_offsets || !changed) {
     hs_set_err(err, err_size, "out of memory");
     errno = ENOMEM;
-    goto done;
+    goto fail;
   }
-  if(hs_compress_changed_blocks(blocks, err, err_size) != 0) goto done;
+  if(hs_compress_changed_blocks(blocks, err, err_size) != 0) goto fail;
   for(size_t i = 0; i < blocks->count; i++) {
     if(blocks->items[i].index >= img->block_count) {
       hs_set_err(err, err_size, "bad changed PFSC block");
       errno = EINVAL;
-      goto done;
+      goto fail;
     }
     changed[blocks->items[i].index] = 1;
   }
@@ -2851,14 +2895,314 @@ hs_rebuild_pfsc_with_changed_blocks(const char *path, hs_pfsc_image_t *img,
   for(uint64_t i = 0; i < img->block_count; i++) {
     hs_changed_block_t *b = hs_changed_at(blocks, &changed_cursor, i);
     uint64_t old_len = img->offsets[i + 1ULL] - img->offsets[i];
-    uint64_t new_len = b ? b->stored_len : old_len;
+    uint64_t new_len = b ? (uint64_t)b->stored_len : old_len;
     if(new_len > UINT64_MAX - new_offsets[i]) {
       hs_set_err(err, err_size, "hot-swap PFSC size overflow");
       errno = EOVERFLOW;
-      goto done;
+      goto fail;
     }
     new_offsets[i + 1ULL] = new_offsets[i] + new_len;
   }
+  *new_offsets_out = new_offsets;
+  *changed_out = changed;
+  return 0;
+
+fail:
+  free(new_offsets);
+  free(changed);
+  return -1;
+}
+
+static hs_pfsc_apply_strategy_t
+hs_pfsc_choose_apply_strategy(const hs_pfsc_image_t *img,
+                              const uint64_t *new_offsets,
+                              const unsigned char *changed) {
+  int saw_left = 0;
+  int saw_right = 0;
+  for(uint64_t i = 0; i < img->block_count; i++) {
+    if(changed[i]) continue;
+    uint64_t old_start = img->offsets[i];
+    uint64_t old_len = img->offsets[i + 1ULL] - img->offsets[i];
+    uint64_t new_start = new_offsets[i];
+    uint64_t new_len = new_offsets[i + 1ULL] - new_offsets[i];
+    if(new_len != old_len) return HS_PFSC_APPLY_MIXED;
+    if(new_start < old_start) saw_left = 1;
+    if(new_start > old_start) saw_right = 1;
+    if(saw_left && saw_right) return HS_PFSC_APPLY_MIXED;
+  }
+  if(saw_left) return HS_PFSC_APPLY_MOVE_LEFT;
+  if(saw_right) return HS_PFSC_APPLY_MOVE_RIGHT;
+  return HS_PFSC_APPLY_OVERWRITE;
+}
+
+static int
+hs_copy_fd_range_overlap_progress(int fd, uint64_t src_off, uint64_t dst_off,
+                                  uint64_t size, int backwards,
+                                  uint64_t run_blocks,
+                                  hs_rebuild_progress_t *progress,
+                                  const char *current,
+                                  char *err, size_t err_size) {
+  if(size == 0 || src_off == dst_off) {
+    hs_rebuild_advance_progress(progress, run_blocks, current);
+    return 0;
+  }
+  unsigned char *buf = malloc(HS_IO_CHUNK);
+  if(!buf) {
+    hs_set_err(err, err_size, "out of memory");
+    errno = ENOMEM;
+    return -1;
+  }
+  uint64_t done = 0;
+  uint64_t base_blocks = progress ? progress->done_blocks : 0;
+  if(backwards) {
+    uint64_t remaining = size;
+    while(remaining > 0) {
+      size_t chunk = remaining > HS_IO_CHUNK ? HS_IO_CHUNK : (size_t)remaining;
+      uint64_t pos = remaining - (uint64_t)chunk;
+      if(hs_read_exact_at(fd, buf, chunk, src_off + pos,
+                          err, err_size) != 0 ||
+         hs_write_exact_at(fd, buf, chunk, dst_off + pos,
+                           err, err_size) != 0) {
+        free(buf);
+        return -1;
+      }
+      remaining = pos;
+      done = size - remaining;
+      if(progress && size > 0 && run_blocks > 0) {
+        uint64_t run_done = done >= size ? run_blocks :
+            (uint64_t)(((unsigned __int128)done * run_blocks) / size);
+        hs_rebuild_report_progress(progress, base_blocks + run_done, current);
+      }
+    }
+  } else {
+    while(done < size) {
+      size_t chunk = size - done > HS_IO_CHUNK ?
+          HS_IO_CHUNK : (size_t)(size - done);
+      if(hs_read_exact_at(fd, buf, chunk, src_off + done,
+                          err, err_size) != 0 ||
+         hs_write_exact_at(fd, buf, chunk, dst_off + done,
+                           err, err_size) != 0) {
+        free(buf);
+        return -1;
+      }
+      done += chunk;
+      if(progress && size > 0 && run_blocks > 0) {
+        uint64_t run_done = done >= size ? run_blocks :
+            (uint64_t)(((unsigned __int128)done * run_blocks) / size);
+        hs_rebuild_report_progress(progress, base_blocks + run_done, current);
+      }
+    }
+  }
+  free(buf);
+  hs_rebuild_report_progress(progress, base_blocks + run_blocks, current);
+  return 0;
+}
+
+static int
+hs_write_changed_pfsc_block(int fd, const hs_pfsc_image_t *img,
+                            const uint64_t *new_offsets,
+                            const hs_changed_block_t *b,
+                            char *err, size_t err_size) {
+  if(!b) {
+    hs_set_err(err, err_size, "missing changed PFSC block");
+    errno = EINVAL;
+    return -1;
+  }
+  return hs_write_exact_at(fd, b->stored, b->stored_len,
+                           img->file_start + new_offsets[b->index],
+                           err, err_size);
+}
+
+static int
+hs_apply_pfsc_in_place(const char *path, const hs_pfsc_image_t *img,
+                       hs_changed_blocks_t *blocks,
+                       const uint64_t *new_offsets,
+                       const unsigned char *changed,
+                       hs_pfsc_apply_strategy_t strategy,
+                       int *modified,
+                       char *err, size_t err_size) {
+  int fd = -1;
+  int rc = -1;
+  uint64_t final_size = 0;
+  hs_rebuild_progress_t progress = {0};
+
+  if(modified) *modified = 0;
+  if(strategy == HS_PFSC_APPLY_MIXED) {
+    hs_set_err(err, err_size, "mixed PFSC movement requires copy-replace");
+    errno = EINVAL;
+    return -1;
+  }
+  if(hs_pfsc_final_size(new_offsets[img->block_count], &final_size,
+                        err, err_size) != 0) {
+    return -1;
+  }
+  fd = open(path, O_RDWR);
+  if(fd < 0) {
+    hs_set_err(err, err_size, "open .ffpfsc for in-place AMPR update: %s",
+               strerror(errno));
+    return -1;
+  }
+  if(final_size > img->outer_size) {
+    if(ftruncate(fd, (off_t)final_size) != 0) {
+      hs_set_err(err, err_size, "extend .ffpfsc for AMPR update: %s",
+                 strerror(errno));
+      goto done;
+    }
+    if(modified) *modified = 1;
+  }
+
+  progress.total_blocks = img->block_count;
+  hs_rebuild_report_progress(&progress, 0,
+                             "Updating compressed image in place");
+  if(strategy == HS_PFSC_APPLY_MOVE_RIGHT) {
+    uint64_t remaining = img->block_count;
+    while(remaining > 0) {
+      uint64_t i = remaining - 1ULL;
+      if(changed[i]) {
+        hs_changed_block_t *b = hs_changed_find(blocks, i);
+        if(modified) *modified = 1;
+        if(hs_write_changed_pfsc_block(fd, img, new_offsets, b,
+                                       err, err_size) != 0) {
+          goto done;
+        }
+        remaining--;
+        hs_rebuild_advance_progress(&progress, 1,
+                                    "Updating compressed image in place");
+        continue;
+      }
+
+      uint64_t old_start = img->offsets[i];
+      uint64_t new_start = new_offsets[i];
+      uint64_t delta = new_start - old_start;
+      uint64_t run_start = i;
+      while(run_start > 0) {
+        uint64_t prev = run_start - 1ULL;
+        if(changed[prev]) break;
+        uint64_t prev_old_start = img->offsets[prev];
+        uint64_t prev_old_len = img->offsets[prev + 1ULL] - img->offsets[prev];
+        uint64_t prev_new_start = new_offsets[prev];
+        uint64_t prev_new_len = new_offsets[prev + 1ULL] - new_offsets[prev];
+        if(prev_new_len != prev_old_len ||
+           prev_new_start < prev_old_start ||
+           prev_new_start - prev_old_start != delta) {
+          break;
+        }
+        run_start = prev;
+      }
+
+      uint64_t old_range_start = img->offsets[run_start];
+      uint64_t old_range_end = img->offsets[remaining];
+      uint64_t new_range_start = new_offsets[run_start];
+      uint64_t run_size = old_range_end - old_range_start;
+      uint64_t run_blocks = remaining - run_start;
+      if(delta != 0) {
+        if(modified) *modified = 1;
+        if(hs_copy_fd_range_overlap_progress(
+               fd, img->file_start + old_range_start,
+               img->file_start + new_range_start, run_size, 1,
+               run_blocks, &progress,
+               "Updating compressed image in place",
+               err, err_size) != 0) {
+          goto done;
+        }
+      } else {
+        hs_rebuild_advance_progress(&progress, run_blocks,
+                                    "Updating compressed image in place");
+      }
+      remaining = run_start;
+    }
+  } else {
+    for(uint64_t block = 0; block < img->block_count;) {
+      if(changed[block]) {
+        hs_changed_block_t *b = hs_changed_find(blocks, block);
+        if(modified) *modified = 1;
+        if(hs_write_changed_pfsc_block(fd, img, new_offsets, b,
+                                       err, err_size) != 0) {
+          goto done;
+        }
+        block++;
+        hs_rebuild_advance_progress(&progress, 1,
+                                    "Updating compressed image in place");
+        continue;
+      }
+
+      uint64_t old_start = img->offsets[block];
+      uint64_t new_start = new_offsets[block];
+      uint64_t delta = old_start - new_start;
+      uint64_t run_start = block;
+      while(block < img->block_count && !changed[block]) {
+        uint64_t cur_old_start = img->offsets[block];
+        uint64_t cur_old_len = img->offsets[block + 1ULL] -
+                               img->offsets[block];
+        uint64_t cur_new_start = new_offsets[block];
+        uint64_t cur_new_len = new_offsets[block + 1ULL] -
+                               new_offsets[block];
+        if(cur_new_len != cur_old_len ||
+           cur_new_start > cur_old_start ||
+           cur_old_start - cur_new_start != delta) {
+          break;
+        }
+        block++;
+      }
+      uint64_t old_range_start = img->offsets[run_start];
+      uint64_t old_range_end = img->offsets[block];
+      uint64_t new_range_start = new_offsets[run_start];
+      uint64_t run_size = old_range_end - old_range_start;
+      uint64_t run_blocks = block - run_start;
+      if(delta != 0) {
+        if(modified) *modified = 1;
+        if(hs_copy_fd_range_overlap_progress(
+               fd, img->file_start + old_range_start,
+               img->file_start + new_range_start, run_size, 0,
+               run_blocks, &progress,
+               "Updating compressed image in place",
+               err, err_size) != 0) {
+          goto done;
+        }
+      } else {
+        hs_rebuild_advance_progress(&progress, run_blocks,
+                                    "Updating compressed image in place");
+      }
+    }
+  }
+
+  hs_rebuild_report_progress(&progress, img->block_count,
+                             "Finalizing compressed image");
+  if(modified) *modified = 1;
+  if(hs_write_pfsc_header(fd, img, new_offsets, err, err_size) != 0 ||
+     hs_update_outer_metadata(fd, img, new_offsets[img->block_count],
+                              err, err_size) != 0) {
+    goto done;
+  }
+  if(fsync(fd) != 0) {
+    hs_set_err(err, err_size, "sync in-place AMPR update: %s",
+               strerror(errno));
+    goto done;
+  }
+  hs_rebuild_report_progress(&progress, img->block_count,
+                             "Compressed image update complete");
+  rc = 0;
+
+done:
+  if(fd >= 0) close(fd);
+  return rc;
+}
+
+static int
+hs_rebuild_pfsc_copy_replace(const char *path, hs_pfsc_image_t *img,
+                             hs_changed_blocks_t *blocks,
+                             const uint64_t *new_offsets,
+                             const unsigned char *changed,
+                             pfs_ampr_hotswap_info_t *info,
+                             char *err, size_t err_size) {
+  char temp_path[1024] = {0};
+  char parent[1024];
+  char base[256];
+  int temp_fd = -1;
+  int rc = -1;
+  struct stat st;
+  hs_rebuild_progress_t progress = {0};
+
   if(hs_temp_path_for(path, temp_path, sizeof(temp_path)) != 0) {
     hs_set_err(err, err_size, "hot-swap temp path too long");
     goto done;
@@ -2867,10 +3211,11 @@ hs_rebuild_pfsc_with_changed_blocks(const char *path, hs_pfsc_image_t *img,
     hs_set_err(err, err_size, "hot-swap parent path too long");
     goto done;
   }
-  uint64_t file_blocks =
-      hs_ceil_div_u64(new_offsets[img->block_count], HS_BLOCK_SIZE);
-  if(file_blocks == 0) file_blocks = 1;
-  uint64_t final_size = (6ULL + file_blocks) * HS_BLOCK_SIZE;
+  uint64_t final_size = 0;
+  if(hs_pfsc_final_size(new_offsets[img->block_count], &final_size,
+                        err, err_size) != 0) {
+    goto done;
+  }
   struct statvfs vfs;
   if(statvfs(parent, &vfs) == 0) {
     uint64_t free_bytes = (uint64_t)vfs.f_bavail * (uint64_t)vfs.f_frsize;
@@ -2899,7 +3244,7 @@ hs_rebuild_pfsc_with_changed_blocks(const char *path, hs_pfsc_image_t *img,
   }
 
   uint64_t block = 0;
-  changed_cursor = 0;
+  size_t changed_cursor = 0;
   progress.total_blocks = img->block_count;
   hs_rebuild_report_progress(&progress, 0, "Rebuilding compressed image");
   while(block < img->block_count) {
@@ -2963,6 +3308,42 @@ hs_rebuild_pfsc_with_changed_blocks(const char *path, hs_pfsc_image_t *img,
 done:
   if(temp_fd >= 0) close(temp_fd);
   if(rc != 0 && temp_path[0]) unlink(temp_path);
+  return rc;
+}
+
+static int
+hs_rebuild_pfsc_with_changed_blocks(const char *path, hs_pfsc_image_t *img,
+                                    hs_changed_blocks_t *blocks,
+                                    pfs_ampr_hotswap_info_t *info,
+                                    char *err, size_t err_size) {
+  uint64_t *new_offsets = NULL;
+  unsigned char *changed = NULL;
+  hs_pfsc_apply_strategy_t strategy = HS_PFSC_APPLY_MIXED;
+  int modified = 0;
+  int rc = -1;
+
+  if(hs_prepare_pfsc_rewrite(img, blocks, &new_offsets, &changed,
+                             err, err_size) != 0) {
+    goto done;
+  }
+  strategy = hs_pfsc_choose_apply_strategy(img, new_offsets, changed);
+  if(strategy != HS_PFSC_APPLY_MIXED) {
+    if(hs_apply_pfsc_in_place(path, img, blocks, new_offsets, changed,
+                              strategy, &modified, err, err_size) == 0) {
+      if(info) info->changed_blocks = blocks->count;
+      hs_pfsc_close(img);
+      rc = 0;
+      goto done;
+    }
+    if(modified) goto done;
+  }
+
+  if(hs_rebuild_pfsc_copy_replace(path, img, blocks, new_offsets, changed,
+                                  info, err, err_size) == 0) {
+    rc = 0;
+  }
+
+done:
   free(new_offsets);
   free(changed);
   return rc;
