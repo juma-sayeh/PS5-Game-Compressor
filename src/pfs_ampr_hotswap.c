@@ -161,6 +161,26 @@ hs_set_err(char *err, size_t err_size, const char *fmt, ...) {
   va_end(ap);
 }
 
+static int
+hs_exfat_require_contiguous_allocation(const hs_exfat_file_t *file,
+                                       const char *label,
+                                       char *err, size_t err_size) {
+  if(!file) {
+    hs_set_err(err, err_size, "bad exFAT allocation check");
+    errno = EINVAL;
+    return -1;
+  }
+  if(file->first_cluster && file->allocated_clusters &&
+     (file->stream_flags & 0x02U) == 0) {
+    hs_set_err(err, err_size,
+               "%s uses a fragmented exFAT allocation; recompress with AMPR hot-swap layout",
+               label ? label : "target file");
+    errno = EINVAL;
+    return -1;
+  }
+  return 0;
+}
+
 static uint16_t
 hs_rd16(const unsigned char *p) {
   return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
@@ -1591,6 +1611,11 @@ hs_build_exfat_index_patches(hs_exfat_t *ex, hs_patch_list_t *patches,
      hs_exfat_load_root_bitmap(ex, err, err_size) != 0) {
     goto done;
   }
+  if(slot.found_existing &&
+     hs_exfat_require_contiguous_allocation(&slot.existing, "ampr_emu.index",
+                                            err, err_size) != 0) {
+    goto done;
+  }
   root_extra = (!slot.found_existing && slot.needs_root_extend) ? 1U : 0U;
   uint64_t bitmap_bytes64 = hs_ceil_div_u64(ex->cluster_count, 8);
   if(ex->bitmap_size < bitmap_bytes64 || ex->bitmap_size > SIZE_MAX) {
@@ -1764,6 +1789,10 @@ hs_build_exfat_ampr_patches(hs_exfat_t *ex,
   }
   uint32_t needed_clusters = (uint32_t)needed_clusters64;
   if(hs_exfat_find_ampr(ex, &file, err, err_size) != 0) return -1;
+  if(hs_exfat_require_contiguous_allocation(&file, "AMPR binary",
+                                            err, err_size) != 0) {
+    return -1;
+  }
 
   uint32_t new_first = file.first_cluster;
   uint32_t new_alloc = file.allocated_clusters;
