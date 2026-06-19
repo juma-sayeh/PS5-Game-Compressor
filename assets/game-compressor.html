@@ -5002,11 +5002,12 @@
       }
     }
 
-    function iconPath(g) {
+    function iconPath(g, size) {
       if (!g || !g.hasIcon) return '';
       const version = iconVersion(g);
       const suffix = version ? '&v=' + encodeURIComponent(version) : '';
-      return '/api/gc/icon?titleId=' + encodeURIComponent(g.titleId) + suffix;
+      const sizePart = size ? '&size=' + encodeURIComponent(size) : '';
+      return '/api/gc/icon?titleId=' + encodeURIComponent(g.titleId) + sizePart + suffix;
     }
 
     function updateIconElements(path, objectUrl) {
@@ -5048,7 +5049,7 @@
     function gameIcon(g, hero) {
       const text = (g && g.titleId ? g.titleId.slice(4) : 'GC');
       if (g && g.hasIcon) {
-        const path = iconPath(g);
+        const path = iconPath(g, hero ? '' : 'thumb');
         const cached = state.iconCache[path];
         if (cached) {
           return '<img src="' + escapeHtml(cached) + '" alt="" data-icon-path="' +

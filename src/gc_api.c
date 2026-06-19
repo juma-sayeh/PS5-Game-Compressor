@@ -23,6 +23,7 @@
 
 #include "gc_api.h"
 #include "gc_diag.h"
+#include "gc_icon_thumb.h"
 #include "gc_notify.h"
 #include "gc_shadowmount.h"
 #include "gc_size_cache.h"
@@ -11970,6 +11971,30 @@ gc_api_icon_request(const http_request_t *req) {
     close(fd);
     return websrv_send_error_json(req->fd, 404, "icon not found");
   }
+
+  char size_arg[32];
+  int want_thumb =
+      websrv_get_query_arg(req, "size", size_arg, sizeof(size_arg)) &&
+      !strcasecmp(size_arg, "thumb");
+  if(want_thumb) {
+    char thumb_path[1024];
+    if(gc_icon_thumb_path(title_id, path, &st, thumb_path,
+                          sizeof(thumb_path)) == 0) {
+      int thumb_fd = open(thumb_path, O_RDONLY);
+      if(thumb_fd >= 0) {
+        struct stat thumb_st;
+        if(fstat(thumb_fd, &thumb_st) == 0 && thumb_st.st_size > 0 &&
+           thumb_st.st_size <= 2 * 1024 * 1024) {
+          close(fd);
+          fd = thumb_fd;
+          st = thumb_st;
+        } else {
+          close(thumb_fd);
+        }
+      }
+    }
+  }
+
   char *data = malloc((size_t)st.st_size);
   if(!data) {
     close(fd);
