@@ -1736,6 +1736,18 @@
       padding: 14px;
     }
 
+    #format-modal .modal {
+      max-height: min(760px, 96vh);
+    }
+
+    #format-modal .modal-head {
+      padding: 13px 16px;
+    }
+
+    #format-modal .modal-body {
+      padding: 12px;
+    }
+
     .about-copy {
       display: grid;
       gap: 10px;
@@ -1908,6 +1920,15 @@
       margin-bottom: 0;
     }
 
+    #format-modal .format-grid {
+      gap: 8px;
+      margin-bottom: 11px;
+    }
+
+    #format-modal .format-row {
+      padding: 10px;
+    }
+
     .format-output-note {
       display: grid;
       grid-template-columns: minmax(0, 1fr) auto;
@@ -1920,6 +1941,11 @@
       background: var(--path-bg);
     }
 
+    #format-modal .format-output-note {
+      padding: 10px;
+      margin-bottom: 8px;
+    }
+
     .format-output-note.is-hidden,
     .format-switch-note.is-hidden {
       display: none;
@@ -1930,6 +1956,10 @@
       color: var(--muted);
       font-size: 12px;
       line-height: 1.35;
+    }
+
+    #format-modal .format-switch-note {
+      margin-bottom: 10px;
     }
 
     .format-link {
@@ -2138,6 +2168,10 @@
       justify-content: flex-end;
       gap: 10px;
       padding-top: 14px;
+    }
+
+    #format-modal .modal-actions {
+      padding-top: 8px;
     }
 
     #ampr-version-modal .modal-actions {
@@ -4776,6 +4810,7 @@
         title: failureNoticeTitle(op),
         text: failureNoticeText(op)
       };
+      hideTerminateReminder();
       renderUiNotice();
     }
 
@@ -4783,6 +4818,7 @@
       if (!state.notice) return;
       state.notice = null;
       renderUiNotice();
+      maybeShowFinishedOperationReminder();
     }
 
     function renderUiNotice() {
@@ -6424,11 +6460,13 @@
     function maybeShowFinishedOperationReminder() {
       const id = pendingFinishedOperationId;
       if (!id || remindedFinishedOperationIds.has(id)) return;
+      if (state.notice) return;
       if (operationQueueHasWork()) return;
       const op = operationById(id);
       if (!operationIsFinished(op)) return;
       pendingFinishedOperationId = '';
       remindedFinishedOperationIds.add(id);
+      if (String((op && op.status) || '').toLowerCase() !== 'success') return;
       showTerminateReminder();
     }
 
