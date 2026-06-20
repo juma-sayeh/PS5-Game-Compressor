@@ -1908,6 +1908,45 @@
       margin-bottom: 0;
     }
 
+    .format-output-note {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 12px;
+      align-items: center;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      margin-bottom: 10px;
+      background: var(--path-bg);
+    }
+
+    .format-output-note.is-hidden,
+    .format-switch-note.is-hidden {
+      display: none;
+    }
+
+    .format-switch-note {
+      margin: -2px 0 14px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.35;
+    }
+
+    .format-link {
+      appearance: none;
+      border: 0;
+      padding: 0;
+      background: transparent;
+      color: var(--accent);
+      font: inherit;
+      font-weight: 760;
+      cursor: pointer;
+    }
+
+    .format-link:hover {
+      text-decoration: underline;
+    }
+
     .ampr-version-list {
       display: grid;
       gap: 10px;
@@ -2554,18 +2593,30 @@
         <button class="icon-btn" id="format-close" aria-label="Close"></button>
       </div>
       <div class="modal-body">
-        <div class="format-section-title">Format</div>
-        <div class="format-grid">
+        <div class="format-section-title" id="format-output-section">Output</div>
+        <div class="format-output-note" id="format-compress-output">
+          <div>
+            <div class="history-title">Compressed archive (.ffpfsc)</div>
+            <div class="history-meta" id="format-compress-output-name">&lt;TITLE_ID&gt;.ffpfsc</div>
+          </div>
+          <span class="chip selected">Output</span>
+        </div>
+        <div class="format-switch-note" id="format-make-image-hint">
+          Need a direct .exfat or .ffpfs file?
+          <button class="format-link" type="button" id="format-switch-make-image">Make Image instead</button>
+        </div>
+        <div class="format-section-title" id="format-inner-section">Inner image format</div>
+        <div class="format-grid" id="format-grid">
           <button class="format-row is-default-choice" type="button" data-compress-format="exfat">
             <div>
-              <div class="history-title">exFAT</div>
+              <div class="history-title" id="format-exfat-title">exFAT</div>
               <div class="history-meta" id="format-exfat-name">&lt;TITLE_ID&gt;.exfat</div>
             </div>
             <span class="chip">Select</span>
           </button>
           <button class="format-row" type="button" data-compress-format="pfs">
             <div>
-              <div class="history-title">PFS Experimental</div>
+              <div class="history-title" id="format-pfs-title">PFS Experimental</div>
               <div class="history-meta" id="format-pfs-name">Experimental - pfs_image.dat</div>
             </div>
             <span class="chip">Select</span>
@@ -7110,6 +7161,11 @@
       if (!useDestinationChooser && state.compressDestination !== 'usb') {
         state.compressDestinationChooserOpen = false;
       }
+      $('format-output-section').textContent = 'Output';
+      $('format-output-section').classList.toggle('is-hidden', makeImage);
+      $('format-inner-section').textContent = makeImage ? 'Image Format' : 'Inner Image Format';
+      $('format-compress-output').classList.toggle('is-hidden', makeImage);
+      $('format-make-image-hint').classList.toggle('is-hidden', makeImage);
       $('format-safe-space').textContent = safeSpaceText(g);
       $('format-stream-space').textContent = makeImage ? 'Not available for image creation' : destructiveSpaceText(g);
       $('format-destination-keep-title').textContent = makeImage
@@ -7191,8 +7247,20 @@
       state.compressUsbOpen = false;
       state.compressDestinationChooserOpen = false;
       $('format-title').textContent = (makeImage ? 'Make Image ' : 'Compress ') + (g.name || g.titleId);
-      $('format-pfs-name').textContent = makeImage ? (g.titleId || '<TITLE_ID>') + '.ffpfs' : 'Experimental - pfs_image.dat';
-      $('format-exfat-name').textContent = (g.titleId || '<TITLE_ID>') + '.exfat';
+      $('format-compress-output-name').textContent =
+        (g.titleId || '<TITLE_ID>') + '.ffpfsc';
+      $('format-exfat-title').textContent = makeImage
+        ? 'exFAT image'
+        : 'exFAT inside .ffpfsc';
+      $('format-exfat-name').textContent = makeImage
+        ? (g.titleId || '<TITLE_ID>') + '.exfat'
+        : 'Creates ' + (g.titleId || '<TITLE_ID>') + '.ffpfsc with internal exFAT';
+      $('format-pfs-title').textContent = makeImage
+        ? 'PFS image experimental'
+        : 'PFS inside .ffpfsc experimental';
+      $('format-pfs-name').textContent = makeImage
+        ? (g.titleId || '<TITLE_ID>') + '.ffpfs'
+        : 'Creates ' + (g.titleId || '<TITLE_ID>') + '.ffpfsc with pfs_image.dat';
       $('format-start').textContent = makeImage ? 'Make Image' : 'Compress';
       updateCompressModalSelection();
       showModal('format-modal');
@@ -7225,6 +7293,13 @@
       state.compressUsbOpen = false;
       state.compressDestinationChooserOpen = false;
       updateCompressModalSelection();
+    }
+
+    function switchCompressModalToMakeImage() {
+      const g = state.compressGame;
+      if (!g || !g.sourcePath) return;
+      closeCompressFormatModal();
+      showCompressFormatModal(g, 'make-image');
     }
 
     async function startMove(url) {
@@ -7529,6 +7604,7 @@
         if (input) input.value = '';
       });
       $('format-close').addEventListener('click', closeCompressFormatModal);
+      $('format-switch-make-image').addEventListener('click', switchCompressModalToMakeImage);
       $('uncompress-close').addEventListener('click', closeUncompressModal);
       $('delete-close').addEventListener('click', closeDeleteModal);
       $('delete-cancel').addEventListener('click', closeDeleteModal);

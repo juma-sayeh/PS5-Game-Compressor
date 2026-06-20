@@ -919,6 +919,144 @@ done:
   return rc;
 }
 
+static uint64_t
+outer_dirent_span(const char *name) {
+  size_t name_len = strlen(name ? name : "");
+  uint64_t ent_size = (uint64_t)name_len + 17ULL;
+  uint64_t rem = ent_size % 8ULL;
+  if(rem) ent_size += 8ULL - rem;
+  return ent_size;
+}
+
+static int
+zero_exact_at(int fd, uint64_t offset, uint64_t size,
+              char *err, size_t err_size) {
+  unsigned char zeroes[64 * 1024];
+  uint64_t written = 0;
+  memset(zeroes, 0, sizeof(zeroes));
+  while(written < size) {
+    size_t chunk = sizeof(zeroes);
+    uint64_t remaining = size - written;
+    if(remaining < (uint64_t)chunk) chunk = (size_t)remaining;
+    if(write_exact_at(fd, zeroes, chunk, offset + written,
+                      err, err_size) != 0) {
+      return -1;
+    }
+    written += chunk;
+  }
+  return 0;
+}
+
+static int
+zero_outer_slack_range(int fd, uint64_t offset, uint64_t size,
+                       uint64_t outer_size, uint64_t *fixed_bytes,
+                       char *err, size_t err_size) {
+  if(size == 0) return 0;
+  if(offset > outer_size || size > outer_size - offset) {
+    set_err(err, err_size, "outer PFS slack range is outside image");
+    errno = EINVAL;
+    return -1;
+  }
+  if(zero_exact_at(fd, offset, size, err, err_size) != 0) return -1;
+  if(fixed_bytes) *fixed_bytes += size;
+  return 0;
+}
+
+int
+pfs_repair_ffpfsc_outer_slack(const char *path, uint64_t *fixed_bytes,
+                              char *err, size_t err_size) {
+  pfsc_image_t img;
+  int rc = -1;
+  const uint64_t superroot_block = 2ULL;
+  const uint64_t fpt_block = 3ULL;
+  const uint64_t collision_block = 4ULL;
+  const uint64_t uroot_block = 5ULL;
+  const uint64_t expected_file_block = 6ULL;
+  uint64_t superroot_used;
+  uint64_t root_used;
+  uint64_t tail_start;
+  uint64_t final_size;
+  uint64_t fixed = 0;
+
+  if(fixed_bytes) *fixed_bytes = 0;
+  if(!path || !path[0]) {
+    set_err(err, err_size, "bad repair path");
+    errno = EINVAL;
+    return -1;
+  }
+
+  memset(&img, 0, sizeof(img));
+  if(pfsc_open(path, 1, &img, err, err_size) != 0) {
+    return -1;
+  }
+
+  if(img.file_start != expected_file_block * PFS_BLOCK_SIZE) {
+    set_err(err, err_size, "unsupported outer PFS nested image offset");
+    errno = EINVAL;
+    goto done;
+  }
+  if(img.outer_size == 0 || img.outer_size % PFS_BLOCK_SIZE != 0) {
+    set_err(err, err_size, "unsupported outer PFS image size");
+    errno = EINVAL;
+    goto done;
+  }
+  final_size = img.outer_size;
+  if(img.stored_size > UINT64_MAX - img.file_start) {
+    set_err(err, err_size, "outer PFS payload size overflow");
+    errno = EOVERFLOW;
+    goto done;
+  }
+  tail_start = img.file_start + img.stored_size;
+  if(tail_start > final_size) {
+    set_err(err, err_size, "outer PFS payload exceeds image size");
+    errno = EINVAL;
+    goto done;
+  }
+
+  superroot_used = outer_dirent_span("flat_path_table") +
+                   outer_dirent_span("uroot");
+  root_used = outer_dirent_span(".") +
+              outer_dirent_span("..") +
+              outer_dirent_span(img.nested_name[0]
+                                    ? img.nested_name
+                                    : "pfs_image.dat");
+  if(superroot_used > PFS_BLOCK_SIZE || root_used > PFS_BLOCK_SIZE) {
+    set_err(err, err_size, "outer PFS directory metadata is too large");
+    errno = EINVAL;
+    goto done;
+  }
+
+  if(zero_outer_slack_range(img.fd,
+                            superroot_block * PFS_BLOCK_SIZE + superroot_used,
+                            PFS_BLOCK_SIZE - superroot_used,
+                            final_size, &fixed, err, err_size) != 0 ||
+     zero_outer_slack_range(img.fd, fpt_block * PFS_BLOCK_SIZE + 8ULL,
+                            PFS_BLOCK_SIZE - 8ULL,
+                            final_size, &fixed, err, err_size) != 0 ||
+     zero_outer_slack_range(img.fd, collision_block * PFS_BLOCK_SIZE,
+                            PFS_BLOCK_SIZE,
+                            final_size, &fixed, err, err_size) != 0 ||
+     zero_outer_slack_range(img.fd,
+                            uroot_block * PFS_BLOCK_SIZE + root_used,
+                            PFS_BLOCK_SIZE - root_used,
+                            final_size, &fixed, err, err_size) != 0 ||
+     zero_outer_slack_range(img.fd, tail_start, final_size - tail_start,
+                            final_size, &fixed, err, err_size) != 0) {
+    goto done;
+  }
+  if(fsync(img.fd) != 0) {
+    set_err(err, err_size, "sync outer PFS slack cleanup: %s",
+            strerror(errno));
+    goto done;
+  }
+  if(fixed_bytes) *fixed_bytes = fixed;
+  rc = 0;
+
+done:
+  pfsc_close(&img);
+  return rc;
+}
+
 static int
 pfsc_read_stored(const pfsc_image_t *img, uint64_t index,
                  unsigned char *stored, size_t *stored_len,

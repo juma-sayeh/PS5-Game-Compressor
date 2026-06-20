@@ -53,3 +53,5 @@ int pfs_repair_ffpfsc_scan_only(const char *path, pfs_repair_info_t *info,
                                 char *err, size_t err_size);
 int pfs_repair_ffpfsc_smoke_verify(const char *path, pfs_repair_info_t *info,
                                    char *err, size_t err_size);
+int pfs_repair_ffpfsc_outer_slack(const char *path, uint64_t *fixed_bytes,
+                                  char *err, size_t err_size);
