@@ -167,16 +167,20 @@ destination, and how to handle the original source.
 
 ### Format
 
-- `exFAT` is the default and recommended format. It creates an exFAT-backed
-  compressed image and is the preferred option for most games, especially APR
-  Emu workflows.
-- `PFS Experimental` creates a PFS-backed compressed image. Use it only when you
-  specifically want to test the PFS image path.
+`Compress` always produces a `.ffpfsc` file, which is a compressed PFS container.
+The format choice controls the nested image stored inside that compressed
+container:
+
+- `exFAT` is the default and recommended nested image format. It stores an exFAT
+  image inside the `.ffpfsc` output and is the preferred option for most games,
+  especially APR Emu workflows.
+- `PFS Experimental` stores a PFS image inside the `.ffpfsc` output. Use it only
+  when you specifically want to test the PFS nested-image path.
 
 ### Destination
 
-- `Compress in place` writes the compressed `.ffpfsc` next to the currently
-  selected game.
+- `Compress in place` writes the compressed `.ffpfsc` container next to the
+  currently selected game.
 - `Internal SSD` writes the compressed output under `/data/homebrew`. This is
   only shown when the selected game is not already on internal storage.
 - `External Storage` writes the compressed output to a selected USB/external
