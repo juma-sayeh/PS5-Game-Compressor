@@ -1296,6 +1296,15 @@ pfs_repair_ffpfsc_outer_slack(const char *path, uint64_t *fixed_bytes,
 
   memset(&img, 0, sizeof(img));
   if(pfsc_open(path, 1, &img, err, err_size) != 0) {
+    int open_errno = errno;
+    char detail[256];
+    snprintf(detail, sizeof(detail), "%s", err && err[0] ? err : "");
+    pfsc_close(&img);
+    if(open_errno == EINVAL || open_errno == ENOTSUP) {
+      return outer_not_applicable(
+          err, err_size, "%s",
+          detail[0] ? detail : "not a GameCompressor fixed .ffpfsc wrapper");
+    }
     return -1;
   }
 
