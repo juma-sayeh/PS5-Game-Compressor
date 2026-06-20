@@ -988,6 +988,18 @@ outer_inode_matches(const pfs_inode_info_t *ino, uint16_t mode,
 }
 
 static int
+outer_not_applicable(char *err, size_t err_size, const char *fmt, ...) {
+  if(err && err_size > 0) {
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(err, err_size, fmt, ap);
+    va_end(ap);
+  }
+  errno = ENOTSUP;
+  return PFS_REPAIR_OUTER_SLACK_NOT_APPLICABLE;
+}
+
+static int
 outer_dirent_match(const unsigned char *block, uint64_t off,
                    uint32_t inode, uint32_t type, const char *name,
                    uint64_t *next_out, char *err, size_t err_size) {
@@ -995,24 +1007,21 @@ outer_dirent_match(const unsigned char *block, uint64_t off,
   uint64_t span = outer_dirent_span(name);
   if(!block || !name || name_len == 0 || off > PFS_BLOCK_SIZE ||
      span > PFS_BLOCK_SIZE - off) {
-    set_err(err, err_size, "outer PFS directory entry is outside block");
-    errno = EINVAL;
-    return -1;
+    return outer_not_applicable(
+        err, err_size, "outer PFS directory entry is outside fixed wrapper");
   }
   if(rd32(block + off) != inode ||
      rd32(block + off + 4ULL) != type ||
      rd32(block + off + 8ULL) != (uint32_t)name_len ||
      rd32(block + off + 12ULL) != (uint32_t)span ||
      memcmp(block + off + 16ULL, name, name_len) != 0) {
-    set_err(err, err_size, "outer PFS directory does not match GameCompressor wrapper");
-    errno = EINVAL;
-    return -1;
+    return outer_not_applicable(
+        err, err_size, "outer PFS directory does not match GameCompressor wrapper");
   }
   for(uint64_t i = off + 16ULL + (uint64_t)name_len; i < off + span; i++) {
     if(block[i] != 0) {
-      set_err(err, err_size, "outer PFS directory entry padding is invalid");
-      errno = EINVAL;
-      return -1;
+      return outer_not_applicable(
+          err, err_size, "outer PFS directory entry padding is not fixed-wrapper zero padding");
     }
   }
   if(next_out) *next_out = off + span;
@@ -1055,9 +1064,8 @@ static int
 outer_verify_no_extra_dirent(const unsigned char *block, uint64_t used,
                              char *err, size_t err_size) {
   if(outer_tail_has_valid_dirent(block, used)) {
-    set_err(err, err_size, "outer PFS directory has unexpected entries");
-    errno = EINVAL;
-    return -1;
+    return outer_not_applicable(
+        err, err_size, "outer PFS directory has entries outside GameCompressor wrapper");
   }
   return 0;
 }
@@ -1079,13 +1087,14 @@ outer_verify_fixed_wrapper_dirs(int fd, const char *nested_name,
                    2ULL * PFS_BLOCK_SIZE, err, err_size) != 0) {
     goto done;
   }
-  if(outer_dirent_match(block, off, 1, PFS_DIRENT_TYPE_FILE,
-                        "flat_path_table", &off, err, err_size) != 0 ||
-     outer_dirent_match(block, off, 2, PFS_DIRENT_TYPE_DIRECTORY,
-                        "uroot", &off, err, err_size) != 0 ||
-     outer_verify_no_extra_dirent(block, off, err, err_size) != 0) {
-    goto done;
-  }
+  rc = outer_dirent_match(block, off, 1, PFS_DIRENT_TYPE_FILE,
+                          "flat_path_table", &off, err, err_size);
+  if(rc != 0) goto done;
+  rc = outer_dirent_match(block, off, 2, PFS_DIRENT_TYPE_DIRECTORY,
+                          "uroot", &off, err, err_size);
+  if(rc != 0) goto done;
+  rc = outer_verify_no_extra_dirent(block, off, err, err_size);
+  if(rc != 0) goto done;
   if(superroot_used_out) *superroot_used_out = off;
 
   off = 0;
@@ -1093,18 +1102,20 @@ outer_verify_fixed_wrapper_dirs(int fd, const char *nested_name,
                    5ULL * PFS_BLOCK_SIZE, err, err_size) != 0) {
     goto done;
   }
-  if(outer_dirent_match(block, off, 2, PFS_DIRENT_TYPE_DOT,
-                        ".", &off, err, err_size) != 0 ||
-     outer_dirent_match(block, off, 2, PFS_DIRENT_TYPE_DOTDOT,
-                        "..", &off, err, err_size) != 0 ||
-     outer_dirent_match(block, off, 3, PFS_DIRENT_TYPE_FILE,
-                        nested_name && nested_name[0]
-                          ? nested_name
-                          : "pfs_image.dat",
-                        &off, err, err_size) != 0 ||
-     outer_verify_no_extra_dirent(block, off, err, err_size) != 0) {
-    goto done;
-  }
+  rc = outer_dirent_match(block, off, 2, PFS_DIRENT_TYPE_DOT,
+                          ".", &off, err, err_size);
+  if(rc != 0) goto done;
+  rc = outer_dirent_match(block, off, 2, PFS_DIRENT_TYPE_DOTDOT,
+                          "..", &off, err, err_size);
+  if(rc != 0) goto done;
+  rc = outer_dirent_match(block, off, 3, PFS_DIRENT_TYPE_FILE,
+                          nested_name && nested_name[0]
+                            ? nested_name
+                            : "pfs_image.dat",
+                          &off, err, err_size);
+  if(rc != 0) goto done;
+  rc = outer_verify_no_extra_dirent(block, off, err, err_size);
+  if(rc != 0) goto done;
   if(root_used_out) *root_used_out = off;
   rc = 0;
 
@@ -1158,8 +1169,8 @@ outer_verify_gamecompressor_wrapper(const pfsc_image_t *img,
      final_ndblock == 0 ||
      final_ndblock > UINT64_MAX / PFS_BLOCK_SIZE ||
      final_ndblock * PFS_BLOCK_SIZE != img->outer_size) {
-    set_err(err, err_size, "not a GameCompressor fixed .ffpfsc wrapper");
-    errno = EINVAL;
+    rc = outer_not_applicable(
+        err, err_size, "not a GameCompressor fixed .ffpfsc wrapper");
     goto done;
   }
 
@@ -1168,8 +1179,8 @@ outer_verify_gamecompressor_wrapper(const pfsc_image_t *img,
   }
   file_blocks = ceil_div_u64(img->stored_size, PFS_BLOCK_SIZE);
   if(file_blocks == 0 || file_blocks > UINT32_MAX) {
-    set_err(err, err_size, "outer PFS nested file block count is unsupported");
-    errno = EINVAL;
+    rc = outer_not_applicable(
+        err, err_size, "outer PFS nested file block count is not fixed-wrapper compatible");
     goto done;
   }
   if(!outer_inode_matches(&ino[0],
@@ -1189,16 +1200,16 @@ outer_verify_gamecompressor_wrapper(const pfsc_image_t *img,
                           PFS_INODE_FLAG_READONLY | PFS_INODE_FLAG_COMPRESSED,
                           img->stored_size, img->nested_size,
                           (uint32_t)file_blocks, 6)) {
-    set_err(err, err_size, "outer PFS inodes do not match GameCompressor wrapper");
-    errno = EINVAL;
+    rc = outer_not_applicable(
+        err, err_size, "outer PFS inodes do not match GameCompressor wrapper");
     goto done;
   }
 
   int n = snprintf(nested_path, sizeof(nested_path), "/%s",
                    img->nested_name[0] ? img->nested_name : "pfs_image.dat");
   if(n < 0 || (size_t)n >= sizeof(nested_path)) {
-    set_err(err, err_size, "nested image name too long");
-    errno = ENAMETOOLONG;
+    rc = outer_not_applicable(
+        err, err_size, "nested image name is too long for fixed-wrapper cleanup");
     goto done;
   }
   if(read_exact_at(img->fd, fpt, sizeof(fpt), 3ULL * PFS_BLOCK_SIZE,
@@ -1207,13 +1218,14 @@ outer_verify_gamecompressor_wrapper(const pfsc_image_t *img,
   }
   if(rd32(fpt + 0) != outer_pfs_hash_path(nested_path) ||
      rd32(fpt + 4) != 3U) {
-    set_err(err, err_size, "outer PFS flat path table does not match GameCompressor wrapper");
-    errno = EINVAL;
+    rc = outer_not_applicable(
+        err, err_size, "outer PFS flat path table does not match GameCompressor wrapper");
     goto done;
   }
-  if(outer_verify_fixed_wrapper_dirs(img->fd, img->nested_name,
-                                     superroot_used_out, root_used_out,
-                                     err, err_size) != 0) {
+  rc = outer_verify_fixed_wrapper_dirs(img->fd, img->nested_name,
+                                       superroot_used_out, root_used_out,
+                                       err, err_size);
+  if(rc != 0) {
     goto done;
   }
   rc = 0;
@@ -1273,6 +1285,7 @@ pfs_repair_ffpfsc_outer_slack(const char *path, uint64_t *fixed_bytes,
   uint64_t tail_start;
   uint64_t final_size;
   uint64_t fixed = 0;
+  int verify_rc = 0;
 
   if(fixed_bytes) *fixed_bytes = 0;
   if(!path || !path[0]) {
@@ -1287,13 +1300,13 @@ pfs_repair_ffpfsc_outer_slack(const char *path, uint64_t *fixed_bytes,
   }
 
   if(img.file_start != expected_file_block * PFS_BLOCK_SIZE) {
-    set_err(err, err_size, "unsupported outer PFS nested image offset");
-    errno = EINVAL;
+    rc = outer_not_applicable(
+        err, err_size, "outer PFS nested image offset is not GameCompressor fixed-wrapper layout");
     goto done;
   }
   if(img.outer_size == 0 || img.outer_size % PFS_BLOCK_SIZE != 0) {
-    set_err(err, err_size, "unsupported outer PFS image size");
-    errno = EINVAL;
+    rc = outer_not_applicable(
+        err, err_size, "outer PFS image size is not fixed-wrapper compatible");
     goto done;
   }
   final_size = img.outer_size;
@@ -1309,8 +1322,10 @@ pfs_repair_ffpfsc_outer_slack(const char *path, uint64_t *fixed_bytes,
     goto done;
   }
 
-  if(outer_verify_gamecompressor_wrapper(&img, &superroot_used, &root_used,
-                                         err, err_size) != 0) {
+  verify_rc = outer_verify_gamecompressor_wrapper(&img, &superroot_used,
+                                                  &root_used, err, err_size);
+  if(verify_rc != 0) {
+    rc = verify_rc;
     goto done;
   }
   if(superroot_used > PFS_BLOCK_SIZE || root_used > PFS_BLOCK_SIZE) {

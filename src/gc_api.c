@@ -8209,6 +8209,7 @@ run_validate_repair_op(gc_operation_t *op) {
   uint64_t free_bytes = 0;
   uint64_t outer_fixed_bytes = 0;
   size_t hidden_count = 0;
+  int slack_rc = 0;
   int mount_missed = 0;
 
   memset(hidden, 0, sizeof(hidden));
@@ -8244,17 +8245,26 @@ run_validate_repair_op(gc_operation_t *op) {
          (unsigned long long)free_bytes,
          game.validation_status);
   gc_checkpoint("validate outer slack cleanup");
-  if(pfs_repair_ffpfsc_outer_slack(repair_path, &outer_fixed_bytes,
-                                   err, sizeof(err)) != 0) {
+  err[0] = 0;
+  slack_rc = pfs_repair_ffpfsc_outer_slack(repair_path, &outer_fixed_bytes,
+                                           err, sizeof(err));
+  if(slack_rc < 0) {
     snprintf(op->error, sizeof(op->error), "%s",
              err[0] ? err : "outer PFS slack cleanup failed");
     gc_log("validate outer slack cleanup failed title=%s err=%s",
            op->title_id, op->error);
     return -1;
   }
-  gc_log("validate outer slack cleanup title=%s path=%s bytes=%llu",
-         op->title_id, repair_path ? repair_path : "",
-         (unsigned long long)outer_fixed_bytes);
+  if(slack_rc == PFS_REPAIR_OUTER_SLACK_NOT_APPLICABLE) {
+    gc_log("validate outer slack cleanup skipped title=%s path=%s reason=%s",
+           op->title_id, repair_path ? repair_path : "",
+           err[0] ? err : "not applicable");
+    err[0] = 0;
+  } else {
+    gc_log("validate outer slack cleanup title=%s path=%s bytes=%llu",
+           op->title_id, repair_path ? repair_path : "",
+           (unsigned long long)outer_fixed_bytes);
+  }
   if(mount_selected_instance_hidden_exclusive(
          op, &game, hidden, GC_MAX_GAMES, &hidden_count, &mount_missed,
          err, sizeof(err)) != 0) {

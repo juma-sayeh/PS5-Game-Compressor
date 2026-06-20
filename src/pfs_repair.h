@@ -46,6 +46,7 @@ typedef struct pfs_repair_info {
 #define PFS_REPAIR_MODE_INPLACE 1
 #define PFS_REPAIR_MODE_COPY_REPLACE 2
 #define PFS_REPAIR_SCAN_REPAIR_NEEDED 2
+#define PFS_REPAIR_OUTER_SLACK_NOT_APPLICABLE 1
 
 int pfs_repair_ffpfsc_auto(const char *path, pfs_repair_info_t *info,
                            char *err, size_t err_size);
