@@ -1224,9 +1224,8 @@ done:
 }
 
 static int
-pfs_nested_read_inode(pfs_nested_reader_t *nr, uint32_t inode_num,
-                      pfs_inode_info_t *ino, char *err, size_t err_size) {
-  unsigned char raw[PFS_INODE_SIZE];
+pfs_nested_inode_offset(pfs_nested_reader_t *nr, uint32_t inode_num,
+                        uint64_t *off_out, char *err, size_t err_size) {
   if((uint64_t)inode_num >= nr->inode_count) {
     set_err(err, err_size, "inode outside table");
     errno = EINVAL;
@@ -1240,8 +1239,21 @@ pfs_nested_read_inode(pfs_nested_reader_t *nr, uint32_t inode_num,
     errno = EINVAL;
     return -1;
   }
-  uint64_t off = PFS_BLOCK_SIZE + inode_block * nr->block_size +
-                 inode_index * PFS_INODE_SIZE;
+  if(off_out) {
+    *off_out = PFS_BLOCK_SIZE + inode_block * nr->block_size +
+               inode_index * PFS_INODE_SIZE;
+  }
+  return 0;
+}
+
+static int
+pfs_nested_read_inode(pfs_nested_reader_t *nr, uint32_t inode_num,
+                      pfs_inode_info_t *ino, char *err, size_t err_size) {
+  unsigned char raw[PFS_INODE_SIZE];
+  uint64_t off = 0;
+  if(pfs_nested_inode_offset(nr, inode_num, &off, err, err_size) != 0) {
+    return -1;
+  }
   if(pfsc_reader_read(&nr->pfsc, off, raw, sizeof(raw), err, err_size) != 0) {
     return -1;
   }
@@ -1352,6 +1364,212 @@ pfs_find_child_inode(pfs_nested_reader_t *nr, uint32_t dir_inode_num,
   set_err(err, err_size, "PFS superroot missing uroot");
   errno = EINVAL;
   return -1;
+}
+
+static int
+pfs_nested_open_uroot(const char *path, pfs_nested_reader_t *nr,
+                      char *err, size_t err_size) {
+  if(pfs_nested_open(path, nr, 0, err, err_size) != 0) {
+    return -1;
+  }
+  if(pfs_find_child_inode(nr, 0, "uroot", PFS_DIRENT_TYPE_DIRECTORY,
+                          &nr->uroot_inode, err, err_size) != 0) {
+    pfs_nested_close(nr);
+    return -1;
+  }
+  return 0;
+}
+
+static int
+pfs_nested_find_path_inode(pfs_nested_reader_t *nr, const char *rel,
+                           uint32_t *inode_out,
+                           char *err, size_t err_size) {
+  const char *p = rel;
+  uint32_t current;
+
+  if(!nr || !rel || !rel[0] || rel[0] == '/' || !inode_out) {
+    set_err(err, err_size, "bad nested PFS path");
+    errno = EINVAL;
+    return -1;
+  }
+  current = nr->uroot_inode;
+  while(*p) {
+    const char *slash = strchr(p, '/');
+    size_t len = slash ? (size_t)(slash - p) : strlen(p);
+    uint32_t child = 0;
+    uint32_t type = slash ? PFS_DIRENT_TYPE_DIRECTORY : PFS_DIRENT_TYPE_FILE;
+    char segment[256];
+    if(len == 0 || len >= sizeof(segment)) {
+      set_err(err, err_size, "bad nested PFS path segment");
+      errno = EINVAL;
+      return -1;
+    }
+    memcpy(segment, p, len);
+    segment[len] = 0;
+    if(!path_segment_supported(segment)) {
+      set_err(err, err_size, "unsafe nested PFS path segment");
+      errno = EINVAL;
+      return -1;
+    }
+    if(pfs_find_child_inode(nr, current, segment, type, &child,
+                            err, err_size) != 0) {
+      return -1;
+    }
+    current = child;
+    if(!slash) {
+      *inode_out = current;
+      return 0;
+    }
+    p = slash + 1;
+  }
+  set_err(err, err_size, "bad nested PFS path");
+  errno = EINVAL;
+  return -1;
+}
+
+static int
+pfs_nested_lookup_file(pfs_nested_reader_t *nr, const char *rel,
+                       uint32_t *inode_num_out,
+                       pfs_inode_info_t *ino_out,
+                       uint64_t *inode_offset_out,
+                       char *err, size_t err_size) {
+  uint32_t inode_num = 0;
+  pfs_inode_info_t ino;
+  uint64_t inode_offset = 0;
+
+  if(pfs_nested_find_path_inode(nr, rel, &inode_num, err, err_size) != 0 ||
+     pfs_nested_read_inode(nr, inode_num, &ino, err, err_size) != 0 ||
+     pfs_nested_inode_offset(nr, inode_num, &inode_offset,
+                             err, err_size) != 0) {
+    return -1;
+  }
+  if((ino.mode & PFS_INODE_MODE_FILE) == 0 ||
+     (ino.flags & PFS_INODE_FLAG_COMPRESSED) != 0) {
+    set_err(err, err_size, "nested PFS AMPR file is not a plain file");
+    errno = EINVAL;
+    return -1;
+  }
+  if(inode_num_out) *inode_num_out = inode_num;
+  if(ino_out) *ino_out = ino;
+  if(inode_offset_out) *inode_offset_out = inode_offset;
+  return 0;
+}
+
+int
+pfs_decompress_find_nested_pfs_file_span(
+    const char *path, const char *const *rels, size_t rel_count,
+    pfs_nested_pfs_file_span_t *span, char *err, size_t err_size) {
+  pfs_nested_reader_t nr;
+  int opened = 0;
+  int rc = -1;
+
+  if(err && err_size) err[0] = 0;
+  memset(&nr, 0, sizeof(nr));
+  if(!path || !rels || rel_count == 0 || !span) {
+    set_err(err, err_size, "bad nested PFS span input");
+    errno = EINVAL;
+    return -1;
+  }
+  memset(span, 0, sizeof(*span));
+  if(pfs_nested_open_uroot(path, &nr, err, err_size) != 0) {
+    return -1;
+  }
+  opened = 1;
+  for(size_t i = 0; i < rel_count; i++) {
+    const char *rel = rels[i];
+    pfs_inode_info_t ino;
+    uint32_t inode_num = 0;
+    uint64_t inode_offset = 0;
+    uint64_t physical_blocks;
+    char local_err[256] = {0};
+
+    if(!rel || !rel[0]) continue;
+    if(pfs_nested_lookup_file(&nr, rel, &inode_num, &ino, &inode_offset,
+                              local_err, sizeof(local_err)) != 0) {
+      continue;
+    }
+    physical_blocks = ino.blocks ? ino.blocks :
+        ceil_div_u64(ino.size, PFS_BLOCK_SIZE);
+    if((physical_blocks > 0 && ino.db0 < 0) ||
+       physical_blocks > UINT32_MAX ||
+       physical_blocks > UINT64_MAX / PFS_BLOCK_SIZE) {
+      set_err(err, err_size, "invalid nested PFS AMPR file allocation");
+      errno = EINVAL;
+      goto done;
+    }
+    snprintf(span->rel, sizeof(span->rel), "%s", rel);
+    span->inode_num = inode_num;
+    span->inode_offset = inode_offset;
+    span->data_offset = (uint64_t)ino.db0 * PFS_BLOCK_SIZE;
+    span->size = ino.size;
+    span->allocated_size = physical_blocks * PFS_BLOCK_SIZE;
+    span->first_block = (uint32_t)ino.db0;
+    span->blocks = (uint32_t)physical_blocks;
+    rc = 0;
+    goto done;
+  }
+  set_err(err, err_size, "AMPR binary was not found in nested PFS image");
+  errno = ENOENT;
+
+done:
+  if(opened) pfs_nested_close(&nr);
+  return rc;
+}
+
+int
+pfs_decompress_read_nested_pfs_file(const char *path, const char *rel,
+                                    size_t max_size,
+                                    unsigned char **out, size_t *out_size,
+                                    char *err, size_t err_size) {
+  pfs_nested_reader_t nr;
+  pfs_inode_info_t ino;
+  uint32_t inode_num = 0;
+  unsigned char *buf = NULL;
+  int opened = 0;
+  int rc = -1;
+
+  if(err && err_size) err[0] = 0;
+  if(out) *out = NULL;
+  if(out_size) *out_size = 0;
+  memset(&nr, 0, sizeof(nr));
+  if(!path || !rel || !out || !out_size) {
+    set_err(err, err_size, "bad nested PFS read input");
+    errno = EINVAL;
+    return -1;
+  }
+  if(pfs_nested_open_uroot(path, &nr, err, err_size) != 0) {
+    return -1;
+  }
+  opened = 1;
+  if(pfs_nested_lookup_file(&nr, rel, &inode_num, &ino, NULL,
+                            err, err_size) != 0) {
+    goto done;
+  }
+  (void)inode_num;
+  if(ino.size > max_size || ino.size > SIZE_MAX) {
+    set_err(err, err_size, "nested PFS file is larger than expected");
+    errno = EINVAL;
+    goto done;
+  }
+  buf = malloc((size_t)ino.size ? (size_t)ino.size : 1);
+  if(!buf) {
+    set_err(err, err_size, "out of memory");
+    errno = ENOMEM;
+    goto done;
+  }
+  if(pfs_nested_read_inode_data(&nr, &ino, 0, buf, (size_t)ino.size,
+                                err, err_size) != 0) {
+    goto done;
+  }
+  *out = buf;
+  *out_size = (size_t)ino.size;
+  buf = NULL;
+  rc = 0;
+
+done:
+  free(buf);
+  if(opened) pfs_nested_close(&nr);
+  return rc;
 }
 
 static int pfs_extract_file(pfs_nested_reader_t *nr, uint32_t inode_num,

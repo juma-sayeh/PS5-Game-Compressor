@@ -31,6 +31,12 @@ typedef struct ampr_hash_slot {
   uint32_t flags;
 } ampr_hash_slot_t;
 
+typedef struct ampr_mem_buf {
+  unsigned char *data;
+  size_t len;
+  size_t cap;
+} ampr_mem_buf_t;
+
 static void
 ampr_set_err(char *err, size_t err_size, const char *fmt, ...) {
   if(!err || err_size == 0 || err[0]) return;
@@ -72,8 +78,7 @@ ampr_rel_is_root_index(const char *rel) {
 
 static int
 ampr_rel_is_marker(const char *rel) {
-  return ampr_ascii_eq_ci(rel, "ampr_emu.index") ||
-         ampr_ascii_eq_ci(rel, "fakelib/libSceAmpr.sprx") ||
+  return ampr_ascii_eq_ci(rel, "fakelib/libSceAmpr.sprx") ||
          ampr_ascii_eq_ci(rel, "fakelib/libSceAmpr.prx") ||
          ampr_ascii_eq_ci(rel, "sce_module/libSceAmpr.sprx") ||
          ampr_ascii_eq_ci(rel, "sce_module/libSceAmpr.prx");
@@ -186,6 +191,66 @@ ampr_write_full(int fd, const void *buf, size_t len) {
   return 0;
 }
 
+static void
+ampr_mem_buf_free(ampr_mem_buf_t *b) {
+  if(!b) return;
+  free(b->data);
+  memset(b, 0, sizeof(*b));
+}
+
+static int
+ampr_mem_buf_reserve(ampr_mem_buf_t *b, size_t extra, char *err,
+                     size_t err_size) {
+  if(!b || extra > SIZE_MAX - b->len) {
+    ampr_set_err(err, err_size, "AMPR index is too large");
+    errno = EOVERFLOW;
+    return -1;
+  }
+  size_t need = b->len + extra;
+  if(need <= b->cap) return 0;
+  size_t next = b->cap ? b->cap : 4096;
+  while(next < need) {
+    if(next > SIZE_MAX / 2) {
+      next = need;
+      break;
+    }
+    next *= 2;
+  }
+  unsigned char *p = (unsigned char *)realloc(b->data, next);
+  if(!p) {
+    ampr_set_err(err, err_size, "out of memory");
+    errno = ENOMEM;
+    return -1;
+  }
+  b->data = p;
+  b->cap = next;
+  return 0;
+}
+
+static int
+ampr_mem_buf_append(ampr_mem_buf_t *b, const void *data, size_t size,
+                    char *err, size_t err_size) {
+  if(size == 0) return 0;
+  if(!data) {
+    errno = EINVAL;
+    return -1;
+  }
+  if(ampr_mem_buf_reserve(b, size, err, err_size) != 0) return -1;
+  memcpy(b->data + b->len, data, size);
+  b->len += size;
+  return 0;
+}
+
+static int
+ampr_mem_buf_append_zero(ampr_mem_buf_t *b, size_t size, char *err,
+                         size_t err_size) {
+  if(size == 0) return 0;
+  if(ampr_mem_buf_reserve(b, size, err, err_size) != 0) return -1;
+  memset(b->data + b->len, 0, size);
+  b->len += size;
+  return 0;
+}
+
 static int
 ampr_build_hash_slots(const ampr_row_t *rows, size_t count,
                       ampr_hash_slot_t **slots_out, uint32_t *slot_count_out,
@@ -234,6 +299,118 @@ ampr_build_hash_slots(const ampr_row_t *rows, size_t count,
   *slot_count_out = slot_count;
   if(stats) stats->hash_slots = slot_count;
   return 0;
+}
+
+static int
+ampr_build_index_memory_from_rows(const ampr_row_t *rows, size_t count,
+                                  unsigned char **out, size_t *out_size,
+                                  ampr_index_stats_t *stats,
+                                  char *err, size_t err_size) {
+  const size_t header_size = 48;
+  size_t records_size;
+  size_t path_blob_size = 0;
+  size_t path_end;
+  size_t hash_offset;
+  size_t padding_size;
+  unsigned char header[48];
+  unsigned char record[24];
+  unsigned char slot_buf[16];
+  ampr_hash_slot_t *slots = NULL;
+  uint32_t slot_count = 0;
+  ampr_mem_buf_t b = {0};
+  int rc = -1;
+
+  if(out) *out = NULL;
+  if(out_size) *out_size = 0;
+  if(!out || !out_size || count == 0 || count > 0x7fffffffU) {
+    ampr_set_err(err, err_size, "invalid AMPR index entry count");
+    errno = EINVAL;
+    return -1;
+  }
+  if(count > (SIZE_MAX / AMPR_INDEX_RECORD_SIZE)) {
+    ampr_set_err(err, err_size, "AMPR index is too large");
+    errno = EOVERFLOW;
+    return -1;
+  }
+  records_size = count * AMPR_INDEX_RECORD_SIZE;
+  for(size_t i = 0; i < count; i++) {
+    size_t path_len = strlen(rows[i].path);
+    if(path_len > 0xffffffffULL ||
+       path_blob_size > 0xffffffffULL - path_len - 1ULL) {
+      ampr_set_err(err, err_size, "AMPR index path blob is too large");
+      errno = EOVERFLOW;
+      return -1;
+    }
+    path_blob_size += path_len + 1;
+  }
+  path_end = header_size + records_size + path_blob_size;
+  hash_offset = (path_end + (AMPR_INDEX_HASH_SLOT_SIZE - 1U)) &
+                ~(size_t)(AMPR_INDEX_HASH_SLOT_SIZE - 1U);
+  padding_size = hash_offset - path_end;
+
+  if(ampr_build_hash_slots(rows, count, &slots, &slot_count, stats, err,
+                           err_size) != 0) {
+    return -1;
+  }
+
+  memset(header, 0, sizeof(header));
+  memcpy(header, AMPR_INDEX_MAGIC, 8);
+  ampr_put_le32(header + 8, AMPR_INDEX_VERSION);
+  ampr_put_le32(header + 12, AMPR_INDEX_RECORD_SIZE);
+  ampr_put_le64(header + 16, (uint64_t)count);
+  ampr_put_le64(header + 24, (uint64_t)path_blob_size);
+  ampr_put_le64(header + 32, (uint64_t)hash_offset);
+  ampr_put_le32(header + 40, AMPR_INDEX_HASH_SLOT_SIZE);
+  ampr_put_le32(header + 44, slot_count);
+  if(ampr_mem_buf_append(&b, header, sizeof(header), err, err_size) != 0) {
+    goto done;
+  }
+
+  uint32_t path_offset = 0;
+  for(size_t i = 0; i < count; i++) {
+    size_t path_len = strlen(rows[i].path);
+    memset(record, 0, sizeof(record));
+    ampr_put_le32(record + 0, path_offset);
+    ampr_put_le32(record + 4, (uint32_t)path_len);
+    ampr_put_le64(record + 8, rows[i].size);
+    ampr_put_le64(record + 16, (uint64_t)rows[i].mtime);
+    if(ampr_mem_buf_append(&b, record, sizeof(record), err, err_size) != 0) {
+      goto done;
+    }
+    path_offset += (uint32_t)path_len + 1U;
+  }
+  for(size_t i = 0; i < count; i++) {
+    size_t path_len = strlen(rows[i].path) + 1;
+    if(ampr_mem_buf_append(&b, rows[i].path, path_len, err, err_size) != 0) {
+      goto done;
+    }
+  }
+  if(ampr_mem_buf_append_zero(&b, padding_size, err, err_size) != 0) {
+    goto done;
+  }
+  for(uint32_t i = 0; i < slot_count; i++) {
+    memset(slot_buf, 0, sizeof(slot_buf));
+    ampr_put_le64(slot_buf + 0, slots[i].hash);
+    ampr_put_le32(slot_buf + 8, slots[i].index_plus_one);
+    ampr_put_le32(slot_buf + 12, slots[i].flags);
+    if(ampr_mem_buf_append(&b, slot_buf, sizeof(slot_buf), err,
+                           err_size) != 0) {
+      goto done;
+    }
+  }
+  if(stats) {
+    stats->indexed_files = count;
+    stats->output_size = (uint64_t)b.len;
+  }
+  *out = b.data;
+  *out_size = b.len;
+  memset(&b, 0, sizeof(b));
+  rc = 0;
+
+done:
+  ampr_mem_buf_free(&b);
+  free(slots);
+  return rc;
 }
 
 static int
@@ -458,6 +635,75 @@ ampr_index_build_from_entries(const char *root,
     goto done;
   }
   rc = 0;
+
+done:
+  free(rows);
+  return rc;
+}
+
+int
+ampr_index_build_to_memory(const ampr_index_entry_t *entries,
+                           size_t count,
+                           int allow_case_collisions,
+                           unsigned char **out,
+                           size_t *out_size,
+                           ampr_index_stats_t *stats,
+                           char *err,
+                           size_t err_size) {
+  ampr_row_t *rows = NULL;
+  size_t row_count = 0;
+  size_t row_cap = 0;
+  int rc = -1;
+
+  if(out) *out = NULL;
+  if(out_size) *out_size = 0;
+  if(stats) memset(stats, 0, sizeof(*stats));
+  if(!entries || !out || !out_size) {
+    ampr_set_err(err, err_size, "bad AMPR index input");
+    errno = EINVAL;
+    return -1;
+  }
+
+  for(size_t i = 0; i < count; i++) {
+    char app0_path[1024];
+    const char *rel = entries[i].rel ? entries[i].rel : "";
+    if(ampr_rel_is_root_index(rel)) continue;
+    if(snprintf(app0_path, sizeof(app0_path), "/app0/%s", rel) >=
+       (int)sizeof(app0_path)) {
+      ampr_set_err(err, err_size, "AMPR index path too long");
+      errno = ENAMETOOLONG;
+      goto done;
+    }
+    if(ampr_append_row(&rows, &row_count, &row_cap, entries[i].size,
+                       entries[i].mtime, app0_path, err, err_size) != 0) {
+      goto done;
+    }
+  }
+  if(row_count == 0) {
+    ampr_set_err(err, err_size, "AMPR index has no files");
+    errno = EINVAL;
+    goto done;
+  }
+  qsort(rows, row_count, sizeof(rows[0]), ampr_row_cmp);
+  size_t out_rows = 0;
+  for(size_t i = 0; i < row_count; i++) {
+    if(out_rows > 0 &&
+       ampr_ascii_casecmp(rows[out_rows - 1].path, rows[i].path) == 0) {
+      if(!allow_case_collisions) {
+        ampr_set_err(err, err_size,
+                     "AMPR index case-insensitive path collision: %s <-> %s",
+                     rows[out_rows - 1].path, rows[i].path);
+        errno = EEXIST;
+        goto done;
+      }
+      continue;
+    }
+    if(out_rows != i) rows[out_rows] = rows[i];
+    out_rows++;
+  }
+  row_count = out_rows;
+  rc = ampr_build_index_memory_from_rows(rows, row_count, out, out_size,
+                                         stats, err, err_size);
 
 done:
   free(rows);

@@ -34,3 +34,12 @@ int ampr_index_build_from_entries(const char *root,
                                   ampr_index_stats_t *stats,
                                   char *err,
                                   size_t err_size);
+
+int ampr_index_build_to_memory(const ampr_index_entry_t *entries,
+                               size_t count,
+                               int allow_case_collisions,
+                               unsigned char **out,
+                               size_t *out_size,
+                               ampr_index_stats_t *stats,
+                               char *err,
+                               size_t err_size);

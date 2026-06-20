@@ -1,5 +1,74 @@
 # Changelog
 
+## 1.0.2 - 2026-06-20
+
+Compared PR #20 (`new_release_items`) against `origin/main` / `v1.0.1`.
+
+Full release notes: [RELEASE_NOTES_1.0.2.md](RELEASE_NOTES_1.0.2.md).
+
+### Added
+
+- Added APR-EMU version management for titles that include `libSceAmpr.sprx`.
+  Game Compressor can discover the current APR-EMU binary, cache known versions,
+  download the latest manifest version, upload a custom `.sprx`/`.prx`, apply a
+  selected version, and restore the original title-provided binary when a backup
+  is available.
+- Added APR-EMU hot-swap support for direct `.exfat` images and compressed
+  `.ffpfsc` images. Updates can patch compatible images in place, grow image
+  tail space when needed, rebuild compressed images when required, and verify the
+  mounted APR-EMU hash after the update.
+- Added exFAT image APR indexing support that can insert or refresh
+  `ampr_emu.index` directly inside `.exfat` and compressed exFAT-backed
+  `.ffpfsc` images.
+- Added AMPR hot-swap layout metadata during image creation and compression so
+  APR-EMU binaries, indexes, exFAT metadata, and related payload files are
+  placed in update-friendly raw/tail regions.
+- Added browser-friendly title icon thumbnails served through `/api/gc/icon`,
+  with cached resized PNGs for the library and full-size icons for selected
+  titles.
+- Added persistent UI color-mode settings with light/dark mode controls, a
+  backend settings file, and a browser cookie so the selected theme is applied
+  before the page finishes loading.
+- Added app version display in the sidebar and About dialog using the runtime
+  `/api/status` version.
+
+### Changed
+
+- Compression now defaults to raw storage for executable payload blocks and
+  broadens executable detection to include `iboot*.bin`, `.self`, `.elf`,
+  `.dll`, and `.so` files in addition to existing executable formats.
+- Compression layout planning now keeps AMPR-related files and exFAT structures
+  in raw regions when hot-swap optimization is enabled, improving future
+  APR-EMU update compatibility.
+- AMPR index generation can now build the index in memory as well as on disk,
+  allowing image patchers to inject the generated index without staging a folder
+  file first.
+- Validation progress reporting now includes richer copied-byte/block progress
+  and ETA data for long validation and mounted-scan phases.
+- The web UI now treats APR-EMU update as a first-class primary action when a
+  newer cached/latest version is available, while keeping normal title actions
+  accessible from the secondary menu.
+- The About dialog and terminate controls were cleaned up, and the launcher
+  install path was simplified to always refresh the home tile assets without
+  extra file-diff probing or install notifications.
+
+### Fixed
+
+- Fixed APR-EMU update flows so Game Compressor records selected versions by
+  title/source, saves verified original binaries before replacement, and avoids
+  repeatedly flagging intentionally selected cached or custom versions as stale.
+- Fixed compressed-image AMPR patching by verifying nested PFS file allocation,
+  rejecting oversized replacements with clear recompress guidance, and using a
+  rebuild path when in-place patching is not possible.
+- Fixed direct exFAT AMPR patching by rejecting fragmented target allocations,
+  updating directory entries/FAT/bitmap state consistently, and verifying the
+  final binary or index contents after patching.
+- Fixed UI feedback for APR-EMU operations, including update-needed chips,
+  installed/latest/custom version labels, operation history labels, failure
+  messages, and progress states.
+- Fixed dark-mode coverage for chips, modals, menus, buttons, notices, progress
+  panels, and selected rows.
+
 ## 1.0.1 - 2026-06-18
 
 Compared `new_release_items` against `v1.0.0`.

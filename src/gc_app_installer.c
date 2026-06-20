@@ -200,29 +200,6 @@ write_file(const char *path, const uint8_t *data, size_t size) {
 }
 
 static int
-file_differs(const char *path, const uint8_t *expected, size_t expected_size) {
-  struct stat st;
-  if(stat(path, &st) != 0) return 1;
-  if(st.st_size < 0 || (size_t)st.st_size != expected_size) return 1;
-
-  FILE *file = fopen(path, "rb");
-  if(!file) return 1;
-
-  uint8_t *actual = malloc(expected_size ? expected_size : 1);
-  if(!actual) {
-    fclose(file);
-    return 1;
-  }
-
-  size_t read = fread(actual, 1, expected_size, file);
-  fclose(file);
-
-  int differs = read != expected_size || memcmp(actual, expected, expected_size);
-  free(actual);
-  return differs;
-}
-
-static int
 ensure_data_dir(void) {
   if(mkdir_if_needed(GC_DATA_ROOT) != 0) return -1;
   return mkdir_if_needed(GC_DATA_DIR);
@@ -299,7 +276,6 @@ gc_install_app_if_needed(void) {
   char sce_sys_dir[256];
   char param_path[256];
   char icon_path[256];
-  struct stat st;
 
   resolve_appinst(&api);
 
@@ -312,21 +288,6 @@ gc_install_app_if_needed(void) {
   snprintf(sce_sys_dir, sizeof(sce_sys_dir), "%s/sce_sys", app_dir);
   snprintf(param_path, sizeof(param_path), "%s/param.json", sce_sys_dir);
   snprintf(icon_path, sizeof(icon_path), "%s/icon0.png", sce_sys_dir);
-
-  int app_exists = stat(app_dir, &st) == 0;
-  int assets_changed = !app_exists ||
-                       file_differs(param_path, gc_launcher_param_json,
-                                    gc_launcher_param_json_size) ||
-                       file_differs(icon_path, gc_launcher_icon0_png,
-                                    gc_launcher_icon0_png_size) ||
-                       file_differs(GC_MARKER_PATH, g_install_marker,
-                                    sizeof(g_install_marker) - 1);
-
-  if(app_exists && assets_changed) {
-    gc_notify_message("Updating home tile", NULL);
-  } else if(!app_exists) {
-    gc_notify_message("Installing home tile", NULL);
-  }
 
   if(!api.initialize) {
     gc_log("launcher install AppInst initialize missing");
@@ -381,7 +342,6 @@ gc_install_app_if_needed(void) {
            GC_MARKER_PATH, errno);
   }
 
-  gc_notify_message("Home tile installed", NULL);
   return 1;
 }
 

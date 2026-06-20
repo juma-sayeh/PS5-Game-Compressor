@@ -31,6 +31,7 @@ typedef struct pfs_app_info {
   uint64_t scan_elapsed_ms;
   uint64_t scan_workers;
   int apr_indexed;
+  int ampr_hot_swap_optimized;
 } pfs_app_info_t;
 
 typedef struct pfs_compress_plan pfs_compress_plan_t;
@@ -44,6 +45,17 @@ typedef struct pfs_decompress_info {
   int  delete_policy;
   int  output_exists;
 } pfs_decompress_info_t;
+
+typedef struct pfs_nested_pfs_file_span {
+  char rel[1024];
+  uint32_t inode_num;
+  uint64_t inode_offset;
+  uint64_t data_offset;
+  uint64_t size;
+  uint64_t allocated_size;
+  uint32_t first_block;
+  uint32_t blocks;
+} pfs_nested_pfs_file_span_t;
 
 #define PFS_COMPRESS_FORMAT_PFS   0
 #define PFS_COMPRESS_FORMAT_EXFAT 1
@@ -126,6 +138,22 @@ int pfs_decompress_detect_nested(const char *path, pfs_decompress_info_t *info,
 
 int pfs_decompress_probe_image(const char *path, pfs_decompress_info_t *info,
                                char *err, size_t err_size);
+
+int pfs_decompress_find_nested_pfs_file_span(
+                                      const char *path,
+                                      const char *const *rels,
+                                      size_t rel_count,
+                                      pfs_nested_pfs_file_span_t *span,
+                                      char *err,
+                                      size_t err_size);
+
+int pfs_decompress_read_nested_pfs_file(const char *path,
+                                      const char *rel,
+                                      size_t max_size,
+                                      unsigned char **out,
+                                      size_t *out_size,
+                                      char *err,
+                                      size_t err_size);
 
 int pfs_decompress_ffpfsc_to_app_opts_output(const char *path, int overwrite,
                                       int workers, int delete_policy,

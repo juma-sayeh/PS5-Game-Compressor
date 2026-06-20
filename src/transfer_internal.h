@@ -78,6 +78,7 @@ struct job_state {
   char            error[256];
   char            cancel_disabled_reason[128];
   time_t          started_at;
+  time_t          phase_started_at;
   time_t          ended_at;
 };
 

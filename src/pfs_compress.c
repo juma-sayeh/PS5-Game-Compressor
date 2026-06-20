@@ -223,7 +223,13 @@ typedef struct pfs_segment {
   pfs_segment_type_t type;
   const unsigned char *mem;
   char path[1024];
+  int force_raw;
 } pfs_segment_t;
+
+typedef struct pfs_raw_range {
+  uint64_t offset;
+  uint64_t size;
+} pfs_raw_range_t;
 
 typedef struct destructive_stream_ctx destructive_stream_ctx_t;
 
@@ -237,6 +243,9 @@ typedef struct pfs_layout {
   pfs_segment_t *segments;
   size_t segment_count;
   size_t segment_cap;
+  pfs_raw_range_t *raw_ranges;
+  size_t raw_range_count;
+  size_t raw_range_cap;
   unsigned char *header_blob;
   unsigned char *inode_blob;
   size_t inode_blob_size;
@@ -312,7 +321,7 @@ typedef struct pfsc_slot {
 #define GC_PFSC_THRESHOLD_GAIN 5
 #endif
 #ifndef GC_PFSC_FORCE_RAW_EXEC
-#define GC_PFSC_FORCE_RAW_EXEC 0
+#define GC_PFSC_FORCE_RAW_EXEC 1
 #endif
 typedef struct pfsc_comp_config {
   int zlib_level;
@@ -668,7 +677,12 @@ static int
 path_is_executable_payload(const char *path) {
   const char *name = path_basename_const(path);
   if(starts_with_ci(name, "eboot") && ends_with_ci(name, ".bin")) return 1;
-  if(ends_with_ci(name, ".prx") || ends_with_ci(name, ".sprx")) return 1;
+  if(starts_with_ci(name, "iboot") && ends_with_ci(name, ".bin")) return 1;
+  if(ends_with_ci(name, ".prx") || ends_with_ci(name, ".sprx") ||
+     ends_with_ci(name, ".self") || ends_with_ci(name, ".elf") ||
+     ends_with_ci(name, ".dll") || ends_with_ci(name, ".so")) {
+    return 1;
+  }
   return 0;
 }
 
@@ -3541,6 +3555,46 @@ scan_file_cmp(const void *a, const void *b) {
 }
 
 static int
+scan_rel_is_tail_payload(const char *rel) {
+  if(!rel || !rel[0]) return 0;
+  if(starts_with_ci(rel, "fakelib/")) return 1;
+  if(starts_with_ci(rel, "sce_module/")) return 1;
+  if(!strchr(rel, '/')) {
+    if(!strcasecmp(rel, "ampr_emu.index")) return 1;
+    if(!strcasecmp(rel, "eboot.bin") || !strcasecmp(rel, "iboot.bin")) {
+      return 1;
+    }
+    if(ends_with_ci(rel, ".prx") || ends_with_ci(rel, ".sprx")) return 1;
+  }
+  return 0;
+}
+
+static int
+scan_move_tail_payload_files_to_tail(scan_list_t *scans) {
+  int moved = 0;
+  if(!scans || scans->count < 2) return 0;
+  scan_file_t *tmp = malloc(scans->count * sizeof(*tmp));
+  if(!tmp) return 0;
+  size_t out = 0;
+  for(size_t i = 0; i < scans->count; i++) {
+    if(!scan_rel_is_tail_payload(scans->items[i].rel)) {
+      tmp[out++] = scans->items[i];
+    }
+  }
+  for(size_t i = 0; i < scans->count; i++) {
+    if(scan_rel_is_tail_payload(scans->items[i].rel)) {
+      moved++;
+      tmp[out++] = scans->items[i];
+    }
+  }
+  if(out == scans->count) {
+    memcpy(scans->items, tmp, scans->count * sizeof(*tmp));
+  }
+  free(tmp);
+  return moved;
+}
+
+static int
 stream_ext_matches(const char *rel, const char *ext) {
   size_t rel_len = strlen(rel ? rel : "");
   size_t ext_len = strlen(ext ? ext : "");
@@ -4213,9 +4267,26 @@ inode_slot(pfs_layout_t *l, int inode) {
 }
 
 static int
-layout_add_segment(pfs_layout_t *l, uint64_t offset, uint64_t size,
-                   pfs_segment_type_t type, const unsigned char *mem,
-                   const char *path) {
+layout_add_raw_range(pfs_layout_t *l, uint64_t offset, uint64_t size) {
+  if(size == 0) return 0;
+  if(offset > UINT64_MAX - size) return -1;
+  if(l->raw_range_count == l->raw_range_cap) {
+    size_t next = l->raw_range_cap ? l->raw_range_cap * 2 : 32;
+    pfs_raw_range_t *p = realloc(l->raw_ranges, next * sizeof(*p));
+    if(!p) return -1;
+    l->raw_ranges = p;
+    l->raw_range_cap = next;
+  }
+  pfs_raw_range_t *r = &l->raw_ranges[l->raw_range_count++];
+  r->offset = offset;
+  r->size = size;
+  return 0;
+}
+
+static int
+layout_add_segment_ex(pfs_layout_t *l, uint64_t offset, uint64_t size,
+                      pfs_segment_type_t type, const unsigned char *mem,
+                      const char *path, int force_raw) {
   if(size == 0) return 0;
   if(l->segment_count == l->segment_cap) {
     size_t next = l->segment_cap ? l->segment_cap * 2 : 128;
@@ -4230,8 +4301,16 @@ layout_add_segment(pfs_layout_t *l, uint64_t offset, uint64_t size,
   s->size = size;
   s->type = type;
   s->mem = mem;
+  s->force_raw = force_raw ? 1 : 0;
   if(path) snprintf(s->path, sizeof(s->path), "%s", path);
   return 0;
+}
+
+static int
+layout_add_segment(pfs_layout_t *l, uint64_t offset, uint64_t size,
+                   pfs_segment_type_t type, const unsigned char *mem,
+                   const char *path) {
+  return layout_add_segment_ex(l, offset, size, type, mem, path, 0);
 }
 
 static int
@@ -4393,9 +4472,12 @@ build_pfs_layout_from_scans(const scan_list_t *scans, pfs_layout_t *l,
     }
   }
   for(size_t i = 0; i < l->file_count; i++) {
-    if(layout_add_segment(l, l->files[i].block_start * PFS_BLOCK_SIZE,
-                          l->files[i].raw_size, PFS_SEG_FILE,
-                          NULL, l->files[i].abs) != 0) {
+    int force_raw =
+        scan_rel_is_tail_payload(l->files[i].rel) ||
+        path_is_executable_payload(l->files[i].rel);
+    if(layout_add_segment_ex(l, l->files[i].block_start * PFS_BLOCK_SIZE,
+                             l->files[i].raw_size, PFS_SEG_FILE,
+                             NULL, l->files[i].abs, force_raw) != 0) {
       set_err(err, err_size, "out of memory");
       goto done;
     }
@@ -4429,6 +4511,10 @@ build_layout_from_files(const char *root, pfs_layout_t *l,
     goto done;
   }
   qsort(scans.items, scans.count, sizeof(scans.items[0]), scan_file_cmp);
+  int tail_payloads = scan_move_tail_payload_files_to_tail(&scans);
+  if(info && tail_payloads > 0) {
+    info->ampr_hot_swap_optimized = 1;
+  }
   rc = build_pfs_layout_from_scans(&scans, l, err, err_size);
 
 done:
@@ -4473,6 +4559,10 @@ build_layout_from_files_stream(const char *root, pfs_layout_t *l,
     info->stream_reserve_bytes = normalized.reserve_bytes;
     info->stream_forward_files = forward_files;
     info->stream_reverse_files = reverse_files;
+  }
+  int tail_payloads = scan_move_tail_payload_files_to_tail(&scans);
+  if(info && tail_payloads > 0) {
+    info->ampr_hot_swap_optimized = 1;
   }
   rc = build_pfs_layout_from_scans(&scans, l, err, err_size);
 
@@ -4709,6 +4799,16 @@ exfat_set_fat_range(unsigned char *fat, uint32_t first, uint32_t count) {
 }
 
 static int
+exfat_add_fat_raw_cluster_range(pfs_layout_t *l, uint32_t fat_offset_sectors,
+                                uint32_t first, uint32_t count) {
+  if(!l || first < 2 || count == 0) return 0;
+  uint64_t off = (uint64_t)fat_offset_sectors * EXFAT_SECTOR_SIZE +
+                 (uint64_t)first * 4ULL;
+  uint64_t size = (uint64_t)count * 4ULL;
+  return layout_add_raw_range(l, off, size);
+}
+
+static int
 exfat_make_upcase_blob(pfs_layout_t *l, uint32_t *checksum,
                        char *err, size_t err_size) {
   l->exfat_upcase_blob = malloc(sizeof(k_exfat_standard_upcase));
@@ -4785,6 +4885,8 @@ build_exfat_layout_from_scans(const scan_list_t *scans, const char *title_id,
   exfat_allocation_t *file_allocs = NULL;
   int rc = -1;
   uint32_t upcase_checksum = 0;
+  uint32_t slack_first_cluster = 0;
+  int has_tail_payload = 0;
 
   if(!scans || scans->count == 0) {
     set_err(err, err_size, "app folder contains no files");
@@ -4890,6 +4992,7 @@ build_exfat_layout_from_scans(const scan_list_t *scans, const char *title_id,
       next_cluster += file_allocs[i].cluster_count;
     }
   }
+  slack_first_cluster = next_cluster;
 
   exfat_mark_cluster_range(l->exfat_bitmap_blob, bitmap_cluster,
                            (uint32_t)bitmap_clusters);
@@ -4959,6 +5062,25 @@ build_exfat_layout_from_scans(const scan_list_t *scans, const char *title_id,
     exfat_set_fat_range(l->exfat_fat_blob, file_allocs[i].first_cluster,
                         file_allocs[i].cluster_count);
   }
+  for(size_t i = 0; i < l->file_count; i++) {
+    int force_raw_payload =
+        scan_rel_is_tail_payload(l->files[i].rel) ||
+        path_is_executable_payload(l->files[i].rel);
+    if(scan_rel_is_tail_payload(l->files[i].rel)) has_tail_payload = 1;
+    if(force_raw_payload &&
+       exfat_add_fat_raw_cluster_range(l, fat_offset,
+                                       file_allocs[i].first_cluster,
+                                       file_allocs[i].cluster_count) != 0) {
+      set_err(err, err_size, "out of memory");
+      goto done;
+    }
+  }
+  if(has_tail_payload &&
+     exfat_add_fat_raw_cluster_range(l, fat_offset, slack_first_cluster,
+                                     (uint32_t)EXFAT_ROOT_SLACK_CLUSTERS) != 0) {
+    set_err(err, err_size, "out of memory");
+    goto done;
+  }
 
   uint64_t allocated_clusters = bitmap_clusters + upcase_clusters +
     dir_clusters_total + file_clusters_total;
@@ -4974,27 +5096,27 @@ build_exfat_layout_from_scans(const scan_list_t *scans, const char *title_id,
   }
 
   l->image_size = volume_sectors * EXFAT_SECTOR_SIZE;
-  if(layout_add_segment(l, 0, l->exfat_boot_blob_size, PFS_SEG_MEM,
-                        l->exfat_boot_blob, NULL) != 0 ||
+  if(layout_add_segment_ex(l, 0, l->exfat_boot_blob_size, PFS_SEG_MEM,
+                           l->exfat_boot_blob, NULL, 1) != 0 ||
      layout_add_segment(l, (uint64_t)fat_offset * EXFAT_SECTOR_SIZE,
                         l->exfat_fat_blob_size, PFS_SEG_MEM,
                         l->exfat_fat_blob, NULL) != 0 ||
-     layout_add_segment(l, exfat_cluster_offset(cluster_heap_offset,
-                                                bitmap_cluster),
-                        l->exfat_bitmap_blob_size, PFS_SEG_MEM,
-                        l->exfat_bitmap_blob, NULL) != 0 ||
-     layout_add_segment(l, exfat_cluster_offset(cluster_heap_offset,
-                                                upcase_cluster),
-                        l->exfat_upcase_blob_size, PFS_SEG_MEM,
-                        l->exfat_upcase_blob, NULL) != 0) {
+     layout_add_segment_ex(l, exfat_cluster_offset(cluster_heap_offset,
+                                                   bitmap_cluster),
+                           l->exfat_bitmap_blob_size, PFS_SEG_MEM,
+                           l->exfat_bitmap_blob, NULL, 1) != 0 ||
+     layout_add_segment_ex(l, exfat_cluster_offset(cluster_heap_offset,
+                                                   upcase_cluster),
+                           l->exfat_upcase_blob_size, PFS_SEG_MEM,
+                           l->exfat_upcase_blob, NULL, 1) != 0) {
     set_err(err, err_size, "out of memory");
     goto done;
   }
   for(size_t i = 0; i < l->dir_count; i++) {
-    if(layout_add_segment(l, exfat_cluster_offset(cluster_heap_offset,
-                                                  dir_allocs[i].first_cluster),
-                          l->dirs[i].blob_size, PFS_SEG_MEM,
-                          l->dirs[i].blob, NULL) != 0) {
+    if(layout_add_segment_ex(l, exfat_cluster_offset(cluster_heap_offset,
+                                                     dir_allocs[i].first_cluster),
+                             l->dirs[i].blob_size, PFS_SEG_MEM,
+                             l->dirs[i].blob, NULL, 1) != 0) {
       set_err(err, err_size, "out of memory");
       goto done;
     }
@@ -5010,8 +5132,12 @@ build_exfat_layout_from_scans(const scan_list_t *scans, const char *title_id,
                                        file_allocs[i].first_cluster);
     l->files[i].block_start = file_offset / PFS_BLOCK_SIZE;
     l->files[i].blocks = ceil_div_u64(l->files[i].raw_size, PFS_BLOCK_SIZE);
-    if(layout_add_segment(l, file_offset, l->files[i].raw_size, PFS_SEG_FILE,
-                          NULL, l->files[i].abs) != 0) {
+    int force_raw =
+        scan_rel_is_tail_payload(l->files[i].rel) ||
+        path_is_executable_payload(l->files[i].rel);
+    if(layout_add_segment_ex(l, file_offset, l->files[i].raw_size,
+                             PFS_SEG_FILE, NULL, l->files[i].abs,
+                             force_raw) != 0) {
       set_err(err, err_size, "out of memory");
       goto done;
     }
@@ -5048,6 +5174,10 @@ build_exfat_layout_from_files(const char *root, const char *title_id,
     goto done;
   }
   qsort(scans.items, scans.count, sizeof(scans.items[0]), scan_file_cmp);
+  int tail_payloads = scan_move_tail_payload_files_to_tail(&scans);
+  if(info && tail_payloads > 0) {
+    info->ampr_hot_swap_optimized = 1;
+  }
   rc = build_exfat_layout_from_scans(&scans, title_id, l, err, err_size);
 
 done:
@@ -5094,6 +5224,10 @@ build_exfat_layout_from_files_stream(const char *root, const char *title_id,
     info->stream_forward_files = forward_files;
     info->stream_reverse_files = reverse_files;
   }
+  int tail_payloads = scan_move_tail_payload_files_to_tail(&scans);
+  if(info && tail_payloads > 0) {
+    info->ampr_hot_swap_optimized = 1;
+  }
   rc = build_exfat_layout_from_scans(&scans, title_id, l, err, err_size);
 
 done:
@@ -5112,6 +5246,7 @@ layout_free(pfs_layout_t *l) {
   free(l->dirs);
   free(l->files);
   free(l->segments);
+  free(l->raw_ranges);
   free(l->header_blob);
   free(l->inode_blob);
   free(l->superroot_blob);
@@ -5292,15 +5427,25 @@ virtual_reader_read(pfs_layout_t *l, virtual_reader_t *vr, uint64_t offset,
 }
 
 static int
-layout_block_overlaps_executable_file(const pfs_layout_t *l, uint64_t offset) {
-  uint64_t end = offset + PFS_BLOCK_SIZE;
+layout_block_should_force_raw(const pfs_layout_t *l, uint64_t offset) {
+  uint64_t end = offset > UINT64_MAX - PFS_BLOCK_SIZE
+      ? UINT64_MAX
+      : offset + PFS_BLOCK_SIZE;
   if(!l) return 0;
+  for(size_t i = 0; i < l->raw_range_count; i++) {
+    const pfs_raw_range_t *r = &l->raw_ranges[i];
+    uint64_t range_end = r->offset > UINT64_MAX - r->size
+        ? UINT64_MAX
+        : r->offset + r->size;
+    if(r->offset < end && range_end > offset) return 1;
+  }
   for(size_t i = 0; i < l->segment_count; i++) {
     const pfs_segment_t *s = &l->segments[i];
     uint64_t seg_end = s->offset + s->size;
     if(s->offset >= end) break;
-    if(seg_end <= offset || s->type != PFS_SEG_FILE) continue;
-    if(path_is_executable_payload(s->path)) return 1;
+    if(seg_end <= offset) continue;
+    if(s->force_raw) return 1;
+    if(s->type == PFS_SEG_FILE && path_is_executable_payload(s->path)) return 1;
   }
   return 0;
 }
@@ -5800,8 +5945,8 @@ pfsc_window_compress_task(pfsc_window_pool_t *pool, pfsc_window_task_t *task,
       if(remaining < PFS_BLOCK_SIZE) hash_len = (size_t)remaining;
     }
     result->force_raw = config && config->force_raw_exec ?
-        layout_block_overlaps_executable_file(pool->nested,
-                                              global_block * PFS_BLOCK_SIZE) :
+        layout_block_should_force_raw(pool->nested,
+                                      global_block * PFS_BLOCK_SIZE) :
         0;
     pfs_sha256(raw, hash_len, result->hash);
     if(result->force_raw) {
@@ -6926,8 +7071,8 @@ compress_nested_to_pfsc(int fd, uint64_t file_start, pfs_layout_t *nested,
         goto done;
       }
       slot->force_raw = comp_config.force_raw_exec ?
-          layout_block_overlaps_executable_file(nested,
-                                                next_read * PFS_BLOCK_SIZE) :
+          layout_block_should_force_raw(nested,
+                                        next_read * PFS_BLOCK_SIZE) :
           0;
       pthread_mutex_lock(&pool.lock);
       slot->state = PFSC_SLOT_READY;

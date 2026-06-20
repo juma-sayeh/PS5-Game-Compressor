@@ -2,13 +2,13 @@
   "url": "",
   "source": "",
   "source_direct": "",
-  "last_update": "2026-06-18",
-  "version": "1.0.1",
-  "downloaded_at": "2026-06-18T22:56:50+0300",
+  "last_update": "2026-06-20",
+  "version": "1.0.2",
+  "downloaded_at": "2026-06-20T03:08:10+0300",
   "install_source": "manual_upload",
   "install_source_detail": "/data/pldmgr/payloads/game-compressor",
   "name": "Game Compressor",
   "filename": "game-compressor.elf",
-  "description": "Standalone game compressor for ShadowMountPlus titles with APR Emu indexing, image creation, compress, uncompress, validate and repair, history, and move actions.",
-  "checksum": "64dba49ef83b2508de4fb99e8b4cc86816812ea7bd70696a29c6b13c95994e9d"
+  "description": "Standalone game compressor for ShadowMountPlus titles with APR Emu indexing, APR-EMU version updates, image creation, compress, uncompress, validate and repair, history, and move actions.",
+  "checksum": "65918eda7454e9221b244ff0fa29738bf3e251b4745efcf589271bb76de3f6b1"
 }

@@ -5,6 +5,20 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Game Compressor</title>
+  <script>
+    (function () {
+      var match = document.cookie.match(/(?:^|;\s*)game_compressor_theme=([^;]*)/);
+      var theme = '';
+      try {
+        theme = match ? decodeURIComponent(match[1]) : '';
+      } catch (err) {
+        theme = '';
+      }
+      theme = theme === 'dark' ? 'dark' : 'light';
+      window.__gcInitialTheme = theme;
+      document.documentElement.classList.add(theme === 'dark' ? 'theme-dark' : 'theme-light');
+    })();
+  </script>
   <style>
     :root {
       --bg: #f6f8fc;
@@ -21,6 +35,53 @@
       --shadow: rgba(37, 51, 81, .16);
       --soft-shadow: 0 18px 46px rgba(39, 54, 84, .10);
       --button-shadow: 0 18px 42px rgba(23, 105, 255, .24);
+      --app-bg: linear-gradient(145deg, #ffffff 0%, #f3f7ff 42%, #f8fbff 100%);
+      --control-bg: rgba(255, 255, 255, .64);
+      --path-bg: rgba(255, 255, 255, .52);
+      --panel-bg: rgba(255, 255, 255, .68);
+      --modal-bg: rgba(255, 255, 255, .92);
+      --menu-bg: rgba(255, 255, 255, .94);
+      --row-hover-bg: rgba(255, 255, 255, .72);
+      --row-output-bg: rgba(234, 242, 255, .52);
+      --menu-hover-bg: #eef4ff;
+      --selected-bg: #eef4ff;
+      --bar-bg: #dfe7f4;
+      --progress-bg: #f4f5f7;
+      --progress-text: #374151;
+      --thumb-bg: linear-gradient(145deg, #eef4ff, #dce8fb);
+    }
+
+    html.theme-dark,
+    body.theme-dark {
+      --bg: #101313;
+      --surface: rgba(25, 28, 28, .96);
+      --surface-solid: #202424;
+      --surface-2: #171a1a;
+      --line: rgba(240, 245, 240, .11);
+      --text: #f1f0eb;
+      --muted: #aaa8a1;
+      --accent: #2b86bd;
+      --accent-2: #1d5f8c;
+      --danger: #f06a78;
+      --focus: #2b86bd;
+      --shadow: rgba(0, 0, 0, .50);
+      --soft-shadow: 0 16px 38px rgba(0, 0, 0, .30);
+      --button-shadow: 0 18px 42px rgba(20, 103, 151, .25);
+      --app-bg: #101313;
+      --control-bg: rgba(35, 38, 38, .90);
+      --path-bg: rgba(24, 27, 27, .84);
+      --panel-bg: rgba(31, 34, 34, .88);
+      --modal-bg: rgba(24, 27, 27, .98);
+      --menu-bg: rgba(25, 28, 28, .98);
+      --row-hover-bg: rgba(42, 46, 46, .78);
+      --row-output-bg: rgba(245, 245, 240, .055);
+      --menu-hover-bg: rgba(43, 134, 189, .14);
+      --selected-bg: rgba(48, 53, 53, .72);
+      --bar-bg: #2b3030;
+      --progress-bg: #171a1a;
+      --progress-text: #e8e6df;
+      --thumb-bg: linear-gradient(145deg, #232727, #171a1a);
+      color-scheme: dark;
     }
 
     * {
@@ -63,8 +124,7 @@
       min-height: 0;
       padding: 18px;
       gap: 18px;
-      background:
-        linear-gradient(145deg, #ffffff 0%, #f3f7ff 42%, #f8fbff 100%);
+      background: var(--app-bg);
     }
 
     .app.is-terminated {
@@ -119,6 +179,20 @@
       letter-spacing: 0;
     }
 
+    .sidebar-brand {
+      display: flex;
+      align-items: baseline;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .sidebar-version {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 680;
+      line-height: 1.2;
+    }
+
     .sidebar-meta {
       margin-top: 6px;
       color: var(--muted);
@@ -162,7 +236,7 @@
 
     .game-row:hover {
       transform: translateY(-1px);
-      background: rgba(255, 255, 255, .72);
+      background: var(--row-hover-bg);
     }
 
     .game-row:active {
@@ -172,6 +246,11 @@
     .game-row.is-selected {
       background: var(--surface-solid);
       box-shadow: 0 14px 34px rgba(37, 51, 81, .12);
+    }
+
+    body.theme-dark .game-row.is-selected {
+      background: var(--selected-bg);
+      box-shadow: inset 0 0 0 1px rgba(240, 245, 240, .075), 0 12px 28px rgba(0, 0, 0, .22);
     }
 
     .game-row.is-unmounted {
@@ -184,7 +263,7 @@
 	    }
 
 	    .game-row.is-output {
-	      background: rgba(234, 242, 255, .52);
+	      background: var(--row-output-bg);
 	    }
 
     .thumb,
@@ -193,7 +272,7 @@
       place-items: center;
       overflow: hidden;
       border-radius: 16px;
-      background: linear-gradient(145deg, #eef4ff, #dce8fb);
+      background: var(--thumb-bg);
       color: var(--accent);
       box-shadow: inset 0 1px 0 rgba(255, 255, 255, .92), 0 10px 24px rgba(37, 51, 81, .12);
     }
@@ -254,7 +333,7 @@
 	      padding: 0 6px;
 	      border: 1px solid var(--line);
 	      border-radius: 999px;
-	      background: rgba(255, 255, 255, .62);
+	      background: var(--control-bg);
 	      color: var(--muted);
 	      font-size: 10px;
 	      font-weight: 560;
@@ -262,6 +341,13 @@
 	      overflow: hidden;
 	      text-overflow: ellipsis;
 	      text-transform: lowercase;
+	    }
+
+	    .row-tag.is-apr {
+	      color: #155f8c;
+	      border-color: rgba(43, 134, 189, .24);
+	      background: #e7f4fb;
+	      text-transform: none;
 	    }
 
     .chip {
@@ -272,7 +358,7 @@
       padding: 0 9px;
       border-radius: 999px;
       border: 1px solid var(--line);
-      background: rgba(255, 255, 255, .72);
+      background: var(--control-bg);
       color: var(--muted);
       font-size: 11px;
       font-weight: 500;
@@ -315,6 +401,37 @@
       background: #fff5dd;
     }
 
+    .chip.ampr {
+      color: #b94708;
+      border-color: rgba(217, 91, 18, .22);
+      background: #fff1df;
+      text-transform: none;
+    }
+
+    .chip.ampr-version {
+      color: #155f8c;
+      border-color: rgba(43, 134, 189, .24);
+      background: #e7f4fb;
+      text-transform: none;
+    }
+
+    .chip.selected,
+    .chip.validating,
+    .chip.reading,
+    .chip.compressing {
+      color: #155f8c;
+      border-color: rgba(43, 134, 189, .28);
+      background: #e7f4fb;
+      text-transform: none;
+    }
+
+    .chip.ampr-updating {
+      color: #fff;
+      border-color: transparent;
+      background: linear-gradient(135deg, #df4f12, #f59f1b);
+      box-shadow: 0 10px 22px rgba(223, 79, 18, .22);
+    }
+
     .chip.run {
       color: #0d5bdd;
       border-color: rgba(19, 102, 255, .20);
@@ -325,12 +442,6 @@
       color: #bc3047;
       border-color: rgba(216, 76, 91, .18);
       background: #fff0f2;
-    }
-
-    .chip.compressing {
-      color: #0d5bdd;
-      border-color: rgba(19, 102, 255, .22);
-      background: #eaf2ff;
     }
 
     .chip.closing {
@@ -344,12 +455,6 @@
       border-color: rgba(33, 107, 143, .22);
       background: #e8f5fb;
     }
-
-	    .chip.validating {
-	      color: #0f766e;
-	      border-color: rgba(15, 118, 110, .22);
-	      background: #e7f7f4;
-	    }
 
 	    .chip.scanning {
 	      color: #386176;
@@ -395,6 +500,94 @@
       background: #edf7fa;
     }
 
+    body.theme-dark .chip {
+      border-color: rgba(245, 245, 240, .10);
+      background: rgba(39, 39, 41, .80);
+      color: #aeada6;
+    }
+
+    body.theme-dark .chip.ok {
+      color: #9ee6bd;
+      border-color: rgba(110, 231, 183, .20);
+      background: rgba(34, 105, 73, .22);
+    }
+
+    body.theme-dark .chip.warn {
+      color: #f2c879;
+      border-color: rgba(242, 200, 121, .20);
+      background: rgba(125, 86, 28, .22);
+    }
+
+    body.theme-dark .chip.ampr,
+    body.theme-dark .chip.ampr-updating {
+      color: #ffd0a3;
+      border-color: rgba(245, 158, 91, .24);
+      background: rgba(154, 73, 27, .24);
+      box-shadow: none;
+    }
+
+    body.theme-dark .chip.ampr-version {
+      color: #bfe8ff;
+      border-color: rgba(98, 176, 221, .30);
+      background: rgba(43, 134, 189, .18);
+    }
+
+    body.theme-dark .row-tag.is-apr {
+      color: #bfe8ff;
+      border-color: rgba(98, 176, 221, .30);
+      background: rgba(43, 134, 189, .18);
+    }
+
+    body.theme-dark .chip.selected,
+    body.theme-dark .chip.validating,
+    body.theme-dark .chip.reading,
+    body.theme-dark .chip.compressing {
+      color: #bfe8ff;
+      border-color: rgba(98, 176, 221, .34);
+      background: rgba(43, 134, 189, .22);
+    }
+
+    body.theme-dark .chip.run {
+      color: #c9e28d;
+      border-color: rgba(201, 226, 141, .20);
+      background: rgba(84, 107, 38, .22);
+    }
+
+    body.theme-dark .chip.bad {
+      color: #ff9aa6;
+      border-color: rgba(255, 154, 166, .22);
+      background: rgba(135, 43, 56, .24);
+    }
+
+    body.theme-dark .chip.closing,
+    body.theme-dark .chip.finalizing {
+      color: #c4c2bc;
+      border-color: rgba(196, 194, 188, .18);
+      background: rgba(83, 83, 82, .24);
+    }
+
+    body.theme-dark .chip.mounting,
+    body.theme-dark .chip.scanning,
+    body.theme-dark .chip.moving,
+    body.theme-dark .chip.size-pending {
+      color: #a9d6ca;
+      border-color: rgba(169, 214, 202, .20);
+      background: rgba(49, 101, 87, .20);
+    }
+
+    body.theme-dark .chip.repacking {
+      color: #f0cf83;
+      border-color: rgba(240, 207, 131, .22);
+      background: rgba(119, 86, 31, .24);
+    }
+
+    body.theme-dark .chip.restoring,
+    body.theme-dark .chip.unpacking {
+      color: #d4c3ff;
+      border-color: rgba(212, 195, 255, .22);
+      background: rgba(87, 65, 136, .24);
+    }
+
     .measure-dots {
       display: inline-block;
       width: 18px;
@@ -417,7 +610,7 @@
       grid-template-rows: 64px 1fr;
       border: 1px solid var(--line);
       border-radius: 32px;
-      background: rgba(255, 255, 255, .74);
+      background: var(--surface);
       box-shadow: var(--soft-shadow);
       overflow: hidden;
       backdrop-filter: blur(22px);
@@ -427,27 +620,92 @@
       position: relative;
       display: flex;
       align-items: center;
-      justify-content: flex-end;
+      justify-content: space-between;
       gap: 8px;
       padding: 12px 18px;
       border-bottom: 1px solid var(--line);
+    }
+
+    .topbar-actions {
+      min-width: 0;
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 8px;
+    }
+
+    .theme-tools {
+      flex: 0 0 auto;
+      min-width: 0;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .theme-toggle {
+      flex: 0 0 auto;
+      height: 44px;
+      display: inline-grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 3px;
+      align-items: center;
+      padding: 3px;
+      border-radius: 16px;
+      border: 1px solid var(--line);
+      background: var(--control-bg);
+      box-shadow: 0 8px 20px rgba(37, 51, 81, .08);
+    }
+
+    .theme-option {
+      min-width: 42px;
+      height: 36px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 12px;
+      color: var(--muted);
+      cursor: pointer;
+      transition: background .16s ease, color .16s ease, transform .16s ease;
+    }
+
+    .theme-option svg {
+      width: 18px;
+      height: 18px;
+      stroke: currentColor;
+      stroke-width: 2;
+      fill: none;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+
+    .theme-option.is-selected {
+      color: #ffffff;
+      background: linear-gradient(135deg, var(--accent), var(--accent-2));
+      box-shadow: 0 8px 18px rgba(23, 105, 255, .18);
+    }
+
+    .theme-option:not(.is-selected):hover {
+      color: var(--accent);
+      background: var(--menu-hover-bg);
+      transform: translateY(-1px);
     }
 
     .terminate-reminder {
       position: absolute;
       top: calc(100% + 8px);
       right: 18px;
-      z-index: 12;
+      z-index: 32;
       width: min(320px, calc(100vw - 36px));
       padding: 10px 12px;
-      border: 1px solid rgba(31, 47, 78, .14);
+      border: 1px solid rgba(31, 47, 78, .22);
       border-radius: 14px;
-      background: rgba(255, 255, 255, .96);
+      background: var(--menu-bg);
       color: var(--text);
       font-size: 12px;
       line-height: 1.35;
       font-weight: 640;
-      box-shadow: 0 16px 36px rgba(37, 51, 81, .14);
+      box-shadow: 0 0 0 1px rgba(255, 255, 255, .74),
+        0 16px 36px rgba(37, 51, 81, .14);
       backdrop-filter: blur(18px);
       pointer-events: none;
       opacity: 1;
@@ -467,9 +725,9 @@
       right: 19px;
       width: 10px;
       height: 10px;
-      border-left: 1px solid rgba(31, 47, 78, .14);
-      border-top: 1px solid rgba(31, 47, 78, .14);
-      background: rgba(255, 255, 255, .96);
+      border-left: 1px solid rgba(31, 47, 78, .22);
+      border-top: 1px solid rgba(31, 47, 78, .22);
+      background: var(--menu-bg);
       transform: rotate(45deg);
     }
 
@@ -532,17 +790,20 @@
     }
 
     .free-space-label {
+      min-width: 0;
       min-height: 38px;
       display: inline-flex;
       align-items: center;
       padding: 0 12px;
       border-radius: 14px;
       border: 1px solid var(--line);
-      background: rgba(255, 255, 255, .64);
+      background: var(--control-bg);
       color: var(--muted);
       font-size: 13px;
       font-weight: 680;
       white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
       box-shadow: 0 8px 20px rgba(37, 51, 81, .08);
     }
 
@@ -552,7 +813,7 @@
     }
 
     .icon-btn {
-      background: rgba(255, 255, 255, .64);
+      background: var(--control-bg);
       border: 1px solid var(--line);
       box-shadow: 0 8px 20px rgba(37, 51, 81, .08);
       transition: transform .18s ease, background .18s ease, box-shadow .18s ease;
@@ -572,16 +833,18 @@
 
     .icon-btn.is-terminate-needed {
       color: #ffffff;
-      border-color: rgba(216, 76, 91, .42);
-      background: var(--danger);
-      box-shadow: 0 14px 30px rgba(216, 76, 91, .26);
+      border-color: rgba(190, 18, 60, .34);
+      background: linear-gradient(180deg, #e11d48, #be123c);
+      box-shadow: 0 0 0 1px rgba(190, 18, 60, .08),
+        0 14px 30px rgba(190, 18, 60, .24);
     }
 
     .icon-btn.is-terminate-needed:hover {
       color: #ffffff;
-      border-color: rgba(216, 76, 91, .58);
-      background: #c83749;
-      box-shadow: 0 16px 34px rgba(216, 76, 91, .30);
+      border-color: rgba(190, 18, 60, .48);
+      background: linear-gradient(180deg, #f43f5e, #be123c);
+      box-shadow: 0 0 0 1px rgba(190, 18, 60, .12),
+        0 16px 34px rgba(190, 18, 60, .30);
     }
 
     .icon-btn:disabled {
@@ -687,6 +950,15 @@
       box-shadow: 0 22px 52px rgba(19, 102, 255, .28);
     }
 
+    .primary-btn.is-ampr {
+      background: linear-gradient(135deg, #df4f12, #f59f1b);
+      box-shadow: 0 18px 46px rgba(223, 79, 18, .30);
+    }
+
+    .primary-btn.is-ampr:hover {
+      box-shadow: 0 22px 54px rgba(223, 79, 18, .36);
+    }
+
     .primary-btn:active {
       transform: scale(.985);
     }
@@ -695,6 +967,28 @@
       cursor: default;
       filter: saturate(.6);
       opacity: .7;
+    }
+
+    body.theme-dark .primary-btn {
+      border: 1px solid rgba(98, 176, 221, .26);
+      background: linear-gradient(135deg, #2b86bd, #1d5f8c);
+      color: #f4fbff;
+      box-shadow: 0 18px 42px rgba(20, 103, 151, .30);
+    }
+
+    body.theme-dark .primary-btn:hover {
+      filter: brightness(1.06);
+      box-shadow: 0 22px 52px rgba(20, 103, 151, .38);
+    }
+
+    body.theme-dark .primary-btn.is-ampr {
+      border-color: rgba(236, 132, 58, .28);
+      background: linear-gradient(135deg, #8f3c17, #b45e1b);
+      box-shadow: 0 18px 42px rgba(143, 60, 23, .30);
+    }
+
+    body.theme-dark .primary-btn.is-ampr:hover {
+      box-shadow: 0 22px 52px rgba(143, 60, 23, .38);
     }
 
     .more-btn {
@@ -776,9 +1070,10 @@
       pointer-events: auto;
       padding: 8px;
       border-radius: 18px;
-      border: 1px solid var(--line);
-      background: rgba(255, 255, 255, .94);
-      box-shadow: 0 24px 64px rgba(37, 51, 81, .18);
+      border: 1px solid rgba(37, 51, 81, .18);
+      background: var(--menu-bg);
+      box-shadow: 0 0 0 1px rgba(255, 255, 255, .70),
+        0 24px 64px rgba(37, 51, 81, .18);
       backdrop-filter: blur(22px);
       animation: menu-in .16s cubic-bezier(.2, .8, .2, 1);
     }
@@ -796,7 +1091,7 @@
     }
 
     .menu-action:hover {
-      background: #eef4ff;
+      background: var(--menu-hover-bg);
       color: var(--accent);
       transform: translateX(1px);
     }
@@ -808,6 +1103,33 @@
     .menu-action.is-danger:hover {
       background: #fff0f2;
       color: #bc3047;
+    }
+
+    body.theme-dark .terminate-reminder {
+      border-color: rgba(245, 245, 240, .22);
+      background: rgba(25, 28, 28, .98);
+      color: #f1f0eb;
+      box-shadow: 0 0 0 1px rgba(245, 245, 240, .10),
+        0 20px 48px rgba(0, 0, 0, .54);
+    }
+
+    body.theme-dark .terminate-reminder::before {
+      border-left-color: rgba(245, 245, 240, .22);
+      border-top-color: rgba(245, 245, 240, .22);
+      background: rgba(25, 28, 28, .98);
+    }
+
+    body.theme-dark .terminate-reminder strong {
+      color: #ffffff;
+    }
+
+    body.theme-dark .terminate-reminder span {
+      color: #c9c6bd;
+    }
+
+    body.theme-dark .menu-action.is-danger:hover {
+      color: #ffb5bd;
+      background: rgba(135, 43, 56, .26);
     }
 
     .menu-action:active {
@@ -827,8 +1149,95 @@
       display: grid;
       gap: 10px;
       align-content: center;
-      color: #374151;
-      background: #f4f5f7;
+      color: var(--progress-text);
+      background: var(--progress-bg);
+    }
+
+    body.theme-dark .more-btn,
+    body.theme-dark .small-action,
+    body.theme-dark .copy-path,
+    body.theme-dark .remount-path,
+    body.theme-dark .icon-btn {
+      box-shadow: 0 10px 24px rgba(0, 0, 0, .32);
+    }
+
+    body.theme-dark .more-btn:hover,
+    body.theme-dark .small-action:hover,
+    body.theme-dark .copy-path:hover,
+    body.theme-dark .remount-path:hover,
+    body.theme-dark .icon-btn:hover {
+      border-color: rgba(98, 176, 221, .34);
+      color: #bfe8ff;
+      background: rgba(43, 134, 189, .18);
+      box-shadow: 0 0 0 1px rgba(98, 176, 221, .08),
+        0 14px 30px rgba(0, 0, 0, .40);
+    }
+
+    body.theme-dark .icon-btn.is-danger:hover {
+      border-color: rgba(255, 154, 166, .50);
+      color: #ff9aa6;
+      background: rgba(135, 43, 56, .24);
+      box-shadow: 0 0 0 1px rgba(255, 154, 166, .12),
+        0 14px 30px rgba(0, 0, 0, .42);
+    }
+
+    body.theme-dark .icon-btn.is-terminate-needed {
+      color: #fff7f8;
+      border-color: rgba(255, 154, 166, .42);
+      background: linear-gradient(180deg, #b83246, #7f2230);
+      box-shadow: 0 0 0 1px rgba(255, 154, 166, .10),
+        0 14px 30px rgba(0, 0, 0, .44);
+    }
+
+    body.theme-dark .terminated-icon {
+      color: #fff7f8;
+      border-color: rgba(255, 154, 166, .42);
+      background: linear-gradient(180deg, #b83246, #7f2230);
+      box-shadow: 0 0 0 1px rgba(255, 154, 166, .10),
+        0 14px 30px rgba(0, 0, 0, .44);
+    }
+
+    body.theme-dark .icon-btn.is-terminate-needed:hover {
+      color: #ffffff;
+      border-color: rgba(255, 174, 184, .58);
+      background: linear-gradient(180deg, #d84459, #9a2b3c);
+      box-shadow: 0 0 0 1px rgba(255, 174, 184, .16),
+        0 16px 34px rgba(0, 0, 0, .48);
+    }
+
+    body.theme-dark .small-action.is-primary:hover {
+      border-color: rgba(98, 176, 221, .30);
+      color: #f4fbff;
+      background: linear-gradient(135deg, #2b86bd, #1d5f8c);
+      filter: brightness(1.06);
+      box-shadow: 0 0 0 1px rgba(98, 176, 221, .08),
+        0 16px 34px rgba(20, 103, 151, .28);
+    }
+
+    body.theme-dark .small-action.is-danger:hover {
+      border-color: rgba(255, 154, 166, .42);
+      color: #fff7f8;
+      background: linear-gradient(135deg, #9a2b3c, #c83b50);
+      box-shadow: 0 0 0 1px rgba(255, 154, 166, .10),
+        0 14px 30px rgba(0, 0, 0, .42);
+    }
+
+    body.theme-dark .secondary-menu {
+      border-color: rgba(245, 245, 240, .20);
+      box-shadow: 0 0 0 1px rgba(245, 245, 240, .08),
+        0 22px 58px rgba(0, 0, 0, .56);
+    }
+
+    body.theme-dark .pending-box,
+    body.theme-dark .progress-box {
+      border-color: rgba(245, 245, 240, .10);
+      background: #1a1a1c;
+      box-shadow: 0 18px 42px rgba(0, 0, 0, .34);
+    }
+
+    body.theme-dark .progress-direction,
+    body.theme-dark .progress-percent {
+      color: #c7c4bc;
     }
 
     .progress-heading {
@@ -837,7 +1246,7 @@
       justify-content: center;
       gap: 6px;
       min-width: 0;
-      color: #374151;
+      color: var(--progress-text);
       font-weight: 400;
       text-align: center;
     }
@@ -984,6 +1393,10 @@
       background: linear-gradient(90deg, #386176, #79b6cb);
     }
 
+    .progress-box.is-ampr-updating .progress-fill {
+      background: linear-gradient(90deg, #df4f12, #f59f1b);
+    }
+
     .progress-box.is-reading .progress-fill {
       background: linear-gradient(90deg, #13715f, #66c6a2);
     }
@@ -1002,6 +1415,43 @@
 
     .progress-box.is-restoring .progress-fill {
       background: linear-gradient(90deg, #6b4ba1, #a995df);
+    }
+
+    body.theme-dark .progress-box.is-compressing .progress-fill {
+      background: linear-gradient(90deg, #2b86bd, #62b0dd);
+    }
+
+    body.theme-dark .progress-box.is-closing .progress-fill,
+    body.theme-dark .progress-box.is-finalizing .progress-fill {
+      background: linear-gradient(90deg, #5f5f5f, #a4a29c);
+    }
+
+    body.theme-dark .progress-box.is-mounting .progress-fill,
+    body.theme-dark .progress-box.is-scanning .progress-fill,
+    body.theme-dark .progress-box.is-moving .progress-fill {
+      background: linear-gradient(90deg, #3f7568, #a3d7c9);
+    }
+
+    body.theme-dark .progress-box.is-validating .progress-fill,
+    body.theme-dark .progress-box.is-reading .progress-fill {
+      background: linear-gradient(90deg, #2f7a58, #9fe3bb);
+    }
+
+    body.theme-dark .progress-box.is-repacking .progress-fill {
+      background: linear-gradient(90deg, #916522, #f0c56c);
+    }
+
+    body.theme-dark .progress-box.is-ampr-updating .progress-fill {
+      background: linear-gradient(90deg, #8d3d17, #e58b32);
+    }
+
+    body.theme-dark .progress-box.is-deleting .progress-fill {
+      background: linear-gradient(90deg, #9e3446, #f18b97);
+    }
+
+    body.theme-dark .progress-box.is-unpacking .progress-fill,
+    body.theme-dark .progress-box.is-restoring .progress-fill {
+      background: linear-gradient(90deg, #674f94, #cab9f8);
     }
 
     .pending-box {
@@ -1052,7 +1502,7 @@
     .bar {
       height: 8px;
       border-radius: 999px;
-      background: #dfe7f4;
+      background: var(--bar-bg);
       overflow: hidden;
     }
 
@@ -1086,7 +1536,7 @@
       padding: 10px 12px;
       border: 1px solid var(--line);
       border-radius: 14px;
-      background: rgba(255, 255, 255, .52);
+      background: var(--path-bg);
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
@@ -1182,7 +1632,7 @@
       height: 28px;
       border-radius: 999px;
       border: 1px solid rgba(19, 102, 255, .18);
-      background: #eaf2ff;
+      background: var(--selected-bg);
       color: var(--accent);
     }
 
@@ -1259,7 +1709,7 @@
       max-height: min(680px, 90vh);
       display: grid;
       grid-template-rows: auto 1fr;
-      background: rgba(255, 255, 255, .92);
+      background: var(--modal-bg);
       border: 1px solid var(--line);
       border-radius: 28px;
       box-shadow: 0 24px 80px var(--shadow);
@@ -1341,6 +1791,47 @@
       background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 36 24'%3E%3Cpath fill='%23000' d='M0 0h36v8H0z'/%3E%3Cpath fill='%23fff' d='M0 8h36v8H0z'/%3E%3Cpath fill='%23009046' d='M0 16h36v8H0z'/%3E%3Cpath fill='%23ce1126' d='M0 0l15 12L0 24z'/%3E%3C/svg%3E");
     }
 
+    body.theme-dark .modal {
+      border-color: rgba(245, 245, 240, .14);
+      box-shadow: 0 0 0 1px rgba(245, 245, 240, .06),
+        0 26px 82px rgba(0, 0, 0, .58);
+    }
+
+    body.theme-dark .modal-head {
+      background: rgba(31, 34, 34, .76);
+      border-bottom-color: rgba(245, 245, 240, .12);
+    }
+
+    body.theme-dark #ampr-version-modal .modal-actions {
+      border-top-color: rgba(245, 245, 240, .12);
+      background: rgba(24, 27, 27, .96);
+      box-shadow: 0 -12px 28px rgba(0, 0, 0, .34),
+        inset 0 1px 0 rgba(255, 255, 255, .04);
+    }
+
+    body.theme-dark .about-copy {
+      border-color: rgba(245, 245, 240, .13);
+      background: rgba(31, 34, 34, .96);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, .04),
+        0 14px 34px rgba(0, 0, 0, .24);
+    }
+
+    body.theme-dark .about-main {
+      color: #f6f4ef;
+    }
+
+    body.theme-dark .about-sub {
+      color: #b9b6ae;
+    }
+
+    body.theme-dark .about-made {
+      color: #dedbd2;
+    }
+
+    body.theme-dark .about-palestine {
+      box-shadow: 0 0 0 1px rgba(245, 245, 240, .18);
+    }
+
     .history-row {
       display: grid;
       grid-template-columns: 1fr auto;
@@ -1350,7 +1841,7 @@
       border-radius: 18px;
       border: 1px solid var(--line);
       margin-bottom: 10px;
-      background: rgba(255, 255, 255, .68);
+      background: var(--panel-bg);
     }
 
     .history-title {
@@ -1384,7 +1875,7 @@
       border-radius: 18px;
       border: 1px solid var(--line);
       margin-bottom: 10px;
-      background: rgba(255, 255, 255, .68);
+      background: var(--panel-bg);
       text-align: left;
       cursor: pointer;
     }
@@ -1417,6 +1908,36 @@
       margin-bottom: 0;
     }
 
+    .ampr-version-list {
+      display: grid;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+
+    .ampr-version-list .format-row {
+      margin-bottom: 0;
+    }
+
+    #ampr-version-modal .modal-body {
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      padding-bottom: 0;
+    }
+
+    #ampr-version-modal .ampr-version-list {
+      flex: 1 1 auto;
+      min-height: 160px;
+      overflow: auto;
+      overscroll-behavior: contain;
+      padding-right: 4px;
+    }
+
+    #ampr-version-modal #ampr-version-status {
+      flex: 0 0 auto;
+      padding-bottom: 10px;
+    }
+
     .format-grid.is-three-up .format-row {
       grid-template-columns: minmax(0, 1fr);
       min-height: 80px;
@@ -1446,7 +1967,7 @@
       padding: 10px;
       border: 1px solid var(--line);
       border-radius: 18px;
-      background: rgba(255, 255, 255, .48);
+      background: var(--path-bg);
     }
 
     .compress-usb-panel.hidden {
@@ -1469,7 +1990,7 @@
       align-items: center;
       border: 1px solid var(--line);
       border-radius: 14px;
-      background: rgba(255, 255, 255, .78);
+      background: var(--control-bg);
       color: var(--text);
       font: inherit;
       padding: 10px 12px;
@@ -1499,12 +2020,12 @@
     .usb-picker-option {
       min-height: 48px;
       border-radius: 12px;
-      background: rgba(255, 255, 255, .66);
+      background: var(--panel-bg);
     }
 
     .usb-picker-option.is-selected {
       border-color: rgba(23, 105, 255, .48);
-      background: #eef4ff;
+      background: var(--selected-bg);
     }
 
     .usb-picker-empty {
@@ -1517,7 +2038,7 @@
       color: var(--muted);
       font-size: 13px;
       font-weight: 680;
-      background: rgba(255, 255, 255, .38);
+      background: var(--path-bg);
     }
 
     .compress-usb-meta {
@@ -1529,7 +2050,13 @@
 
     .format-row.is-selected {
       border-color: rgba(23, 105, 255, .48);
-      background: #eef4ff;
+      background: var(--selected-bg);
+    }
+
+    body.theme-dark .usb-picker-option.is-selected,
+    body.theme-dark .format-row.is-selected {
+      border-color: rgba(98, 176, 221, .36);
+      background: var(--selected-bg);
     }
 
     .format-row:disabled,
@@ -1574,6 +2101,27 @@
       padding-top: 14px;
     }
 
+    #ampr-version-modal .modal-actions {
+      position: sticky;
+      bottom: 0;
+      z-index: 2;
+      flex: 0 0 auto;
+      margin: 0 -14px;
+      padding: 12px 14px 14px;
+      border-top: 1px solid var(--line);
+      background: rgba(255, 255, 255, .94);
+      backdrop-filter: blur(18px);
+      box-shadow: 0 -12px 26px rgba(37, 51, 81, .08);
+    }
+
+    #ampr-custom-upload {
+      margin-right: auto;
+    }
+
+    #ampr-custom-file {
+      display: none;
+    }
+
     .danger-text {
       color: var(--danger);
       overflow-wrap: anywhere;
@@ -1615,6 +2163,22 @@
       line-height: 1.35;
     }
 
+    body.theme-dark .ui-notice {
+      border-color: rgba(255, 154, 166, .30);
+      background: linear-gradient(180deg, rgba(70, 31, 38, .98), rgba(45, 26, 30, .98));
+      color: #f6c8ce;
+      box-shadow: 0 0 0 1px rgba(255, 154, 166, .08),
+        0 20px 46px rgba(0, 0, 0, .54);
+    }
+
+    body.theme-dark .ui-notice-title {
+      color: #ff8f9e;
+    }
+
+    body.theme-dark .ui-notice-meta {
+      color: #f2c5cb;
+    }
+
     .delete-warning {
       display: grid;
       gap: 8px;
@@ -1622,6 +2186,11 @@
       border: 1px solid rgba(216, 76, 91, .2);
       border-radius: 14px;
       background: #fff0f2;
+    }
+
+    body.theme-dark .delete-warning {
+      border-color: rgba(255, 98, 116, .28);
+      background: rgba(255, 98, 116, .12);
     }
 
     .delete-warning .history-meta {
@@ -1732,8 +2301,27 @@
         padding: 6px 10px;
       }
 
+      .theme-toggle {
+        height: 40px;
+        flex: 0 0 auto;
+      }
+
+      .theme-tools {
+        gap: 6px;
+      }
+
+      .topbar-actions {
+        flex: 1 1 auto;
+      }
+
+      .theme-option {
+        min-width: 36px;
+        height: 32px;
+      }
+
       .free-space-label {
         min-height: 36px;
+        flex: 1 1 auto;
         padding: 0 10px;
         font-size: 12px;
       }
@@ -1812,6 +2400,20 @@
         grid-template-columns: minmax(0, 1fr);
       }
 
+      #ampr-version-modal .modal-actions {
+        flex-wrap: wrap;
+      }
+
+      #ampr-version-modal #ampr-custom-upload {
+        width: 100%;
+        margin-right: 0;
+      }
+
+      #ampr-version-modal #ampr-version-cancel,
+      #ampr-version-modal #ampr-version-apply {
+        flex: 1 1 0;
+      }
+
       .path-line {
         white-space: normal;
         overflow-wrap: anywhere;
@@ -1822,10 +2424,17 @@
 </head>
 
 <body>
+  <script>
+    (function () {
+      var dark = document.documentElement.classList.contains('theme-dark');
+      document.body.classList.add(dark ? 'theme-dark' : 'theme-light');
+    })();
+  </script>
   <div class="app">
     <aside class="sidebar">
       <div class="sidebar-head">
-        <h1>Game Compressor</h1>
+        <h1 class="sidebar-brand"><span id="sidebar-app-name">Game Compressor</span><span class="sidebar-version"
+            id="sidebar-version"></span></h1>
         <div class="sidebar-meta" id="count-label">Scanning games</div>
       </div>
       <div class="game-list" id="game-list">
@@ -1843,10 +2452,20 @@
 
     <main class="content">
       <div class="topbar">
-        <div class="free-space-label" id="free-space-label">Free Space <span>--</span></div>
-        <button class="icon-btn" id="history-top" title="History" aria-label="History"></button>
-        <button class="icon-btn is-danger" id="terminate-top" title="Terminate Game Compressor"
-          aria-label="Terminate Game Compressor"></button>
+        <div class="theme-tools">
+          <div class="theme-toggle" role="group" aria-label="Color mode">
+            <button class="theme-option" id="theme-dark" type="button" data-theme="dark"
+              title="Dark mode" aria-label="Dark mode"></button>
+            <button class="theme-option" id="theme-light" type="button" data-theme="light"
+              title="Light mode" aria-label="Light mode"></button>
+          </div>
+        </div>
+        <div class="topbar-actions">
+          <div class="free-space-label" id="free-space-label">Free Space <span>--</span></div>
+          <button class="icon-btn" id="history-top" title="History" aria-label="History"></button>
+          <button class="icon-btn is-danger" id="terminate-top" title="Terminate Game Compressor"
+            aria-label="Terminate Game Compressor"></button>
+        </div>
         <div class="terminate-reminder hidden" id="terminate-reminder" role="status" aria-live="polite">
           <strong>Done processing.</strong>
           <span>Before playing, terminate Game Compressor to avoid minor game performance effects.</span>
@@ -1883,7 +2502,7 @@
   <div class="modal-backdrop hidden" id="info-modal">
     <div class="modal" role="dialog" aria-modal="true" aria-labelledby="info-title">
       <div class="modal-head">
-        <div class="modal-title" id="info-title">About</div>
+        <div class="modal-title" id="info-title">Game Compressor</div>
         <button class="icon-btn" id="info-close" aria-label="Close"></button>
       </div>
       <div class="modal-body">
@@ -1905,6 +2524,26 @@
         <button class="icon-btn" id="usb-close" aria-label="Close"></button>
       </div>
       <div class="modal-body" id="usb-body"></div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop hidden" id="ampr-version-modal">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="ampr-version-title">
+      <div class="modal-head">
+        <div class="modal-title" id="ampr-version-title">APR-EMU Version</div>
+        <button class="icon-btn" id="ampr-version-close" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <div class="format-section-title">Available Versions</div>
+        <div class="ampr-version-list" id="ampr-version-list"></div>
+        <div class="history-meta" id="ampr-version-status"></div>
+        <div class="modal-actions">
+          <input type="file" id="ampr-custom-file" accept=".sprx,.prx,application/octet-stream">
+          <button class="small-action" type="button" id="ampr-custom-upload">Upload Custom File</button>
+          <button class="small-action" type="button" id="ampr-version-cancel">Cancel</button>
+          <button class="small-action is-primary" type="button" id="ampr-version-apply">Apply Version</button>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -2090,10 +2729,12 @@
   </div>
 
   <script>
+    const THEME_COOKIE = 'game_compressor_theme';
     const SELECTED_GAME_COOKIE = 'game_compressor_selected_title';
     const PFS_BLOCK_SIZE = 64 * 1024;
     const SPEED_SAMPLE_WINDOW_MS = 8 * 1000;
     const SPEED_MIN_SAMPLE_MS = 1000;
+    const AMPR_MANIFEST_URL = 'https://pippo26442999.github.io/.exFAT/ampr-emu-drakmor/manifest.json';
 
     const state = {
       games: [],
@@ -2101,9 +2742,14 @@
       gamesLoaded: false,
       gamesError: '',
       terminated: false,
+      appName: 'Game Compressor',
+      appVersion: '',
       history: [],
       usb: [],
       job: null,
+      theme: window.__gcInitialTheme === 'dark' ? 'dark' : 'light',
+      savedTheme: window.__gcInitialTheme === 'dark' ? 'dark' : 'light',
+      themeSaving: false,
       speed: {
         activeId: '',
         metricKey: '',
@@ -2141,6 +2787,17 @@
       deleteGame: null,
       deleteBusy: false,
       secondaryMenuFor: '',
+      amprBusy: false,
+      amprLatestStarted: false,
+      amprLatestReady: false,
+      amprLatestError: '',
+      amprPickerGame: null,
+      amprPickerVersions: [],
+      amprPickerSelected: '',
+      amprPickerLoading: false,
+      amprPickerBusy: false,
+      amprPickerBusyText: '',
+      amprPickerError: '',
       notice: null,
       noticedHistory: false,
       seenOperationKeys: {},
@@ -2233,6 +2890,8 @@
         timer: '<path d="M9 2h6"/><path d="M12 6v2"/><circle cx="12" cy="14" r="8"/><path d="M12 10v4l3 2"/>',
         copy: '<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',
         refresh: '<path d="M21 12a9 9 0 0 1-15 6.7"/><path d="M3 12a9 9 0 0 1 15-6.7"/><path d="M18 3v5h-5"/><path d="M6 21v-5h5"/>',
+        sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/>',
+        moon: '<path d="M20.5 14.5A8.5 8.5 0 0 1 9.5 3.5 7 7 0 1 0 20.5 14.5Z"/>',
         power: '<path d="M12 2v10"/><path d="M18.4 6.6a9 9 0 1 1-12.8 0"/>',
         close: '<path d="M18 6 6 18"/><path d="m6 6 12 12"/>'
       };
@@ -2249,6 +2908,16 @@
         i++;
       }
       return (i === 0 ? n.toFixed(0) : n.toFixed(n >= 10 ? 1 : 2)) + ' ' + units[i];
+    }
+
+    function formatByteText(text) {
+      return String(text || '').replace(/\b(\d{1,20})\s+more\s+bytes?\b/gi, (_match, value) => {
+        const bytes = Number(value);
+        return Number.isFinite(bytes) ? shortSize(bytes) + ' more' : value + ' more bytes';
+      }).replace(/\b(\d{1,20})\s+bytes?\b/gi, (_match, value) => {
+        const bytes = Number(value);
+        return Number.isFinite(bytes) ? shortSize(bytes) : value + ' bytes';
+      });
     }
 
     function cardSize(bytes) {
@@ -2291,11 +2960,764 @@
       let data = {};
       try { data = text ? JSON.parse(text) : {}; } catch (err) { }
       if (!res.ok) {
-        const e = new Error(data.error || text || res.statusText);
+        const e = new Error(formatByteText(data.error || text || res.statusText));
         e.data = data;
         throw e;
       }
       return data;
+    }
+
+    function cleanAppVersion(version) {
+      return String(version || '').trim();
+    }
+
+    function appVersionText() {
+      const version = cleanAppVersion(state.appVersion);
+      return version ? version : '';
+    }
+
+    function renderAppChrome() {
+      const name = String(state.appName || 'Game Compressor').trim() || 'Game Compressor';
+      const version = appVersionText();
+      const sidebarName = $('sidebar-app-name');
+      const sidebarVersion = $('sidebar-version');
+      const infoTitle = $('info-title');
+      if (sidebarName) sidebarName.textContent = name;
+      if (sidebarVersion) sidebarVersion.textContent = version;
+      if (infoTitle) infoTitle.textContent = version ? name + ' ' + version : name;
+    }
+
+    async function loadAppStatus() {
+      try {
+        const data = await api('/api/status');
+        state.appName = String(data.name || state.appName || 'Game Compressor').trim() || 'Game Compressor';
+        state.appVersion = cleanAppVersion(data.version);
+      } catch (err) {
+        state.appName = state.appName || 'Game Compressor';
+      }
+      renderAppChrome();
+    }
+
+    function normalizeTheme(value) {
+      return String(value || '').toLowerCase() === 'dark' ? 'dark' : 'light';
+    }
+
+    function applyTheme(theme) {
+      const normalized = normalizeTheme(theme);
+      state.theme = normalized;
+      document.documentElement.classList.toggle('theme-dark', normalized === 'dark');
+      document.documentElement.classList.toggle('theme-light', normalized !== 'dark');
+      document.body.classList.toggle('theme-dark', normalized === 'dark');
+      document.body.classList.toggle('theme-light', normalized !== 'dark');
+      writeCookie(THEME_COOKIE, normalized, 365);
+      const light = $('theme-light');
+      const dark = $('theme-dark');
+      if (light) {
+        light.classList.toggle('is-selected', normalized === 'light');
+        light.setAttribute('aria-pressed', normalized === 'light' ? 'true' : 'false');
+      }
+      if (dark) {
+        dark.classList.toggle('is-selected', normalized === 'dark');
+        dark.setAttribute('aria-pressed', normalized === 'dark' ? 'true' : 'false');
+      }
+      state.renderKeys.header = '';
+    }
+
+    async function loadUiSettings() {
+      try {
+        const data = await api('/api/gc/ui-settings');
+        const theme = normalizeTheme(data.theme);
+        state.savedTheme = theme;
+        applyTheme(theme);
+      } catch (err) {
+        state.savedTheme = state.theme;
+        applyTheme(state.theme);
+      }
+    }
+
+    async function setUiTheme(theme) {
+      const normalized = normalizeTheme(theme);
+      if (state.themeSaving || normalized === state.theme) return;
+      const previous = state.savedTheme || state.theme;
+      state.themeSaving = true;
+      applyTheme(normalized);
+      try {
+        const data = await api('/api/gc/ui-settings?theme=' +
+          encodeURIComponent(normalized), { method: 'POST' });
+        const saved = normalizeTheme(data.theme || normalized);
+        state.savedTheme = saved;
+        applyTheme(saved);
+      } catch (err) {
+        applyTheme(previous);
+        alert(formatByteText(err.message || 'Could not save display mode'));
+      } finally {
+        state.themeSaving = false;
+      }
+    }
+
+    function bytesToHex(buffer) {
+      const bytes = new Uint8Array(buffer);
+      let hex = '';
+      for (let i = 0; i < bytes.length; i++) {
+        hex += bytes[i].toString(16).padStart(2, '0');
+      }
+      return hex;
+    }
+
+    function sha256HexFallback(buffer) {
+      const bytes = new Uint8Array(buffer);
+      const k = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
+        0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+        0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
+        0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+        0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
+        0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
+        0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+        0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+      ];
+      const bitLen = bytes.length * 8;
+      const paddedLen = (((bytes.length + 9 + 63) >> 6) << 6);
+      const data = new Uint8Array(paddedLen);
+      data.set(bytes);
+      data[bytes.length] = 0x80;
+      const view = new DataView(data.buffer);
+      view.setUint32(paddedLen - 8, Math.floor(bitLen / 0x100000000));
+      view.setUint32(paddedLen - 4, bitLen >>> 0);
+      const h = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
+      ];
+      const w = new Array(64);
+      const rotr = (x, n) => (x >>> n) | (x << (32 - n));
+      for (let offset = 0; offset < paddedLen; offset += 64) {
+        for (let i = 0; i < 16; i++) {
+          w[i] = view.getUint32(offset + i * 4);
+        }
+        for (let i = 16; i < 64; i++) {
+          const s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >>> 3);
+          const s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >>> 10);
+          w[i] = (w[i - 16] + s0 + w[i - 7] + s1) >>> 0;
+        }
+        let a = h[0], b = h[1], c = h[2], d = h[3];
+        let e = h[4], f = h[5], g = h[6], hh = h[7];
+        for (let i = 0; i < 64; i++) {
+          const s1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+          const ch = (e & f) ^ (~e & g);
+          const temp1 = (hh + s1 + ch + k[i] + w[i]) >>> 0;
+          const s0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+          const maj = (a & b) ^ (a & c) ^ (b & c);
+          const temp2 = (s0 + maj) >>> 0;
+          hh = g;
+          g = f;
+          f = e;
+          e = (d + temp1) >>> 0;
+          d = c;
+          c = b;
+          b = a;
+          a = (temp1 + temp2) >>> 0;
+        }
+        h[0] = (h[0] + a) >>> 0;
+        h[1] = (h[1] + b) >>> 0;
+        h[2] = (h[2] + c) >>> 0;
+        h[3] = (h[3] + d) >>> 0;
+        h[4] = (h[4] + e) >>> 0;
+        h[5] = (h[5] + f) >>> 0;
+        h[6] = (h[6] + g) >>> 0;
+        h[7] = (h[7] + hh) >>> 0;
+      }
+      return h.map((x) => x.toString(16).padStart(8, '0')).join('');
+    }
+
+    async function sha256Hex(buffer) {
+      if (window.crypto && crypto.subtle && crypto.subtle.digest) {
+        const digest = await crypto.subtle.digest('SHA-256', buffer);
+        return bytesToHex(digest);
+      }
+      return sha256HexFallback(buffer);
+    }
+
+    function amprVersionFromPath(path, fallback) {
+      const text = String(path || '');
+      const match = text.match(/(?:^|\/)([^/?#]+)\/libSceAmpr\.sprx(?:[?#]|$)/i);
+      if (match && match[1]) return match[1];
+      return String(fallback || '').trim();
+    }
+
+    function amprSafeVersion(version) {
+      return /^[A-Za-z0-9._-]{1,63}$/.test(String(version || ''));
+    }
+
+    function amprSafeSize(size) {
+      const value = Number(size || 0);
+      return Number.isFinite(value) && value > 0 ? value : 0;
+    }
+
+    function amprEntryDeclaredSize(value) {
+      if (!value || typeof value !== 'object') return 0;
+      const candidates = [
+        value.size,
+        value.bytes,
+        value.fileSize,
+        value.file_size,
+        value.contentLength,
+        value.content_length,
+        value.length
+      ];
+      for (const candidate of candidates) {
+        const size = amprSafeSize(candidate);
+        if (size) return size;
+      }
+      return 0;
+    }
+
+    function amprSizeFromHeaders(headers) {
+      if (!headers) return 0;
+      const contentLength = amprSafeSize(headers.get('content-length'));
+      if (contentLength) return contentLength;
+      const etag = String(headers.get('etag') || '');
+      const match = etag.match(/-([0-9a-f]+)"?$/i);
+      if (!match) return 0;
+      const parsed = parseInt(match[1], 16);
+      return amprSafeSize(parsed);
+    }
+
+    async function enrichAmprEntrySizes(entries) {
+      await Promise.all(entries.map(async (entry) => {
+        if (!entry || entry.size || !entry.url) return;
+        try {
+          const res = await fetch(entry.url, { method: 'HEAD', cache: 'no-store' });
+          if (!res.ok) return;
+          const size = amprSizeFromHeaders(res.headers);
+          if (size) entry.size = size;
+        } catch (err) { }
+      }));
+    }
+
+    function compareAmprVersions(a, b) {
+      const left = String(a || '').split(/[^A-Za-z0-9]+/).filter(Boolean);
+      const right = String(b || '').split(/[^A-Za-z0-9]+/).filter(Boolean);
+      const len = Math.max(left.length, right.length);
+      for (let i = 0; i < len; i++) {
+        const av = left[i] || '0';
+        const bv = right[i] || '0';
+        const an = /^\d+$/.test(av) ? Number(av) : NaN;
+        const bn = /^\d+$/.test(bv) ? Number(bv) : NaN;
+        const cmp = !Number.isNaN(an) && !Number.isNaN(bn)
+          ? an - bn
+          : av.localeCompare(bv, undefined, { numeric: true, sensitivity: 'base' });
+        if (cmp) return cmp;
+      }
+      return 0;
+    }
+
+    function amprEntryFromValue(value, versionHint) {
+      if (!value || typeof value !== 'object') return null;
+      const path = value.url || value.href || value.downloadUrl || value.download_url ||
+        value.file || value.path || value.name || '';
+      if (!/libSceAmpr\.sprx(?:[?#]|$)/i.test(String(path))) return null;
+      const version = amprVersionFromPath(path, value.version || value.tag || versionHint);
+      if (!amprSafeVersion(version)) return null;
+      let url = '';
+      try {
+        url = new URL(String(path), AMPR_MANIFEST_URL).toString();
+      } catch (err) {
+        return null;
+      }
+      const sha256 = String(value.sha256 || value.sha || value.hash || '').trim().toLowerCase();
+      return {
+        version,
+        url,
+        sha256: /^[0-9a-f]{64}$/.test(sha256) ? sha256 : '',
+        size: amprEntryDeclaredSize(value)
+      };
+    }
+
+    function collectAmprManifestEntries(value, out, versionHint, depth) {
+      if (depth > 5 || value == null) return;
+      if (typeof value === 'string') {
+        const path = value;
+        if (/libSceAmpr\.sprx(?:[?#]|$)/i.test(path)) {
+          const version = amprVersionFromPath(path, versionHint);
+          if (amprSafeVersion(version)) {
+            try {
+              out.push({
+                version,
+                url: new URL(path, AMPR_MANIFEST_URL).toString(),
+                sha256: '',
+                size: 0
+              });
+            } catch (err) { }
+          }
+        }
+        return;
+      }
+      if (Array.isArray(value)) {
+        value.forEach((item) => collectAmprManifestEntries(item, out, versionHint, depth + 1));
+        return;
+      }
+      if (typeof value !== 'object') return;
+      const direct = amprEntryFromValue(value, versionHint);
+      if (direct) out.push(direct);
+      Object.keys(value).forEach((key) => {
+        const nextHint = amprSafeVersion(key) ? key : (value.version || value.tag || versionHint);
+        collectAmprManifestEntries(value[key], out, nextHint, depth + 1);
+      });
+    }
+
+    function latestAmprManifestEntry(manifest) {
+      const list = amprManifestEntryList(manifest);
+      return list[0] || null;
+    }
+
+    function amprManifestEntryList(manifest) {
+      const entries = [];
+      collectAmprManifestEntries(manifest, entries, '', 0);
+      const unique = {};
+      entries.forEach((entry) => {
+        const current = unique[entry.version];
+        if (!current || (entry.sha256 && !current.sha256)) {
+          unique[entry.version] = entry;
+        }
+      });
+      const list = Object.values(unique);
+      list.sort((a, b) => compareAmprVersions(b.version, a.version));
+      return list;
+    }
+
+    async function fetchAmprManifestEntries(options) {
+      const res = await fetch(AMPR_MANIFEST_URL, { cache: 'no-store' });
+      if (!res.ok) throw new Error('APR-EMU manifest fetch failed');
+      const manifest = await res.json();
+      const list = amprManifestEntryList(manifest);
+      if (!list.length) throw new Error('APR-EMU manifest did not include libSceAmpr.sprx');
+      if (options && options.includeSizes) await enrichAmprEntrySizes(list);
+      return list;
+    }
+
+    async function fetchLatestAmprEntry() {
+      const list = await fetchAmprManifestEntries();
+      return list[0];
+    }
+
+    async function cacheAmprEntry(entry, options) {
+      const res = await fetch(entry.url, { cache: 'no-store' });
+      if (!res.ok) throw new Error('APR-EMU binary download failed');
+      const bytes = await res.arrayBuffer();
+      let url = '/api/gc/ampr/upload?version=' + encodeURIComponent(entry.version) +
+        '&sourceUrl=' + encodeURIComponent(entry.url) +
+        '&setLatest=' + encodeURIComponent(options && options.setLatest === false ? '0' : '1');
+      if (entry.sha256) url += '&sha256=' + encodeURIComponent(entry.sha256);
+      const uploaded = await api(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: bytes
+      });
+      return Object.assign({}, entry, {
+        cached: true,
+        path: uploaded.path || entry.path || '',
+        sha256: uploaded.sha256 || entry.sha256 || '',
+        size: uploaded.size || entry.size || 0
+      });
+    }
+
+    async function bootstrapAmprLatest(force) {
+      if (state.amprLatestReady && !force) return true;
+      if (state.amprLatestStarted && !force) return false;
+      state.amprLatestStarted = true;
+      state.amprLatestError = '';
+      try {
+        const entry = await fetchLatestAmprEntry();
+        await cacheAmprEntry(entry);
+        state.amprLatestReady = true;
+        state.amprLatestError = '';
+        return true;
+      } catch (err) {
+        state.amprLatestError = err.message || 'APR-EMU update check failed';
+        return false;
+      }
+    }
+
+    async function enqueueAmprUpdate(g, version, sha256, intent) {
+      if (!g || !g.sourcePath || !version || !sha256) return;
+      const updateIntent = intent || 'manual';
+      await api('/api/gc/update-ampr?' + gameQuery(g) +
+        '&version=' + encodeURIComponent(version) +
+        '&sha256=' + encodeURIComponent(sha256) +
+        '&intent=' + encodeURIComponent(updateIntent), {
+        method: 'POST'
+      });
+      startPollBurst(6000);
+      await refreshAll();
+    }
+
+    function amprCustomVersionForSha(sha256) {
+      const clean = String(sha256 || '').toLowerCase();
+      return 'custom-' + clean.slice(0, 12);
+    }
+
+    function amprCustomSourceUrl(file) {
+      const rawName = String((file && file.name) || 'libSceAmpr.sprx');
+      const name = rawName.replace(/[^A-Za-z0-9._ -]+/g, '_').slice(0, 120) || 'libSceAmpr.sprx';
+      return 'custom-upload:' + name;
+    }
+
+    function isPs5Browser() {
+      const nav = typeof navigator !== 'undefined' ? navigator : {};
+      const ua = String(nav.userAgent || '');
+      const platform = String(nav.platform || '');
+      return /PlayStation 5/i.test(ua) || /PlayStation 5/i.test(platform);
+    }
+
+    function showPs5CustomAmprUploadMessage() {
+      const message = 'Upload custom libSceAmpr from your computer. Not supported on PS5 browser.';
+      const status = $('ampr-version-status');
+      if (status) status.textContent = message;
+      alert(message);
+    }
+
+    async function cacheCustomAmprFile(file) {
+      if (!file || !file.size) throw new Error('Custom APR-EMU file is empty');
+      const bytes = await file.arrayBuffer();
+      const sha256 = await sha256Hex(bytes);
+      if (!sha256HexLooksValid(sha256)) {
+        throw new Error('Custom APR-EMU SHA-256 could not be computed');
+      }
+      const version = amprCustomVersionForSha(sha256);
+      const url = '/api/gc/ampr/upload?version=' + encodeURIComponent(version) +
+        '&sourceUrl=' + encodeURIComponent(amprCustomSourceUrl(file)) +
+        '&sha256=' + encodeURIComponent(sha256) +
+        '&setLatest=0';
+      const uploaded = await api(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: bytes
+      });
+      return {
+        version,
+        sha256: uploaded.sha256 || sha256,
+        size: uploaded.size || file.size || bytes.byteLength,
+        path: uploaded.path || '',
+        cached: true,
+        custom: true
+      };
+    }
+
+    async function updateAmprForGame(g) {
+      if (!g || !g.sourcePath || state.amprBusy || jobIsBusy()) return;
+      state.amprBusy = true;
+      refreshPrimaryArea(g);
+      try {
+        if (!g.amprLatestVersion || !g.amprLatestSha256) {
+          await bootstrapAmprLatest(true);
+          await refreshAll();
+          g = selectedGame() || g;
+        }
+        if (!g.amprLatestVersion || !g.amprLatestSha256) {
+          throw new Error(state.amprLatestError || 'APR-EMU latest cache is unavailable');
+        }
+        await enqueueAmprUpdate(g, g.amprLatestVersion, g.amprLatestSha256,
+          'latest');
+      } catch (err) {
+        alert(formatByteText(err.message || 'APR-EMU update failed'));
+      } finally {
+        state.amprBusy = false;
+        refreshPrimaryArea(selectedGame());
+      }
+    }
+
+    async function restoreOriginalAmprForGame(g) {
+      if (!g || !g.sourcePath || state.amprBusy || jobIsBusy()) return;
+      state.amprBusy = true;
+      refreshPrimaryArea(g);
+      try {
+        await api('/api/gc/restore-ampr-original?' + gameQuery(g), {
+          method: 'POST'
+        });
+        startPollBurst(6000);
+        await refreshAll();
+      } catch (err) {
+        alert(formatByteText(err.message || 'Original APR-EMU restore failed'));
+      } finally {
+        state.amprBusy = false;
+        refreshPrimaryArea(selectedGame());
+      }
+    }
+
+    function mergeAmprVersionEntry(map, entry) {
+      if (!entry || !amprSafeVersion(entry.version)) return;
+      const version = String(entry.version);
+      const current = map[version] || { version };
+      map[version] = Object.assign(current, {
+        version,
+        url: entry.url || current.url || '',
+        sha256: entry.sha256 || current.sha256 || '',
+        path: entry.path || current.path || '',
+        size: amprSafeSize(entry.size) || amprSafeSize(current.size),
+        cached: !!(current.cached || entry.cached)
+      });
+    }
+
+    async function loadAmprVersionEntries(g) {
+      const map = {};
+      let manifestError = '';
+      let manifestEntries = [];
+      try {
+        manifestEntries = await fetchAmprManifestEntries({ includeSizes: true });
+        manifestEntries.forEach((entry, index) => {
+          mergeAmprVersionEntry(map, Object.assign({}, entry, {
+            isLatest: index === 0
+          }));
+        });
+      } catch (err) {
+        manifestError = err.message || 'APR-EMU manifest fetch failed';
+      }
+      try {
+        const cached = await api('/api/gc/ampr/versions');
+        (cached.versions || []).forEach((entry) => {
+          mergeAmprVersionEntry(map, Object.assign({}, entry, { cached: true }));
+        });
+      } catch (err) {
+        if (!Object.keys(map).length) throw err;
+      }
+      if (g && amprSafeVersion(g.amprLatestVersion) && g.amprLatestSha256) {
+        mergeAmprVersionEntry(map, {
+          version: g.amprLatestVersion,
+          sha256: g.amprLatestSha256,
+          cached: true,
+          isLatest: true
+        });
+      }
+      const latestVersion = manifestEntries[0] && manifestEntries[0].version
+        ? manifestEntries[0].version
+        : (g && g.amprLatestVersion ? g.amprLatestVersion : '');
+      const list = Object.values(map).map((entry) => Object.assign(entry, {
+        isLatest: latestVersion && entry.version === latestVersion
+      })).sort((a, b) => compareAmprVersions(b.version, a.version));
+      if (!list.length && manifestError) throw new Error(manifestError);
+      return { list, manifestError };
+    }
+
+    function amprSelectedEntry() {
+      const selected = String(state.amprPickerSelected || '');
+      return state.amprPickerVersions.find((entry) => entry.version === selected) || null;
+    }
+
+    function amprEntryIsCurrent(g, entry) {
+      if (!g || !entry) return false;
+      const currentSha = String(g.amprSha256 || '').toLowerCase();
+      const entrySha = String(entry.sha256 || '').toLowerCase();
+      if (sha256HexLooksValid(currentSha) && sha256HexLooksValid(entrySha)) {
+        return currentSha === entrySha;
+      }
+      return amprCurrentVersion(g) && entry.version === amprCurrentVersion(g);
+    }
+
+    function sha256HexLooksValid(value) {
+      return /^[0-9a-f]{64}$/.test(String(value || '').toLowerCase());
+    }
+
+    function renderAmprVersionModal() {
+      const g = state.amprPickerGame;
+      const list = $('ampr-version-list');
+      const status = $('ampr-version-status');
+      const apply = $('ampr-version-apply');
+      const cancel = $('ampr-version-cancel');
+      const close = $('ampr-version-close');
+      const custom = $('ampr-custom-upload');
+      if (!list || !status || !apply) return;
+      if (state.amprPickerLoading) {
+        list.innerHTML = '<div class="empty">Loading APR-EMU versions</div>';
+      } else if (state.amprPickerError) {
+        list.innerHTML = '<div class="empty">' + escapeHtml(state.amprPickerError) + '</div>';
+      } else if (!state.amprPickerVersions.length) {
+        list.innerHTML = '<div class="empty">No APR-EMU versions cached or available</div>';
+      } else {
+        list.innerHTML = state.amprPickerVersions.map((entry) => {
+          const selected = entry.version === state.amprPickerSelected;
+          const current = amprEntryIsCurrent(g, entry);
+          const chips = [];
+          if (current) chips.push('Current');
+          if (entry.isLatest) chips.push('Latest');
+          chips.push(entry.cached ? 'Cached' : 'Download');
+          const sizeText = amprSafeSize(entry.size)
+            ? 'Size ' + shortSize(entry.size)
+            : 'Size after download';
+          const meta = [
+            sizeText,
+            entry.sha256 ? 'SHA ' + entry.sha256.slice(0, 12) : 'SHA after download',
+            entry.cached ? 'stored on PS5' : 'downloads before applying'
+          ].join(' - ');
+          return '<button class="format-row' +
+            (selected ? ' is-selected' : '') +
+            '" type="button" data-ampr-version="' + escapeHtml(entry.version) + '">' +
+            '<div>' +
+            '<div class="history-title">APR v' + escapeHtml(entry.version) + '</div>' +
+            '<div class="history-meta">' + escapeHtml(meta) + '</div>' +
+            '</div>' +
+            '<span class="chip ' + (selected ? 'selected' : (current ? 'ok' : (entry.isLatest ? 'ampr' : ''))) + '">' +
+            escapeHtml(selected ? 'Selected' : chips[0]) + '</span>' +
+            '</button>';
+        }).join('');
+      }
+      const selectedEntry = amprSelectedEntry();
+      const selectedCurrent = amprEntryIsCurrent(g, selectedEntry);
+      apply.disabled = state.amprPickerLoading || state.amprPickerBusy ||
+        !selectedEntry || selectedCurrent || jobIsBusy();
+      apply.textContent = state.amprPickerBusy
+        ? 'Applying...'
+        : (selectedCurrent ? 'Installed' : 'Apply Version');
+      if (custom) {
+        custom.disabled = state.amprPickerLoading || state.amprPickerBusy ||
+          !g || jobIsBusy();
+        custom.textContent = state.amprPickerBusy ? 'Working...' : 'Upload Custom File';
+      }
+      if (cancel) cancel.disabled = state.amprPickerBusy;
+      if (close) close.disabled = state.amprPickerBusy;
+      if (state.amprPickerBusy) {
+        status.textContent = state.amprPickerBusyText || 'Preparing APR-EMU';
+      } else if (state.amprPickerError) {
+        status.textContent = '';
+      } else if (selectedEntry) {
+        status.textContent = selectedCurrent
+          ? 'Selected version is already installed.'
+          : (selectedEntry.cached
+            ? 'Selected version is cached and ready to apply.'
+            : 'Selected version will be downloaded, cached, then applied.');
+      } else {
+        status.textContent = '';
+      }
+      list.querySelectorAll('[data-ampr-version]').forEach((button) => {
+        button.addEventListener('click', () => {
+          if (state.amprPickerBusy) return;
+          state.amprPickerSelected = button.getAttribute('data-ampr-version') || '';
+          renderAmprVersionModal();
+        });
+      });
+    }
+
+    async function showAmprVersionModal(g) {
+      if (!g || !g.sourcePath || !g.amprPresent) return;
+      state.amprPickerGame = g;
+      state.amprPickerVersions = [];
+      state.amprPickerSelected = amprCurrentVersion(g) || g.amprLatestVersion || '';
+      state.amprPickerLoading = true;
+      state.amprPickerBusy = false;
+      state.amprPickerBusyText = '';
+      state.amprPickerError = '';
+      $('ampr-version-title').textContent = 'APR-EMU Version - ' + (g.name || g.titleId);
+      renderAmprVersionModal();
+      showModal('ampr-version-modal');
+      try {
+        const result = await loadAmprVersionEntries(g);
+        state.amprPickerVersions = result.list || [];
+        if (!state.amprPickerVersions.some((entry) => entry.version === state.amprPickerSelected)) {
+          const current = state.amprPickerVersions.find((entry) => amprEntryIsCurrent(g, entry));
+          state.amprPickerSelected = current
+            ? current.version
+            : (state.amprPickerVersions[0] ? state.amprPickerVersions[0].version : '');
+        }
+        state.amprPickerError = '';
+      } catch (err) {
+        state.amprPickerVersions = [];
+        state.amprPickerError = err.message || 'APR-EMU version list failed';
+      } finally {
+        state.amprPickerLoading = false;
+        renderAmprVersionModal();
+      }
+    }
+
+    function closeAmprVersionModal() {
+      if (state.amprPickerBusy) return;
+      hideModal('ampr-version-modal');
+      state.amprPickerGame = null;
+      state.amprPickerVersions = [];
+      state.amprPickerSelected = '';
+      state.amprPickerLoading = false;
+      state.amprPickerBusyText = '';
+      state.amprPickerError = '';
+    }
+
+    async function uploadCustomAmprFile(file) {
+      let g = state.amprPickerGame;
+      if (!g || !file || state.amprPickerBusy || jobIsBusy()) return;
+      state.amprPickerBusy = true;
+      state.amprBusy = true;
+      state.amprPickerBusyText = 'Hashing and uploading custom APR-EMU file';
+      state.amprPickerError = '';
+      renderAmprVersionModal();
+      refreshPrimaryArea(g);
+      try {
+        const entry = await cacheCustomAmprFile(file);
+        state.amprPickerVersions = [
+          entry,
+          ...state.amprPickerVersions.filter((item) => item.version !== entry.version)
+        ];
+        state.amprPickerSelected = entry.version;
+        if (amprEntryIsCurrent(g, entry)) return;
+        state.amprPickerBusyText = 'Applying custom APR-EMU file';
+        renderAmprVersionModal();
+        hideModal('ampr-version-modal');
+        await enqueueAmprUpdate(g, entry.version, entry.sha256, 'custom');
+        state.amprPickerGame = null;
+        state.amprPickerVersions = [];
+        state.amprPickerSelected = '';
+      } catch (err) {
+        state.amprPickerError = err.message || 'Custom APR-EMU upload failed';
+        alert(formatByteText(state.amprPickerError));
+      } finally {
+        state.amprPickerBusy = false;
+        state.amprBusy = false;
+        state.amprPickerBusyText = '';
+        renderAmprVersionModal();
+        refreshPrimaryArea(selectedGame());
+      }
+    }
+
+    async function applySelectedAmprVersion() {
+      let g = state.amprPickerGame;
+      let entry = amprSelectedEntry();
+      if (!g || !entry || state.amprPickerBusy || jobIsBusy()) return;
+      if (amprEntryIsCurrent(g, entry)) return;
+      state.amprPickerBusy = true;
+      state.amprBusy = true;
+      state.amprPickerBusyText = entry.cached
+        ? 'Applying cached APR-EMU version'
+        : 'Downloading and preparing APR-EMU';
+      renderAmprVersionModal();
+      refreshPrimaryArea(g);
+      try {
+        if (!entry.cached || !entry.sha256) {
+          if (!entry.url) throw new Error('Selected APR-EMU version has no download URL');
+          entry = await cacheAmprEntry(entry, { setLatest: !!entry.isLatest });
+          state.amprPickerVersions = state.amprPickerVersions.map((item) =>
+            item.version === entry.version ? Object.assign({}, item, entry) : item
+          );
+        }
+        if (!entry.sha256) throw new Error('Selected APR-EMU SHA-256 is unavailable');
+        hideModal('ampr-version-modal');
+        await enqueueAmprUpdate(g, entry.version, entry.sha256, 'manual');
+        state.amprPickerGame = null;
+        state.amprPickerVersions = [];
+        state.amprPickerSelected = '';
+      } catch (err) {
+        state.amprPickerError = err.message || 'APR-EMU version apply failed';
+        alert(formatByteText(state.amprPickerError));
+      } finally {
+        state.amprPickerBusy = false;
+        state.amprBusy = false;
+        state.amprPickerBusyText = '';
+        renderAmprVersionModal();
+        refreshPrimaryArea(selectedGame());
+      }
     }
 
     function selectedGame() {
@@ -2452,6 +3874,18 @@
         }
         return { label: 'Building APR Index', className: 'scanning' };
       }
+      if (action === 'update-ampr') {
+        if (phase === 'complete') {
+          return { label: 'APR-EMU Updated', className: 'ampr-updating' };
+        }
+        if (phase === 'rebuilding') {
+          return { label: 'Rebuilding APR-EMU', className: 'ampr-updating' };
+        }
+        if (phase === 'patching') {
+          return { label: 'Updating APR-EMU', className: 'ampr-updating' };
+        }
+        return { label: 'Updating APR-EMU', className: 'ampr-updating' };
+      }
       if (action === 'read-speed-test') {
         return { label: 'Testing Read Speed', className: 'reading' };
       }
@@ -2572,6 +4006,7 @@
         phase === 'copying' ||
         phase === 'unpacking' ||
         phase === 'moving' ||
+        phase === 'rebuilding' ||
         phase === 'restoring' ||
         phase === 'read-test')) {
         return {
@@ -2612,6 +4047,9 @@
           escapeHtml(pendingOperationLabel(g.pendingOp).toLowerCase()) +
           '</span>';
       }
+      if (g.amprUpdateNeeded === true) {
+        return '<span class="chip ampr">APR update</span>';
+      }
       if (g.sourceKind === 'compressed') {
         if (g.validation === 'validated') return '<span class="chip ok">validated</span>';
         if (g.validation === 'changed') return '<span class="chip warn">changed</span>';
@@ -2650,7 +4088,36 @@
 	    }
 
 	    function aprIndexedChip(item) {
-	      return item && item.aprIndexed ? '<span class="chip ok">APR indexed</span>' : '';
+	      return item && item.aprIndexed ? '<span class="chip ok">APR Indexed</span>' : '';
+	    }
+
+	    function amprUpdateChip(g) {
+	      return g && g.amprUpdateNeeded === true ? '<span class="chip ampr">APR update needed</span>' : '';
+	    }
+
+	    function amprCurrentVersion(g) {
+	      const version = String((g && g.amprVersion) || '').trim();
+	      return amprSafeVersion(version) ? version : '';
+	    }
+
+	    function amprVersionDisplay(version) {
+	      const text = String(version || '').trim();
+	      if (text === 'original') return 'APR original';
+	      if (text.indexOf('custom-') === 0) return 'APR custom';
+	      return text ? 'APR v' + text : '';
+	    }
+
+	    function amprVersionChip(g) {
+	      const version = amprCurrentVersion(g);
+	      const label = amprVersionDisplay(version);
+	      return label ? '<span class="chip ampr-version">' + escapeHtml(label) + '</span>' : '';
+	    }
+
+	    function amprCanRestoreOriginal(g) {
+	      if (!g || g.amprOriginalAvailable !== true || g.amprPresent !== true) return false;
+	      const current = String(g.amprSha256 || '').toLowerCase();
+	      const original = String(g.amprOriginalSha256 || '').toLowerCase();
+	      return !current || !original || current !== original;
 	    }
 
 	    function gameAprIndexedFromLastState(g) {
@@ -2695,7 +4162,7 @@
 	    }
 
 	    function aprIndexedChipForGame(g) {
-	      return gameAprIndexedFromLastState(g) ? '<span class="chip ok">APR indexed</span>' : '';
+	      return gameAprIndexedFromLastState(g) ? '<span class="chip ok">APR Indexed</span>' : '';
 	    }
 
 	    function instanceRoleChip(g) {
@@ -2711,6 +4178,14 @@
 	      return '<span class="chip">' + escapeHtml(smallLabel(count + ' locations')) + '</span>';
 	    }
 
+	    function rowTagLabel(tag) {
+	      return /^APR\b/.test(String(tag || '')) ? tag : smallLabel(tag);
+	    }
+
+	    function rowTagClass(tag) {
+	      return /^APR\b/.test(String(tag || '')) ? 'row-tag is-apr' : 'row-tag';
+	    }
+
 	    function rowTagsHtml(g) {
 	      const tags = [];
 	      const storage = storageLabelForGame(g);
@@ -2718,10 +4193,13 @@
 	      const count = titleInstanceCount(g);
 	      if (storage) tags.push(storage);
 	      if (role) tags.push(role);
+	      const amprVersion = amprCurrentVersion(g);
+	      if (amprVersion) tags.push(amprVersionDisplay(amprVersion));
+	      if (g && g.amprUpdateNeeded === true) tags.push('APR update');
 	      if (count > 1) tags.push(count + ' locations');
 	      if (!tags.length) return '';
 	      return '<div class="row-tags">' + tags.map((tag) => (
-	        '<span class="row-tag">' + escapeHtml(tag === 'APR indexed' ? tag : smallLabel(tag)) + '</span>'
+	        '<span class="' + rowTagClass(tag) + '">' + escapeHtml(rowTagLabel(tag)) + '</span>'
 	      )).join('') + '</div>';
 	    }
 
@@ -2807,6 +4285,7 @@
         if (action === 'make-image') return source + ' made into image';
         if (action === 'uncompress') return source + ' unpacked in place';
 	        if (action === 'extract-image') return source + ' extracted to folder';
+	        if (action === 'update-ampr') return source + ' APR-EMU updated';
 	        return source;
 	      }
 	      return source + ' -> ' + target;
@@ -3000,6 +4479,7 @@
         action === 'make-image' ||
         action === 'uncompress' ||
         action === 'extract-image' ||
+        action === 'update-ampr' ||
         action === 'move-to-usb' ||
         action === 'move-to-internal' ||
         action === 'copy-to-usb' ||
@@ -3229,12 +4709,13 @@
       if (action === 'refresh-mount') return 'Mount failed';
       if (action === 'set-read-only') return 'Set read-only failed';
       if (action === 'build-ampr-index') return 'APR index failed';
+      if (action === 'update-ampr') return 'APR-EMU update failed';
       if (action === 'read-speed-test') return 'Read speed failed';
       return 'Operation failed';
     }
 
     function failureNoticeText(op) {
-      return String((op && op.error) || historyResultLabel(op, null) || 'Failed');
+      return formatByteText((op && op.error) || historyResultLabel(op, null) || 'Failed');
     }
 
     function showFailureNotice(op) {
@@ -3480,6 +4961,9 @@
         if (average) return 'avg ' + average;
         if (result === 'tested') return 'tested read speed';
       }
+      if (action === 'update-ampr' && result === 'updated') {
+        return 'APR-EMU updated';
+      }
       if (opLooksLikeMountFailure(op)) return "verified, didn't mount";
       const repairText = repairedBlocksText(op, job);
       if (!repairText) return result;
@@ -3541,15 +5025,16 @@
         startPollBurst(6000);
         await refreshAll();
       } catch (err) {
-        alert(err.message);
+        alert(formatByteText(err.message));
       }
     }
 
-    function iconPath(g) {
+    function iconPath(g, size) {
       if (!g || !g.hasIcon) return '';
       const version = iconVersion(g);
       const suffix = version ? '&v=' + encodeURIComponent(version) : '';
-      return '/api/gc/icon?titleId=' + encodeURIComponent(g.titleId) + suffix;
+      const sizePart = size ? '&size=' + encodeURIComponent(size) : '';
+      return '/api/gc/icon?titleId=' + encodeURIComponent(g.titleId) + sizePart + suffix;
     }
 
     function updateIconElements(path, objectUrl) {
@@ -3591,7 +5076,7 @@
     function gameIcon(g, hero) {
       const text = (g && g.titleId ? g.titleId.slice(4) : 'GC');
       if (g && g.hasIcon) {
-        const path = iconPath(g);
+        const path = iconPath(g, hero ? '' : 'thumb');
         const cached = state.iconCache[path];
         if (cached) {
           return '<img src="' + escapeHtml(cached) + '" alt="" data-icon-path="' +
@@ -3650,6 +5135,10 @@
         g.requiredBytes, g.extraBytes, g.streamMinFreeBytes,
         g.streamExtraBytes, g.savedBytes,
         g.compressionSourceSize, g.compressedSize,
+        g.amprPresent, g.amprUpdateNeeded, g.amprPath, g.amprVersion,
+        g.amprSha256,
+        g.amprLatestVersion, g.amprLatestSha256, g.amprUpdateSupported,
+        g.amprOriginalAvailable, g.amprOriginalSha256, g.amprOriginalSize,
         g.sizePending, g.sizeStatus, g.sizeEstimated,
         g.sizeMeasuredAt, g.sizeRefreshing,
         g.canStreamDelete, g.hasIcon,
@@ -3690,6 +5179,7 @@
       const g = selectedGame();
       const fallback = headerFreeSpaceGame(g);
       return [
+        state.theme,
         state.selected,
         g && g.freeBytes,
         fallback && fallback.freeBytes,
@@ -3842,7 +5332,7 @@
       return String(s || '').toLowerCase();
     }
 
-    function actionFor(g) {
+    function baseActionFor(g) {
       if (!g) return '';
       if (!g.sourcePath) return '';
       if (g.sourceKind === 'compressed') return 'validate-repair';
@@ -3850,8 +5340,14 @@
       return '';
     }
 
+    function actionFor(g) {
+      if (g && g.amprUpdateNeeded === true) return 'update-ampr';
+      return baseActionFor(g);
+    }
+
     function actionLabel(g) {
       const action = actionFor(g);
+      if (action === 'update-ampr') return 'Update APR-EMU';
       if (action === 'validate-repair') return g.primaryAction || 'Validate and Repair';
       if (action === 'compress') return g.primaryAction || 'Compress';
       return 'Start';
@@ -3872,6 +5368,7 @@
       if (action === 'copy-to-internal') return 'Pending Copy to Internal SSD';
       if (action === 'delete-game-data') return 'Pending Delete';
       if (action === 'build-ampr-index') return 'Pending APR Index';
+      if (action === 'update-ampr') return 'Pending APR-EMU Update';
 	      if (action === 'read-speed-test') return 'Pending Read Speed Test';
 	      return 'Pending Operation';
 	    }
@@ -3931,13 +5428,15 @@
 	    function progressTiming(job) {
 	      job = job || activeJob() || {};
 	      const elapsed = Math.max(0, Number(job.elapsedSeconds || 0));
+	      const phaseElapsed = Math.max(0, Number(job.phaseElapsedSeconds || 0));
       const units = progressUnits(job);
       const percent = progressPercent(job);
       const fraction = units.countable && units.total > 0 ? units.done / units.total : 0;
+      const etaElapsed = validationJobUsesPhaseEta(job) ? phaseElapsed : elapsed;
       const remaining = fraction >= 1
         ? 0
-        : fraction > 0.001 && elapsed > 0
-          ? Math.max(0, elapsed * (1 - fraction) / fraction)
+        : fraction > 0.001 && etaElapsed > 0
+          ? Math.max(0, etaElapsed * (1 - fraction) / fraction)
           : null;
       const reportedSpeed = reportedSpeedBytesPerSecond(job);
       const sampledSpeed = String(state.speed.activeId || '') === String(job.activeId || '')
@@ -4037,13 +5536,30 @@
 	      return null;
 	    }
 
+    function validationJobUsesPhaseEta(job) {
+      const action = String((job && job.verb) || '').toLowerCase();
+      const phase = String((job && job.phase) || '').toLowerCase();
+      const current = String((job && job.current) || '').toLowerCase();
+      const count = Number((job && job.phaseCount) || 0);
+      const validationAction =
+        action === 'validate-repair' ||
+        action === 'validate-only' ||
+        (action === 'compress' && current.indexOf('scanning mounted') !== -1);
+      return validationAction && count > 0 &&
+        (phase === 'scanning' || phase === 'validating' ||
+          phase === 'repairing' || phase === 'copying' ||
+          phase === 'metadata');
+    }
+
 	    function operationProgressTiming(job, visual, op, g) {
 	      const progress = progressTiming(job);
 	      const phaseProgress = operationProgressInfoForVisual(visual, job, op, g);
 	      if (!phaseProgress || !phaseProgress.countable || phaseProgress.total <= 0) {
 	        return progress;
 	      }
-	      const elapsed = Math.max(0, Number((job && job.elapsedSeconds) || 0));
+	      const elapsed = validationJobUsesPhaseEta(job)
+	        ? Math.max(0, Number((job && job.phaseElapsedSeconds) || 0))
+	        : Math.max(0, Number((job && job.elapsedSeconds) || 0));
 	      const fraction = Math.max(0, Math.min(1, phaseProgress.scanned / phaseProgress.total));
 	      const remaining = fraction >= 1
 	        ? 0
@@ -4160,16 +5676,36 @@
       if (!g || !g.sourcePath || g.activeOp || g.pendingOp || g.sourceKind === 'unknown') return [];
       const actions = [];
       const sourceKind = String(g.sourceKind || '').toLowerCase();
+      const canBuildAmprIndex = g.amprPresent === true;
+      const primaryAction = actionFor(g);
+      const normalAction = baseActionFor(g);
+      if (primaryAction === 'update-ampr' && normalAction) {
+        actions.push({ id: normalAction, label: actionLabel({ ...g, amprUpdateNeeded: false }) });
+      }
+      if (g.amprPresent === true) {
+        actions.push({ id: 'choose-ampr-version', label: 'Choose APR-EMU Version' });
+      }
+      if (amprCanRestoreOriginal(g)) {
+        actions.push({ id: 'restore-ampr-original', label: 'Restore Original APR-EMU' });
+      }
       if (sourceKind === 'folder') {
         actions.push({ id: 'make-image', label: 'Make Image' });
-        actions.push({ id: 'build-ampr-index', label: 'Build AMPR Index' });
+        if (canBuildAmprIndex) {
+          actions.push({ id: 'build-ampr-index', label: 'Build AMPR Index' });
+        }
       }
       if (sourceKind === 'compressed' || actionFor(g) === 'validate-repair') {
         actions.push({ id: 'validate-only', label: 'Validate Only' });
+        if (canBuildAmprIndex) {
+          actions.push({ id: 'build-ampr-index', label: 'Build AMPR Index' });
+        }
         actions.push({ id: 'uncompress', label: 'Uncompress' });
       }
       if (sourceKind === 'image') {
         actions.push({ id: 'set-read-only', label: 'Set Read Only' });
+        if (canBuildAmprIndex) {
+          actions.push({ id: 'build-ampr-index', label: 'Build AMPR Index' });
+        }
         if (g.isMounted === true) {
           actions.push({ id: 'extract-image', label: 'Extract to Folder' });
         }
@@ -4265,10 +5801,11 @@
 	          (meta ? '<div class="pending-meta">' + escapeHtml(meta) + '</div>' : '') +
 	          '</div>' +
 	          '<button class="small-action" id="cancel-pending">Cancel</button></div>';
-	      }
+      }
       const action = actionFor(g);
       if (!action) return '<button class="primary-btn" disabled>Unavailable</button>';
-      const primary = '<button class="primary-btn" id="primary-action">' + escapeHtml(actionLabel(g)) + '</button>';
+      const primaryClass = action === 'update-ampr' ? 'primary-btn is-ampr' : 'primary-btn';
+      const primary = '<button class="' + primaryClass + '" id="primary-action">' + escapeHtml(actionLabel(g)) + '</button>';
       const actions = secondaryActions(g);
       if (!actions.length) return primary;
       const expanded = state.secondaryMenuFor === gameInstanceId(g) ? 'true' : 'false';
@@ -4366,7 +5903,7 @@
         startPollBurst(10000);
         await refreshAll();
       } catch (err) {
-        alert(err.message || 'Could not mount selected instance');
+        alert(formatByteText(err.message || 'Could not mount selected instance'));
       } finally {
         if (btn) btn.disabled = false;
       }
@@ -4383,7 +5920,7 @@
         startPollBurst(70000);
         await refreshAll();
       } catch (err) {
-        alert(err.message || 'Could not start read speed test');
+        alert(formatByteText(err.message || 'Could not start read speed test'));
       } finally {
         if (btn) btn.disabled = false;
       }
@@ -4441,6 +5978,10 @@
       closeSecondaryMenu();
       if (action === 'validate-only') {
         startAction(g, false, 'validate-only');
+      } else if (action === 'validate-repair') {
+        startAction(g, false, 'validate-repair');
+      } else if (action === 'compress') {
+        startAction(g, false, 'compress');
       } else if (action === 'uncompress') {
         showUncompressModal(g);
       } else if (action === 'make-image') {
@@ -4451,6 +5992,12 @@
         startAction(g, false, 'set-read-only');
       } else if (action === 'build-ampr-index') {
         startAction(g, false, 'build-ampr-index');
+      } else if (action === 'update-ampr') {
+        updateAmprForGame(g);
+      } else if (action === 'choose-ampr-version') {
+        showAmprVersionModal(g);
+      } else if (action === 'restore-ampr-original') {
+        restoreOriginalAmprForGame(g);
       } else if (action === 'move-to' || action === 'move-usb') {
         showUsbModal(g, 'move');
       } else if (action === 'move-internal') {
@@ -4539,6 +6086,8 @@
 	        locationCountChip(g) +
 	        detailMountStateChip(g) +
         detailStatusChip(g) +
+	        amprUpdateChip(g) +
+	        amprVersionChip(g) +
 	        aprIndexedChipForGame(g) +
 	        sizeChip(g) +
 	        savedChip(g) +
@@ -4586,7 +6135,7 @@
 	            op.status === 'running' ? 'run' :
 	              op.status === 'pending' ? 'warn' : '';
 	        const repairText = repairedBlocksText(op, jobForOperation(op));
-	        const result = historyResultLabel(op, jobForOperation(op));
+	        const result = formatByteText(historyResultLabel(op, jobForOperation(op)));
 	        const chips =
 	          '<div class="history-chips"><span class="chip ' + chipClass + '">' +
 	          escapeHtml(smallLabel(op.status)) + '</span>' +
@@ -4611,7 +6160,7 @@
 	          '<div class="history-meta">' + escapeHtml(op.action) + ' - ' + escapeHtml(result) + '</div>' +
 	          metaRows +
 	          repairMeta +
-	          (op.error ? '<div class="history-meta danger-text">' + escapeHtml(op.error) + '</div>' : '') +
+	          (op.error ? '<div class="history-meta danger-text">' + escapeHtml(formatByteText(op.error)) + '</div>' : '') +
           retryAction +
 	          '</div>' + chips + '</div>';
 	      }).join('');
@@ -4721,6 +6270,7 @@
 	          ? progress.percent
 	          : null;
 	      box.classList.remove('is-compressing', 'is-closing', 'is-mounting', 'is-validating', 'is-scanning', 'is-repacking',
+	        'is-ampr-updating',
 	        'is-moving', 'is-reading', 'is-deleting', 'is-finalizing', 'is-unpacking', 'is-restoring', 'is-run');
       box.classList.add('is-' + visual.className);
       if (label) {
@@ -4798,6 +6348,12 @@
         (status && status !== 'running' && status !== 'pending' && Number((op && op.endedAt) || 0) > 0);
     }
 
+    function operationQueueHasWork(games) {
+      if (state.job && state.job.busy) return true;
+      const list = Array.isArray(games) ? games : state.games;
+      return list.some((g) => g && (g.activeOp || g.pendingOp));
+    }
+
     function showTerminateReminder() {
       const reminder = $('terminate-reminder');
       const terminate = $('terminate-top');
@@ -4817,6 +6373,7 @@
     function maybeShowFinishedOperationReminder() {
       const id = pendingFinishedOperationId;
       if (!id || remindedFinishedOperationIds.has(id)) return;
+      if (operationQueueHasWork()) return;
       const op = operationById(id);
       if (!operationIsFinished(op)) return;
       pendingFinishedOperationId = '';
@@ -4861,10 +6418,10 @@
 	            queueFinishedOperationReminder(previousActiveId);
 	          }
 	        }
-	        maybeShowFinishedOperationReminder();
 	        state.games = games.games || [];
 	        applyOperationOutputPresentation();
 	        state.games = sortGamesForList(state.games);
+	        maybeShowFinishedOperationReminder();
 	        if (!state.selected && state.games[0]) {
 	          selectGame(gameInstanceId(state.games[0]), false, false);
 	        }
@@ -4876,6 +6433,12 @@
 	        }
         render();
         updateProgressOnly();
+        if (!state.amprLatestStarted &&
+          state.games.some((g) => g && g.amprPresent === true)) {
+          bootstrapAmprLatest(false).then((ok) => {
+            if (ok) setTimeout(() => refreshAll(), 0);
+          });
+        }
       } catch (err) {
         state.gamesLoading = false;
         state.gamesLoaded = true;
@@ -5036,7 +6599,7 @@
 	        '<div class="history-meta">' + escapeHtml(usb.targetRoot || usb.path) + '</div>' +
 	        '<div class="history-meta">' + shortSize(usb.freeBytes) + ' free of ' +
 	        shortSize(usb.totalBytes) + '</div></div>' +
-        '<span class="chip' + (selected ? ' run' : '') + '">' +
+        '<span class="chip' + (selected ? ' selected' : '') + '">' +
         (selected ? 'Selected' : 'Select') + '</span>' +
         '</button>';
     }
@@ -5058,7 +6621,7 @@
         '<div><div class="history-title">' + escapeHtml(title) + '</div>' +
         '<div class="history-meta">' + escapeHtml(meta) + '</div>' +
         (detail ? '<div class="history-meta">' + escapeHtml(detail) + '</div>' : '') +
-        '</div><span class="chip' + (selected ? ' run' : '') + '">' +
+        '</div><span class="chip' + (selected ? ' selected' : '') + '">' +
         (selected ? 'Selected' : 'Select') + '</span></button>';
     }
 
@@ -5301,7 +6864,7 @@
         const chip = button.querySelector('.chip');
         if (chip) {
           chip.textContent = disabled ? 'Unavailable' : (selected ? 'Selected' : 'Select');
-          chip.classList.toggle('run', selected && !disabled);
+          chip.classList.toggle('selected', selected && !disabled);
           chip.classList.toggle('bad', disabled);
         }
       });
@@ -5423,7 +6986,7 @@
       } catch (err) {
         state.deleteBusy = false;
         updateDeleteModal();
-        alert(err.message);
+        alert(formatByteText(err.message));
       }
     }
 
@@ -5606,7 +7169,7 @@
         const chip = button.querySelector('.chip');
         if (chip) {
           chip.textContent = disabled ? 'Unavailable' : (selected ? 'Selected' : 'Select');
-          chip.classList.toggle('run', selected && !disabled);
+          chip.classList.toggle('selected', selected && !disabled);
           chip.classList.toggle('bad', disabled);
         }
       });
@@ -5674,7 +7237,7 @@
         if (data.lowSpace) {
           alert('Not enough free storage.\n\nFree ' + shortSize(data.extraBytes || 0) + ' more on the target storage.');
         } else {
-          alert(err.message);
+          alert(formatByteText(err.message));
         }
       }
     }
@@ -5757,7 +7320,7 @@
         if (data.lowSpace) {
           alert('Not enough free storage.\n\nFree ' + shortSize(data.extraBytes || 0) + ' more on the target storage.');
         } else {
-          alert(err.message);
+          alert(formatByteText(err.message));
         }
       }
     }
@@ -5766,6 +7329,10 @@
       const action = overrideAction || actionFor(g);
       if (!action) return;
       if (!g || !g.sourcePath) return;
+      if (action === 'update-ampr') {
+        await updateAmprForGame(g);
+        return;
+      }
       if ((action === 'compress' || action === 'make-image') && !compressFormat) {
         showCompressFormatModal(g, action);
         return;
@@ -5826,20 +7393,20 @@
             alert('Not enough free storage.\n\n' + base);
           }
         } else {
-          alert(err.message);
+          alert(formatByteText(err.message));
         }
       }
     }
 
     async function cancelPending(id) {
-      await api('/api/gc/queue/cancel?id=' + encodeURIComponent(id), { method: 'POST' }).catch((err) => alert(err.message));
+      await api('/api/gc/queue/cancel?id=' + encodeURIComponent(id), { method: 'POST' }).catch((err) => alert(formatByteText(err.message)));
       await refreshAll();
     }
 
     async function cancelActiveJob(activeId) {
       const id = activeId || String((state.job && state.job.activeId) || '');
       if (state.job && state.job.cancelDisabled) {
-        alert(state.job.cancelDisabledReason || 'Operation cannot be cancelled now');
+        alert(formatByteText(state.job.cancelDisabledReason || 'Operation cannot be cancelled now'));
         return;
       }
       if (id) {
@@ -5859,7 +7426,7 @@
           }
           renderDetail(true);
           renderHistory(true);
-          alert(err.message);
+          alert(formatByteText(err.message));
         });
       startPollBurst(8000);
       await refreshAll();
@@ -5921,23 +7488,46 @@
     }
 
     document.addEventListener('DOMContentLoaded', () => {
+      applyTheme(state.theme);
       restoreSelectedGame();
+      $('theme-light').innerHTML = icon('sun');
+      $('theme-dark').innerHTML = icon('moon');
       $('info-top').innerHTML = icon('info');
       $('history-top').innerHTML = icon('history');
       $('terminate-top').innerHTML = icon('power');
       $('info-close').innerHTML = icon('close');
       $('history-close').innerHTML = icon('close');
       $('usb-close').innerHTML = icon('close');
+      $('ampr-version-close').innerHTML = icon('close');
       $('format-close').innerHTML = icon('close');
       $('uncompress-close').innerHTML = icon('close');
       $('delete-close').innerHTML = icon('close');
 
+      $('theme-light').addEventListener('click', () => setUiTheme('light'));
+      $('theme-dark').addEventListener('click', () => setUiTheme('dark'));
       $('info-top').addEventListener('click', () => showModal('info-modal'));
       $('info-close').addEventListener('click', () => hideModal('info-modal'));
       $('history-top').addEventListener('click', () => showModal('history-modal'));
       $('history-close').addEventListener('click', () => hideModal('history-modal'));
       $('terminate-top').addEventListener('click', terminateProgram);
       $('usb-close').addEventListener('click', closeUsbModal);
+      $('ampr-version-close').addEventListener('click', closeAmprVersionModal);
+      $('ampr-version-cancel').addEventListener('click', closeAmprVersionModal);
+      $('ampr-version-apply').addEventListener('click', applySelectedAmprVersion);
+      $('ampr-custom-upload').addEventListener('click', () => {
+        if (state.amprPickerBusy || state.amprPickerLoading || jobIsBusy()) return;
+        if (isPs5Browser()) {
+          showPs5CustomAmprUploadMessage();
+          return;
+        }
+        $('ampr-custom-file').click();
+      });
+      $('ampr-custom-file').addEventListener('change', (event) => {
+        const input = event.target;
+        const file = input && input.files && input.files[0] ? input.files[0] : null;
+        if (file) uploadCustomAmprFile(file);
+        if (input) input.value = '';
+      });
       $('format-close').addEventListener('click', closeCompressFormatModal);
       $('uncompress-close').addEventListener('click', closeUncompressModal);
       $('delete-close').addEventListener('click', closeDeleteModal);
@@ -6016,6 +7606,7 @@
         modal.addEventListener('click', (event) => {
           if (event.target !== modal) return;
           if (modal.id === 'usb-modal') closeUsbModal();
+          else if (modal.id === 'ampr-version-modal') closeAmprVersionModal();
           else if (modal.id === 'format-modal') closeCompressFormatModal();
           else if (modal.id === 'uncompress-modal') closeUncompressModal();
           else if (modal.id === 'delete-modal') closeDeleteModal();
@@ -6052,6 +7643,9 @@
         if (state.secondaryMenuFor) positionSecondaryMenu();
       }, true);
 
+      renderAppChrome();
+      loadAppStatus();
+      loadUiSettings();
       refreshAll();
       setInterval(refreshJob, 1200);
       setInterval(() => {

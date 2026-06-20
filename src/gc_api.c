@@ -23,9 +23,11 @@
 
 #include "gc_api.h"
 #include "gc_diag.h"
+#include "gc_icon_thumb.h"
 #include "gc_notify.h"
 #include "gc_shadowmount.h"
 #include "gc_size_cache.h"
+#include "pfs_ampr_hotswap.h"
 #include "pfs_compress.h"
 #include "pfs_validate_hash.h"
 #include "pfs_repair.h"
@@ -40,6 +42,12 @@
 #define GC_HISTORY_LOG GC_HISTORY_DIR "/history.jsonl"
 #define GC_MOUNT_SWITCH_LOG GC_BASE "/mount-switch-recovery.jsonl"
 #define GC_REPAIR_DIR GC_LOG_DIR "/repair"
+#define GC_UI_SETTINGS_FILE GC_BASE "/ui-settings.json"
+#define GC_AMPR_DIR GC_BASE "/ampr-emu"
+#define GC_AMPR_BINARY_NAME "libSceAmpr.sprx"
+#define GC_AMPR_LATEST_FILE GC_AMPR_DIR "/latest.json"
+#define GC_AMPR_SELECTION_DIR GC_AMPR_DIR "/selections"
+#define GC_AMPR_ORIGINAL_DIR GC_AMPR_DIR "/originals"
 #define GC_HISTORY_KEY_SIZE 96
 #define GC_MAX_GAMES 128
 #define GC_MAX_SCAN_ROOTS 256
@@ -143,6 +151,7 @@ typedef enum gc_action {
   GC_ACTION_READ_SPEED_TEST,
   GC_ACTION_BUILD_AMPR_INDEX,
   GC_ACTION_SET_READ_ONLY,
+  GC_ACTION_UPDATE_AMPR,
 } gc_action_t;
 
 typedef enum gc_op_status {
@@ -187,6 +196,18 @@ typedef struct gc_game {
   int output_exists;
   int is_mounted;
   int apr_indexed;
+  int ampr_hot_swap_optimized;
+  int ampr_present;
+  int ampr_update_needed;
+  int ampr_update_supported;
+  int ampr_original_available;
+  char ampr_path[1024];
+  char ampr_version[64];
+  char ampr_sha256[65];
+  char ampr_original_sha256[65];
+  uint64_t ampr_original_size;
+  char ampr_latest_version[64];
+  char ampr_latest_sha256[65];
   char mount_status[32];
   gc_validation_state_t validation;
   char validation_status[32];
@@ -218,6 +239,11 @@ typedef struct gc_operation {
   char result[32];
   char error[256];
   char repair_summary[1024];
+  char ampr_version[64];
+  char ampr_sha256[65];
+  char ampr_cache_path[1024];
+  char ampr_result_mode[32];
+  char ampr_intent[16];
   char read_root[1024];
   char read_storage[32];
   char read_first_error_path[1024];
@@ -232,6 +258,7 @@ typedef struct gc_operation {
   uint64_t scan_elapsed_ms;
   uint64_t scan_workers;
   int apr_indexed;
+  int ampr_hot_swap_optimized;
   uint64_t read_bytes;
   uint64_t read_files;
   uint64_t read_dirs;
@@ -298,6 +325,8 @@ static const gc_storage_target_def_t GC_STORAGE_TARGETS[GC_STORAGE_TARGET_COUNT]
 };
 
 static void fsync_parent_dir_best_effort(const char *path);
+static int copy_file_contents(const char *src, const char *dst, char *err,
+                              size_t err_size);
 
 static const char *
 source_kind_name(gc_source_kind_t kind) {
@@ -341,6 +370,7 @@ action_name(gc_action_t action) {
   if(action == GC_ACTION_READ_SPEED_TEST) return "read-speed-test";
   if(action == GC_ACTION_BUILD_AMPR_INDEX) return "build-ampr-index";
   if(action == GC_ACTION_SET_READ_ONLY) return "set-read-only";
+  if(action == GC_ACTION_UPDATE_AMPR) return "update-ampr";
   return "unknown";
 }
 
@@ -405,6 +435,118 @@ valid_title_id(const char *s) {
 }
 
 static int
+hex_char_value(int ch) {
+  if(ch >= '0' && ch <= '9') return ch - '0';
+  if(ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+  if(ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+  return -1;
+}
+
+static int
+sha256_hex_valid(const char *hex) {
+  if(!hex || strlen(hex) != 64) return 0;
+  for(size_t i = 0; i < 64; i++) {
+    if(hex_char_value((unsigned char)hex[i]) < 0) return 0;
+  }
+  return 1;
+}
+
+static void
+sha256_to_hex(const unsigned char hash[PFS_VHASH_HASH_SIZE],
+              char out[65]) {
+  static const char hexdigits[] = "0123456789abcdef";
+  for(size_t i = 0; i < PFS_VHASH_HASH_SIZE; i++) {
+    out[i * 2] = hexdigits[(hash[i] >> 4) & 0xf];
+    out[i * 2 + 1] = hexdigits[hash[i] & 0xf];
+  }
+  out[64] = 0;
+}
+
+static int
+ampr_version_safe(const char *version) {
+  if(!version || !*version || strlen(version) >= 64) return 0;
+  for(const unsigned char *p = (const unsigned char *)version; *p; p++) {
+    if(!isalnum(*p) && *p != '.' && *p != '_' && *p != '-') return 0;
+  }
+  return 1;
+}
+
+static int
+ampr_cache_dir_for_version(const char *version, char *out, size_t out_size) {
+  if(!ampr_version_safe(version)) {
+    errno = EINVAL;
+    return -1;
+  }
+  int n = snprintf(out, out_size, "%s/%s", GC_AMPR_DIR, version);
+  if(n < 0 || (size_t)n >= out_size) {
+    errno = ENAMETOOLONG;
+    return -1;
+  }
+  return 0;
+}
+
+static int
+ampr_cache_binary_path(const char *version, char *out, size_t out_size) {
+  char dir[1024];
+  if(ampr_cache_dir_for_version(version, dir, sizeof(dir)) != 0) return -1;
+  int n = snprintf(out, out_size, "%s/%s", dir, GC_AMPR_BINARY_NAME);
+  if(n < 0 || (size_t)n >= out_size) {
+    errno = ENAMETOOLONG;
+    return -1;
+  }
+  return 0;
+}
+
+static int
+hash_file_sha256_hex(const char *path, char out[65], char *err,
+                     size_t err_size) {
+  int fd = open(path, O_RDONLY);
+  if(fd < 0) {
+    snprintf(err, err_size, "open hash input: %s", strerror(errno));
+    return -1;
+  }
+  struct stat st;
+  if(fstat(fd, &st) != 0 || st.st_size < 0 ||
+     (uint64_t)st.st_size > SIZE_MAX) {
+    snprintf(err, err_size, "stat hash input: %s", strerror(errno));
+    close(fd);
+    return -1;
+  }
+  size_t size = (size_t)st.st_size;
+  unsigned char *buf = malloc(size ? size : 1);
+  if(!buf) {
+    snprintf(err, err_size, "%s", "out of memory");
+    close(fd);
+    return -1;
+  }
+  size_t done = 0;
+  while(done < size) {
+    ssize_t n = read(fd, buf + done, size - done);
+    if(n < 0) {
+      if(errno == EINTR) continue;
+      snprintf(err, err_size, "read hash input: %s", strerror(errno));
+      free(buf);
+      close(fd);
+      return -1;
+    }
+    if(n == 0) break;
+    done += (size_t)n;
+  }
+  close(fd);
+  if(done != size) {
+    snprintf(err, err_size, "%s", "short hash input");
+    free(buf);
+    errno = EIO;
+    return -1;
+  }
+  unsigned char hash[PFS_VHASH_HASH_SIZE];
+  pfs_sha256(buf, size, hash);
+  sha256_to_hex(hash, out);
+  free(buf);
+  return 0;
+}
+
+static int
 read_link_file(const char *path, char *out, size_t out_size) {
   FILE *f = fopen(path, "r");
   if(!f) return -1;
@@ -415,6 +557,60 @@ read_link_file(const char *path, char *out, size_t out_size) {
   fclose(f);
   out[strcspn(out, "\r\n")] = 0;
   return out[0] ? 0 : -1;
+}
+
+static int
+ampr_folder_target_probe(const char *root, char *path_out, size_t path_size,
+                         char sha_out[65]) {
+  static const char *rels[] = {
+    "fakelib/" GC_AMPR_BINARY_NAME,
+    "fakelib/libSceAmpr.prx",
+    "sce_module/" GC_AMPR_BINARY_NAME,
+    "sce_module/libSceAmpr.prx",
+  };
+  struct stat st;
+  if(!root || !root[0]) return 0;
+  if(path_out && path_size) path_out[0] = 0;
+  if(sha_out) sha_out[0] = 0;
+  for(size_t i = 0; i < sizeof(rels) / sizeof(rels[0]); i++) {
+    char path[1024];
+    int n = snprintf(path, sizeof(path), "%s/%s", root, rels[i]);
+    if(n < 0 || (size_t)n >= sizeof(path)) continue;
+    if(stat(path, &st) == 0 && S_ISREG(st.st_mode)) {
+      char err[128] = {0};
+      if(path_out && path_size) snprintf(path_out, path_size, "%s", path);
+      if(sha_out && hash_file_sha256_hex(path, sha_out, err, sizeof(err)) != 0) {
+        sha_out[0] = 0;
+      }
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int
+ampr_folder_index_probe(const char *root) {
+  char path[1024];
+  struct stat st;
+  int n;
+
+  if(!root || !root[0]) return 0;
+  n = snprintf(path, sizeof(path), "%s/ampr_emu.index", root);
+  if(n < 0 || (size_t)n >= sizeof(path)) return 0;
+  return stat(path, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0;
+}
+
+static void
+populate_apr_index_state_from_roots(gc_game_t *g) {
+  if(!g || !g->ampr_present) return;
+  if(g->source_kind == GC_SOURCE_FOLDER &&
+     ampr_folder_index_probe(g->source_path)) {
+    g->apr_indexed = 1;
+    return;
+  }
+  if(g->is_mounted && ampr_folder_index_probe(g->mount_path)) {
+    g->apr_indexed = 1;
+  }
 }
 
 static void
@@ -589,6 +785,8 @@ static const char *
 source_kind_name_from_path(const char *path) {
   const char *name = base_name(path);
   if(name && ends_with_ci(name, ".ffpfsc")) return "compressed";
+  if(name && (ends_with_ci(name, ".exfat") ||
+              ends_with_ci(name, ".ffpfs"))) return "image";
   return "unknown";
 }
 
@@ -1371,41 +1569,55 @@ find_exact_pfsc_by_title(const char *title_id, char *out, size_t out_size) {
 static int remove_tree_gc(const char *path);
 static void artifact_cache_invalidate(void);
 
+static const char *
+force_remount_visible_suffix(const char *name, size_t *suffix_len) {
+  const char *suffix = "";
+  if(!name) return NULL;
+  if(ends_with_ci(name, ".ffpfsc")) {
+    suffix = ".ffpfsc";
+  } else if(ends_with_ci(name, ".exfat")) {
+    suffix = ".exfat";
+  } else if(ends_with_ci(name, ".ffpfs")) {
+    suffix = ".ffpfs";
+  } else if(ends_with_ci(name, "-app")) {
+    suffix = "-app";
+  } else {
+    return NULL;
+  }
+  if(suffix_len) *suffix_len = strlen(suffix);
+  return suffix;
+}
+
 static int
 force_remount_original_name_for_temp(const char *name,
                                      char *out, size_t out_size) {
   const char *marker;
   const char *visible_name = name;
+  const char *suffix;
   char title_id[64];
   size_t title_len;
   size_t prefix_len = strlen(GC_FORCE_REMOUNT_PREFIX);
   size_t name_len;
-  size_t suffix_len = strlen(".ffpfsc");
-  int is_ffpfsc;
-  int is_app_dir;
+  size_t suffix_len = 0;
 
   if(!name || !out || out_size == 0) {
     return -1;
   }
   if(visible_name[0] == '.') visible_name++;
   name_len = strlen(visible_name);
-  is_ffpfsc = ends_with_ci(visible_name, ".ffpfsc");
-  is_app_dir = name_len > strlen("-app") &&
-               ends_with_ci(visible_name, "-app");
+  suffix = force_remount_visible_suffix(visible_name, &suffix_len);
+  if(!suffix) return -1;
   marker = strstr(visible_name, GC_FORCE_REMOUNT_PREFIX);
   if(!marker) return -1;
   title_len = (size_t)(marker - visible_name);
   if(title_len != 9 || title_len >= sizeof(title_id)) return -1;
-  if(name_len <= title_len + prefix_len +
-                 (is_ffpfsc ? suffix_len : (is_app_dir ? strlen("-app") : 0))) {
+  if(name_len <= title_len + prefix_len + suffix_len) {
     return -1;
   }
   memcpy(title_id, visible_name, title_len);
   title_id[title_len] = 0;
   if(!valid_title_id(title_id)) return -1;
-  if(snprintf(out, out_size, "%s%s", title_id,
-              is_ffpfsc ? ".ffpfsc" : (is_app_dir ? "-app" : "")) >=
-     (int)out_size) {
+  if(snprintf(out, out_size, "%s%s", title_id, suffix) >= (int)out_size) {
     return -1;
   }
   return 0;
@@ -1592,6 +1804,423 @@ json_find_string_value(const char *json, const char *key,
   }
   out[pos] = 0;
   return pos > 0;
+}
+
+static int
+ampr_latest_cached(char *version, size_t version_size,
+                   char sha[65]) {
+  char *json = NULL;
+  size_t json_size = 0;
+  char local_version[64] = {0};
+  char local_sha[65] = {0};
+  if(version && version_size) version[0] = 0;
+  if(sha) sha[0] = 0;
+  if(read_file_limited(GC_AMPR_LATEST_FILE, &json, &json_size, 64 * 1024) != 0) {
+    return 0;
+  }
+  (void)json_size;
+  json_find_string_value(json, "version", local_version, sizeof(local_version));
+  json_find_string_value(json, "sha256", local_sha, sizeof(local_sha));
+  free(json);
+  if(!ampr_version_safe(local_version) || !sha256_hex_valid(local_sha)) {
+    return 0;
+  }
+  if(version && version_size) snprintf(version, version_size, "%s", local_version);
+  if(sha) snprintf(sha, 65, "%s", local_sha);
+  return 1;
+}
+
+static int
+ampr_cached_version_for_sha(const char sha[65], char *version,
+                            size_t version_size) {
+  DIR *d;
+  int found = 0;
+  if(version && version_size) version[0] = 0;
+  if(!sha256_hex_valid(sha) || !version || version_size == 0) return 0;
+  d = opendir(GC_AMPR_DIR);
+  if(!d) return 0;
+  struct dirent *ent;
+  while((ent = readdir(d)) != NULL) {
+    char bin[1024];
+    char hash[65] = {0};
+    char err[128] = {0};
+    struct stat st;
+    if(!ampr_version_safe(ent->d_name)) continue;
+    if(ampr_cache_binary_path(ent->d_name, bin, sizeof(bin)) != 0) continue;
+    if(stat(bin, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+    if(hash_file_sha256_hex(bin, hash, err, sizeof(err)) != 0) continue;
+    if(strcasecmp(hash, sha) != 0) continue;
+    if(!found || strcmp(ent->d_name, version) > 0) {
+      snprintf(version, version_size, "%s", ent->d_name);
+      found = 1;
+    }
+  }
+  closedir(d);
+  return found;
+}
+
+static int
+ampr_intent_valid(const char *intent) {
+  return !strcmp(intent ? intent : "", "latest") ||
+      !strcmp(intent ? intent : "", "manual") ||
+      !strcmp(intent ? intent : "", "custom");
+}
+
+static const char *
+ampr_normalized_intent(const char *intent, const char *version) {
+  if(version && !strncmp(version, "custom-", 7)) return "custom";
+  return ampr_intent_valid(intent) ? intent : "manual";
+}
+
+static int
+ampr_selection_path_for_title_source(const char *title_id,
+                                     const char *source_path,
+                                     char *out, size_t out_size) {
+  if(!valid_title_id(title_id) || !source_path || !source_path[0] ||
+     !out || out_size == 0) {
+    return -1;
+  }
+  int n = snprintf(out, out_size, "%s/%s-%08x.json",
+                   GC_AMPR_SELECTION_DIR, title_id,
+                   fnv1a32_string(source_path));
+  return n < 0 || (size_t)n >= out_size ? -1 : 0;
+}
+
+static int
+ampr_selection_read(const char *title_id, const char *source_path,
+                    char *intent, size_t intent_size,
+                    char *version, size_t version_size,
+                    char sha[65]) {
+  char path[1024];
+  char marker_path[1024] = {0};
+  char marker_intent[16] = {0};
+  char marker_version[64] = {0};
+  char marker_sha[65] = {0};
+  char *json = NULL;
+  size_t json_size = 0;
+  if(intent && intent_size) intent[0] = 0;
+  if(version && version_size) version[0] = 0;
+  if(sha) sha[0] = 0;
+  if(ampr_selection_path_for_title_source(title_id, source_path,
+                                          path, sizeof(path)) != 0 ||
+     read_file_limited(path, &json, &json_size, 64 * 1024) != 0) {
+    return 0;
+  }
+  (void)json_size;
+  json_find_string_value(json, "path", marker_path, sizeof(marker_path));
+  json_find_string_value(json, "intent", marker_intent,
+                         sizeof(marker_intent));
+  json_find_string_value(json, "version", marker_version,
+                         sizeof(marker_version));
+  json_find_string_value(json, "sha256", marker_sha, sizeof(marker_sha));
+  free(json);
+  if(marker_path[0] && strcmp(marker_path, source_path)) return 0;
+  if(!ampr_intent_valid(marker_intent) || !sha256_hex_valid(marker_sha)) {
+    return 0;
+  }
+  if(marker_version[0] && !ampr_version_safe(marker_version)) return 0;
+  if(intent && intent_size) snprintf(intent, intent_size, "%s", marker_intent);
+  if(version && version_size) {
+    snprintf(version, version_size, "%s", marker_version);
+  }
+  if(sha) snprintf(sha, 65, "%s", marker_sha);
+  return 1;
+}
+
+static int
+ampr_selection_write(const char *title_id, const char *source_path,
+                     const char *intent, const char *version,
+                     const char sha[65], const char *result_mode) {
+  char path[1024];
+  char tmp[1024];
+  json_buf_t b = {0};
+  int fd = -1;
+  const char *normalized = ampr_normalized_intent(intent, version);
+  if(!valid_title_id(title_id) || !source_path || !source_path[0] ||
+     !ampr_intent_valid(normalized) || !ampr_version_safe(version) ||
+     !sha256_hex_valid(sha)) {
+    return -1;
+  }
+  if(mkdirs(GC_AMPR_SELECTION_DIR) != 0 ||
+     ampr_selection_path_for_title_source(title_id, source_path,
+                                          path, sizeof(path)) != 0) {
+    return -1;
+  }
+  int n = snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+  if(n < 0 || (size_t)n >= sizeof(tmp)) return -1;
+  if(json_append(&b, "{\"titleId\":") != 0 ||
+     json_string(&b, title_id) != 0 ||
+     json_append(&b, ",\"path\":") != 0 ||
+     json_string(&b, source_path) != 0 ||
+     json_append(&b, ",\"intent\":") != 0 ||
+     json_string(&b, normalized) != 0 ||
+     json_append(&b, ",\"version\":") != 0 ||
+     json_string(&b, version) != 0 ||
+     json_append(&b, ",\"sha256\":") != 0 ||
+     json_string(&b, sha) != 0 ||
+     json_append(&b, ",\"resultMode\":") != 0 ||
+     json_string(&b, result_mode ? result_mode : "") != 0 ||
+     json_appendf(&b, ",\"updatedAt\":%ld}\n", (long)time(NULL)) != 0) {
+    free(b.data);
+    return -1;
+  }
+  fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+  if(fd < 0) {
+    free(b.data);
+    return -1;
+  }
+  if(write_all_fd(fd, b.data, b.len) != 0 || fsync(fd) != 0) {
+    close(fd);
+    unlink(tmp);
+    free(b.data);
+    return -1;
+  }
+  close(fd);
+  fd = -1;
+  if(rename(tmp, path) != 0) {
+    unlink(tmp);
+    free(b.data);
+    return -1;
+  }
+  fsync_parent_dir_best_effort(path);
+  free(b.data);
+  return 0;
+}
+
+static int
+ampr_original_dir_for_title_source(const char *title_id,
+                                   const char *source_path,
+                                   char *out, size_t out_size) {
+  if(!valid_title_id(title_id) || !source_path || !source_path[0] ||
+     !out || out_size == 0) {
+    return -1;
+  }
+  int n = snprintf(out, out_size, "%s/%s-%08x",
+                   GC_AMPR_ORIGINAL_DIR, title_id,
+                   fnv1a32_string(source_path));
+  return n < 0 || (size_t)n >= out_size ? -1 : 0;
+}
+
+static int
+ampr_original_binary_path(const char *title_id, const char *source_path,
+                          char *out, size_t out_size) {
+  char dir[1024];
+  if(ampr_original_dir_for_title_source(title_id, source_path,
+                                        dir, sizeof(dir)) != 0) {
+    return -1;
+  }
+  int n = snprintf(out, out_size, "%s/%s", dir, GC_AMPR_BINARY_NAME);
+  return n < 0 || (size_t)n >= out_size ? -1 : 0;
+}
+
+static int
+ampr_original_metadata_path(const char *title_id, const char *source_path,
+                            char *out, size_t out_size) {
+  char dir[1024];
+  if(ampr_original_dir_for_title_source(title_id, source_path,
+                                        dir, sizeof(dir)) != 0) {
+    return -1;
+  }
+  int n = snprintf(out, out_size, "%s/metadata.json", dir);
+  return n < 0 || (size_t)n >= out_size ? -1 : 0;
+}
+
+static int
+ampr_original_lookup(const char *title_id, const char *source_path,
+                     char path_out[1024], char sha_out[65],
+                     uint64_t *size_out) {
+  char path[1024];
+  char sha[65] = {0};
+  char err[128] = {0};
+  struct stat st;
+  if(path_out) path_out[0] = 0;
+  if(sha_out) sha_out[0] = 0;
+  if(size_out) *size_out = 0;
+  if(ampr_original_binary_path(title_id, source_path, path,
+                               sizeof(path)) != 0 ||
+     stat(path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0) {
+    return 0;
+  }
+  if(hash_file_sha256_hex(path, sha, err, sizeof(err)) != 0 ||
+     !sha256_hex_valid(sha)) {
+    return 0;
+  }
+  if(path_out) snprintf(path_out, 1024, "%s", path);
+  if(sha_out) snprintf(sha_out, 65, "%s", sha);
+  if(size_out) *size_out = (uint64_t)st.st_size;
+  return 1;
+}
+
+static int
+ampr_write_original_metadata(const gc_game_t *game, const char *backup_path,
+                             const char sha[65], uint64_t size,
+                             char *err, size_t err_size) {
+  char meta[1024];
+  char tmp[1024];
+  json_buf_t b = {0};
+  int fd = -1;
+  if(ampr_original_metadata_path(game->title_id, game->source_path,
+                                 meta, sizeof(meta)) != 0) {
+    snprintf(err, err_size, "%s", "original AMPR metadata path too long");
+    return -1;
+  }
+  int n = snprintf(tmp, sizeof(tmp), "%s.tmp", meta);
+  if(n < 0 || (size_t)n >= sizeof(tmp)) {
+    snprintf(err, err_size, "%s", "original AMPR metadata temp path too long");
+    return -1;
+  }
+  if(json_append(&b, "{\"titleId\":") != 0 ||
+     json_string(&b, game->title_id) != 0 ||
+     json_append(&b, ",\"sourcePath\":") != 0 ||
+     json_string(&b, game->source_path) != 0 ||
+     json_append(&b, ",\"amprPath\":") != 0 ||
+     json_string(&b, game->ampr_path) != 0 ||
+     json_append(&b, ",\"path\":") != 0 ||
+     json_string(&b, backup_path) != 0 ||
+     json_append(&b, ",\"sha256\":") != 0 ||
+     json_string(&b, sha) != 0 ||
+     json_appendf(&b, ",\"size\":%llu,\"savedAt\":%ld}\n",
+                  (unsigned long long)size, (long)time(NULL)) != 0) {
+    snprintf(err, err_size, "%s", "build original AMPR metadata failed");
+    free(b.data);
+    return -1;
+  }
+  fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+  if(fd < 0) {
+    snprintf(err, err_size, "open original AMPR metadata: %s",
+             strerror(errno));
+    free(b.data);
+    return -1;
+  }
+  if(write_all_fd(fd, b.data, b.len) != 0 || fsync(fd) != 0) {
+    snprintf(err, err_size, "write original AMPR metadata: %s",
+             strerror(errno));
+    close(fd);
+    unlink(tmp);
+    free(b.data);
+    return -1;
+  }
+  close(fd);
+  fd = -1;
+  if(rename(tmp, meta) != 0) {
+    snprintf(err, err_size, "publish original AMPR metadata: %s",
+             strerror(errno));
+    unlink(tmp);
+    free(b.data);
+    return -1;
+  }
+  fsync_parent_dir_best_effort(meta);
+  free(b.data);
+  return 0;
+}
+
+static int
+ampr_original_backup_prepare(const gc_game_t *game, char *err,
+                             size_t err_size) {
+  char existing_path[1024];
+  char backup_path[1024];
+  char backup_dir[1024];
+  char tmp[1024];
+  char backup_sha[65] = {0};
+  char cached_version[64] = {0};
+  struct stat st;
+  uint64_t backup_size = 0;
+  if(!game || !game->ampr_present || !sha256_hex_valid(game->ampr_sha256)) {
+    return 0;
+  }
+  if(ampr_original_lookup(game->title_id, game->source_path,
+                          existing_path, NULL, NULL)) {
+    return 0;
+  }
+  if(ampr_cached_version_for_sha(game->ampr_sha256, cached_version,
+                                 sizeof(cached_version))) {
+    return 0;
+  }
+  if(!game->ampr_path[0]) {
+    snprintf(err, err_size, "%s", "original AMPR source path is unavailable");
+    return -1;
+  }
+  if(stat(game->ampr_path, &st) != 0 || !S_ISREG(st.st_mode) ||
+     st.st_size <= 0) {
+    snprintf(err, err_size, "original AMPR source is not readable: %s",
+             game->ampr_path);
+    return -1;
+  }
+  if(ampr_original_dir_for_title_source(game->title_id, game->source_path,
+                                        backup_dir,
+                                        sizeof(backup_dir)) != 0 ||
+     ampr_original_binary_path(game->title_id, game->source_path,
+                               backup_path, sizeof(backup_path)) != 0) {
+    snprintf(err, err_size, "%s", "original AMPR backup path too long");
+    return -1;
+  }
+  if(mkdirs(backup_dir) != 0) {
+    snprintf(err, err_size, "create original AMPR backup dir: %s",
+             strerror(errno));
+    return -1;
+  }
+  int n = snprintf(tmp, sizeof(tmp), "%s/.%s.tmp",
+                   backup_dir, GC_AMPR_BINARY_NAME);
+  if(n < 0 || (size_t)n >= sizeof(tmp)) {
+    snprintf(err, err_size, "%s", "original AMPR temp path too long");
+    return -1;
+  }
+  unlink(tmp);
+  if(copy_file_contents(game->ampr_path, tmp, err, err_size) != 0) {
+    unlink(tmp);
+    return -1;
+  }
+  if(hash_file_sha256_hex(tmp, backup_sha, err, err_size) != 0 ||
+     strcasecmp(backup_sha, game->ampr_sha256) != 0) {
+    unlink(tmp);
+    snprintf(err, err_size, "%s", "original AMPR backup verification failed");
+    return -1;
+  }
+  if(rename(tmp, backup_path) != 0) {
+    unlink(tmp);
+    snprintf(err, err_size, "publish original AMPR backup: %s",
+             strerror(errno));
+    return -1;
+  }
+  fsync_parent_dir_best_effort(backup_path);
+  backup_size = (uint64_t)st.st_size;
+  if(ampr_write_original_metadata(game, backup_path, backup_sha,
+                                  backup_size, err, err_size) != 0) {
+    return -1;
+  }
+  gc_log("original AMPR backup saved title=%s source=%s sha=%s path=%s",
+         game->title_id, game->source_path, backup_sha, backup_path);
+  return 0;
+}
+
+static int
+ampr_latest_update_needed_for_game(const gc_game_t *g, int have_latest,
+                                   int current_sha_cached) {
+  char intent[16] = {0};
+  char version[64] = {0};
+  char selected_sha[65] = {0};
+  if(!g || !have_latest || !g->ampr_present ||
+     !sha256_hex_valid(g->ampr_sha256) ||
+     !sha256_hex_valid(g->ampr_latest_sha256)) {
+    return 0;
+  }
+  if(strcasecmp(g->ampr_sha256, g->ampr_latest_sha256) == 0) return 0;
+
+  if(ampr_selection_read(g->title_id, g->source_path,
+                         intent, sizeof(intent),
+                         version, sizeof(version),
+                         selected_sha)) {
+    return !strcmp(intent, "latest") &&
+        strcasecmp(selected_sha, g->ampr_sha256) == 0;
+  }
+
+  /*
+   * No marker means this predates intent tracking. If the current SHA already
+   * exists in the local AMPR cache, assume the user intentionally installed or
+   * selected it and keep the primary action quiet. Unknown AMPR SHA means this
+   * is the first GameCompressor-managed update opportunity for the title.
+   */
+  return current_sha_cached ? 0 : 1;
 }
 
 static const char *
@@ -1942,6 +2571,7 @@ load_validation_state(gc_game_t *g) {
     snprintf(g->validation_status, sizeof(g->validation_status), "%s", "n/a");
     g->validation = GC_VALIDATION_NONE;
     g->apr_indexed = 0;
+    g->ampr_hot_swap_optimized = 0;
     return 0;
   }
 
@@ -1967,6 +2597,7 @@ load_validation_state(gc_game_t *g) {
              "not-validated");
     g->validation = GC_VALIDATION_NONE;
     g->apr_indexed = 0;
+    g->ampr_hot_swap_optimized = 0;
     return 0;
   }
   (void)json_size;
@@ -1991,8 +2622,11 @@ load_validation_state(gc_game_t *g) {
     g->saved_bytes =
         json_find_u64_value(json, "compressionSavedBytes", 0);
     g->apr_indexed = json_find_bool_value(json, "aprIndexed", 0);
+    g->ampr_hot_swap_optimized =
+        json_find_bool_value(json, "amprHotSwapOptimized", 0);
   } else {
     g->apr_indexed = 0;
+    g->ampr_hot_swap_optimized = 0;
   }
   if(!marker_matches_path ||
      !strcmp(marker_status, "bad-blocks-found") ||
@@ -2075,7 +2709,8 @@ static int
 write_validation_marker_ex(const char *title_id, const char *image_path,
                            const pfs_repair_info_t *info, const char *result,
                            uint64_t compression_source_size,
-                           int apr_indexed) {
+                           int apr_indexed,
+                           int ampr_hot_swap_optimized) {
   if(mkdirs(GC_VALIDATION_DIR) != 0) return -1;
   char marker[1024];
   char legacy_marker[1024];
@@ -2085,6 +2720,7 @@ write_validation_marker_ex(const char *title_id, const char *image_path,
   uint64_t compressed_size = st.st_size > 0 ? (uint64_t)st.st_size : 0;
   uint64_t saved_bytes = 0;
   int marker_apr_indexed = apr_indexed ? 1 : 0;
+  int marker_ampr_hot_swap_optimized = ampr_hot_swap_optimized ? 1 : 0;
   char *old_json = NULL;
   size_t old_json_size = 0;
   char old_path[1024] = {0};
@@ -2101,6 +2737,9 @@ write_validation_marker_ex(const char *title_id, const char *image_path,
     if(!strcmp(old_path, image_path)) {
       if(json_find_bool_value(old_json, "aprIndexed", 0)) {
         marker_apr_indexed = 1;
+      }
+      if(json_find_bool_value(old_json, "amprHotSwapOptimized", 0)) {
+        marker_ampr_hot_swap_optimized = 1;
       }
       if(compression_source_size == 0) {
         compression_source_size =
@@ -2136,13 +2775,15 @@ write_validation_marker_ex(const char *title_id, const char *image_path,
                    "\n  \"compressionCompressedSize\":%llu,"
                    "\n  \"compressionSavedBytes\":%llu,"
                    "\n  \"aprIndexed\":%s,"
+                   "\n  \"amprHotSwapOptimized\":%s,"
                    "\n  \"status\":",
                    (unsigned long long)(st.st_size > 0 ? st.st_size : 0),
                    (unsigned long long)st.st_mtime,
                    (unsigned long long)compression_source_size,
                    (unsigned long long)compressed_size,
                    (unsigned long long)saved_bytes,
-                   marker_apr_indexed ? "true" : "false") == 0 &&
+                   marker_apr_indexed ? "true" : "false",
+                   marker_ampr_hot_swap_optimized ? "true" : "false") == 0 &&
       json_string(&b, result ? result : "") == 0 &&
       json_appendf(&b,
                    ",\n  \"nestedName\":") == 0 &&
@@ -2632,7 +3273,59 @@ detect_game_source_ex(gc_game_t *g, int exact_folder_size, int honor_cancel) {
   g->can_stream_delete =
       g->source_kind == GC_SOURCE_FOLDER ||
       g->source_kind == GC_SOURCE_COMPRESSED;
+  if(ampr_folder_target_probe(g->source_path, g->ampr_path,
+                              sizeof(g->ampr_path), g->ampr_sha256) ||
+     (g->is_mounted &&
+      ampr_folder_target_probe(g->mount_path, g->ampr_path,
+                               sizeof(g->ampr_path), g->ampr_sha256))) {
+    g->ampr_present = 1;
+  } else {
+    g->ampr_present = 0;
+    g->ampr_path[0] = 0;
+    g->ampr_sha256[0] = 0;
+  }
+  g->ampr_version[0] = 0;
+  int ampr_have_latest =
+      ampr_latest_cached(g->ampr_latest_version,
+                         sizeof(g->ampr_latest_version),
+                         g->ampr_latest_sha256);
+  int ampr_current_cached = 0;
+  if(g->ampr_present && sha256_hex_valid(g->ampr_sha256)) {
+    if(ampr_have_latest &&
+       strcasecmp(g->ampr_sha256, g->ampr_latest_sha256) == 0) {
+      snprintf(g->ampr_version, sizeof(g->ampr_version), "%s",
+               g->ampr_latest_version);
+      ampr_current_cached = 1;
+    } else {
+      ampr_current_cached =
+          ampr_cached_version_for_sha(g->ampr_sha256, g->ampr_version,
+                                      sizeof(g->ampr_version));
+    }
+    if(!g->ampr_version[0]) {
+      char selected_intent[16] = {0};
+      char selected_version[64] = {0};
+      char selected_sha[65] = {0};
+      if(ampr_selection_read(g->title_id, g->source_path,
+                             selected_intent, sizeof(selected_intent),
+                             selected_version, sizeof(selected_version),
+                             selected_sha) &&
+         strcasecmp(selected_sha, g->ampr_sha256) == 0 &&
+         ampr_version_safe(selected_version)) {
+        snprintf(g->ampr_version, sizeof(g->ampr_version), "%s",
+                 selected_version);
+      }
+    }
+  }
+  g->ampr_original_available =
+      ampr_original_lookup(g->title_id, g->source_path, NULL,
+                           g->ampr_original_sha256,
+                           &g->ampr_original_size);
+  g->ampr_update_needed =
+      ampr_latest_update_needed_for_game(g, ampr_have_latest,
+                                         ampr_current_cached);
+  g->ampr_update_supported = g->ampr_present;
   load_validation_state(g);
+  populate_apr_index_state_from_roots(g);
 
   if(g->source_kind == GC_SOURCE_COMPRESSED) {
     snprintf(g->primary_action, sizeof(g->primary_action), "%s",
@@ -3172,7 +3865,8 @@ find_game_for_operation_source_path(const gc_operation_t *op, gc_game_t *out,
   if(S_ISREG(st.st_mode) && ends_with_ci(name, ".ffpfsc")) {
     if(strip_extension_base(name, title_id, sizeof(title_id)) != 0 ||
        strcmp(title_id, op->title_id) ||
-       pfs_decompress_probe(op->source_path, &dec, err, sizeof(err)) != 0) {
+       pfs_decompress_detect_nested(op->source_path, &dec,
+                                    err, sizeof(err)) != 0) {
       return -1;
     }
     candidate.source_kind = GC_SOURCE_COMPRESSED;
@@ -3182,6 +3876,9 @@ find_game_for_operation_source_path(const gc_operation_t *op, gc_game_t *out,
              dec.source_path);
     snprintf(candidate.output_path, sizeof(candidate.output_path), "%s",
              dec.output_path);
+    snprintf(candidate.nested_name, sizeof(candidate.nested_name), "%s",
+             dec.nested_name);
+    candidate.nested_type = dec.nested_type;
     candidate.output_exists = dec.output_exists;
     candidate.source_size = st.st_size > 0 ? (uint64_t)st.st_size : 0;
     candidate.required_bytes = candidate.source_size;
@@ -3252,6 +3949,15 @@ find_game_for_operation_source_path(const gc_operation_t *op, gc_game_t *out,
           snprintf(candidate.image_path, sizeof(candidate.image_path), "%s",
                    mounted.image_path);
         }
+        if(mounted.ampr_present) {
+          candidate.ampr_present = 1;
+          snprintf(candidate.ampr_path, sizeof(candidate.ampr_path), "%s",
+                   mounted.ampr_path);
+          snprintf(candidate.ampr_sha256, sizeof(candidate.ampr_sha256), "%s",
+                   mounted.ampr_sha256);
+          snprintf(candidate.ampr_version, sizeof(candidate.ampr_version), "%s",
+                   mounted.ampr_version);
+        }
       }
     }
   }
@@ -3266,6 +3972,7 @@ find_game_for_operation_source_path(const gc_operation_t *op, gc_game_t *out,
              "Compress");
   }
   load_validation_state(&candidate);
+  populate_apr_index_state_from_roots(&candidate);
   if(out) *out = candidate;
   return 0;
 }
@@ -3364,6 +4071,7 @@ operation_store_scan_stats(gc_operation_t *op, const pfs_app_info_t *info) {
   op->scan_elapsed_ms = info->scan_elapsed_ms;
   op->scan_workers = info->scan_workers;
   if(info->apr_indexed) op->apr_indexed = 1;
+  if(info->ampr_hot_swap_optimized) op->ampr_hot_swap_optimized = 1;
 }
 
 static void
@@ -3463,6 +4171,16 @@ append_operation_json(json_buf_t *b, const gc_operation_t *op,
       json_string(b, op->preserved_hidden_path) == 0 &&
       json_append(b, ",\"repairSummary\":") == 0 &&
       json_string(b, op->repair_summary) == 0 &&
+      json_append(b, ",\"amprVersion\":") == 0 &&
+      json_string(b, op->ampr_version) == 0 &&
+      json_append(b, ",\"amprSha256\":") == 0 &&
+      json_string(b, op->ampr_sha256) == 0 &&
+      json_append(b, ",\"amprCachePath\":") == 0 &&
+      json_string(b, op->ampr_cache_path) == 0 &&
+      json_append(b, ",\"amprResultMode\":") == 0 &&
+      json_string(b, op->ampr_result_mode) == 0 &&
+      json_append(b, ",\"amprIntent\":") == 0 &&
+      json_string(b, op->ampr_intent) == 0 &&
       json_append(b, ",\"readRoot\":") == 0 &&
       json_string(b, op->read_root) == 0 &&
       json_append(b, ",\"readStorage\":") == 0 &&
@@ -3480,6 +4198,7 @@ append_operation_json(json_buf_t *b, const gc_operation_t *op,
                    "\"scanDirs\":%llu,\"scanEntries\":%llu,"
                    "\"scanElapsedMs\":%llu,\"scanWorkers\":%llu,"
                    "\"aprIndexed\":%s,"
+                   "\"amprHotSwapOptimized\":%s,"
                    "\"readBytes\":%llu,\"readFiles\":%llu,"
                    "\"readDirs\":%llu,\"readElapsedMs\":%llu,"
                    "\"readAvgBps\":%llu,\"readMinBps\":%llu,"
@@ -3501,6 +4220,7 @@ append_operation_json(json_buf_t *b, const gc_operation_t *op,
                    (unsigned long long)op->scan_elapsed_ms,
                    (unsigned long long)op->scan_workers,
                    op->apr_indexed ? "true" : "false",
+                   op->ampr_hot_swap_optimized ? "true" : "false",
                    (unsigned long long)op->read_bytes,
                    (unsigned long long)op->read_files,
                    (unsigned long long)op->read_dirs,
@@ -4397,24 +5117,22 @@ build_force_remount_temp_path(const char *path, const char *title_id,
                               char *out, size_t out_size) {
   char parent[1024];
   const char *name = base_name(path);
-  int is_ffpfsc = ends_with_ci(name, ".ffpfsc");
+  const char *suffix = NULL;
+  size_t suffix_len = 0;
   if(!path || !title_id || !valid_title_id(title_id) || !name ||
      path_parent(path, parent, sizeof(parent)) != 0) {
     return -1;
   }
+  suffix = force_remount_visible_suffix(name, &suffix_len);
+  if(!suffix) return -1;
   size_t name_len = strlen(name);
-  size_t suffix_len = strlen(".ffpfsc");
-  size_t app_suffix_len = strlen("-app");
-  int is_app_dir = !is_ffpfsc && name_len > app_suffix_len &&
-                   ends_with_ci(name, "-app");
-  size_t stem_len = is_ffpfsc ? name_len - suffix_len :
-                    (is_app_dir ? name_len - app_suffix_len : name_len);
+  if(name_len <= suffix_len) return -1;
+  size_t stem_len = name_len - suffix_len;
   if(stem_len != 9 || strncmp(name, title_id, stem_len) != 0) return -1;
   int n = snprintf(out, out_size, "%s%s.%.*s%s%ld_%u%s",
                    parent, parent[1] ? "/" : "",
                    (int)stem_len, name, GC_FORCE_REMOUNT_PREFIX,
-                   (long)time(NULL), (unsigned)getpid(),
-                   is_ffpfsc ? ".ffpfsc" : (is_app_dir ? "-app" : ""));
+                   (long)time(NULL), (unsigned)getpid(), suffix);
   return n < 0 || (size_t)n >= out_size ? -1 : 0;
 }
 
@@ -4441,6 +5159,30 @@ wait_for_compressed_shadowmount(const char *title_id, const char *path,
            title_id ? title_id : "", scan_err[0] ? scan_err : "unknown");
   }
   return wait_for_shadowmount_links(title_id, expected_mount, expected_image,
+                                    err, err_size);
+}
+
+static int
+wait_for_image_shadowmount(const char *title_id, const char *path,
+                           int nested_type, const char *current,
+                           char *err, size_t err_size) {
+  char expected_mount[1024];
+  char scan_err[256] = {0};
+  if(!path || !path[0] ||
+     shadow_image_mount_point(path, nested_type, expected_mount,
+                              sizeof(expected_mount)) != 0) {
+    snprintf(err, err_size, "%s", "could not derive image remount path");
+    return -1;
+  }
+  if(gc_cancel_requested(err, err_size)) return -1;
+  job_set_phase("mounting", 0, 0, current ? current : "Waiting for remount");
+  if(gc_shadowmount_request_title_source_scan_cancelable(
+         title_id, path, scan_err, sizeof(scan_err)) != 0) {
+    if(job_cancelled()) return -1;
+    gc_log("image remount scan request failed title=%s err=%s",
+           title_id ? title_id : "", scan_err[0] ? scan_err : "unknown");
+  }
+  return wait_for_shadowmount_links(title_id, expected_mount, path,
                                     err, err_size);
 }
 
@@ -4522,6 +5264,67 @@ force_compressed_path_bounce_remount(const char *title_id,
                                          nested_type,
                                          "Waiting for final remount",
                                          err, err_size);
+}
+
+static int
+force_image_path_bounce_remount(const char *title_id,
+                                const char *original_path,
+                                int nested_type,
+                                char *err, size_t err_size) {
+  char temp_path[1024];
+  char hint_err[256] = {0};
+  char scan_err[256] = {0};
+  int cancelled = 0;
+
+  if(gc_cancel_requested(err, err_size)) return -1;
+  if(build_force_remount_temp_path(original_path, title_id, temp_path,
+                                   sizeof(temp_path)) != 0) {
+    snprintf(err, err_size, "%s", "could not build image remount temp path");
+    return -1;
+  }
+  if(rename(original_path, temp_path) != 0) {
+    snprintf(err, err_size, "rename image for remount: %s", strerror(errno));
+    return -1;
+  }
+  gc_log("image remount bounce title=%s original=%s temp=%s",
+         title_id ? title_id : "", original_path, temp_path);
+
+  job_set_phase("mounting", 0, 0, "Refreshing temporary mount state");
+  if(gc_shadowmount_request_scan_cancelable(scan_err, sizeof(scan_err)) != 0) {
+    if(job_cancelled()) cancelled = 1;
+  }
+  if(!cancelled && scan_err[0]) {
+    gc_log("image temp remount scan failed title=%s err=%s",
+           title_id ? title_id : "", scan_err[0] ? scan_err : "unknown");
+  }
+  if(!cancelled &&
+     gc_sleep_cancelable_seconds(GC_MOUNT_SCAN_REQUEST_SECONDS,
+                                 err, err_size) != 0) {
+    cancelled = 1;
+  }
+  if(rename(temp_path, original_path) != 0) {
+    snprintf(err, err_size, "restore image name: %s", strerror(errno));
+    gc_log("image remount restore failed title=%s temp=%s original=%s err=%s",
+           title_id ? title_id : "", temp_path,
+           original_path ? original_path : "", err && err[0] ? err : "");
+    return -1;
+  }
+  gc_log("image remount restore title=%s temp=%s original=%s",
+         title_id ? title_id : "", temp_path, original_path);
+  if(gc_shadowmount_prepare_image_hints_for_title(title_id, original_path,
+                                                  nested_type, hint_err,
+                                                  sizeof(hint_err)) != 0) {
+    gc_log("image final remount hint failed title=%s path=%s err=%s",
+           title_id ? title_id : "", original_path,
+           hint_err[0] ? hint_err : "unknown");
+  }
+  if(cancelled || gc_cancel_requested(err, err_size)) {
+    snprintf(err, err_size, "%s", "cancelled");
+    return -1;
+  }
+  return wait_for_image_shadowmount(title_id, original_path, nested_type,
+                                    "Waiting for final remount",
+                                    err, err_size);
 }
 
 static int
@@ -5609,6 +6412,121 @@ mount_selected_instance_hidden_exclusive(gc_operation_t *op,
 }
 
 static int
+update_ampr_remount_source(gc_operation_t *op, const gc_game_t *game,
+                           char *expected_mount, size_t expected_mount_size,
+                           char *err, size_t err_size) {
+  char expected_image[1024] = {0};
+  char scan_err[256] = {0};
+  gc_mount_link_backup_t link_backup;
+
+  if(!op || !game || !game->source_path[0]) {
+    snprintf(err, err_size, "%s", "AMPR source is unavailable");
+    errno = EINVAL;
+    return -1;
+  }
+  if(expected_mount && expected_mount_size) expected_mount[0] = 0;
+  memset(&link_backup, 0, sizeof(link_backup));
+  if(move_remount_expectations(game, game->source_path,
+                               expected_mount, expected_mount_size,
+                               expected_image, sizeof(expected_image),
+                               err, err_size) != 0) {
+    return -1;
+  }
+  if(prepare_shadowmount_for_selected_source(game, err, err_size) != 0) {
+    return -1;
+  }
+  if(gc_cancel_requested(err, err_size)) return -1;
+  artifact_cache_invalidate();
+  if(mount_switch_clear_stale_links(op->title_id, expected_mount,
+                                    expected_image, &link_backup,
+                                    err, err_size) != 0) {
+    return -1;
+  }
+  if(mount_switch_clear_live_title_mount(op->title_id, err, err_size) != 0) {
+    (void)mount_switch_restore_cleared_links(&link_backup, scan_err,
+                                             sizeof(scan_err));
+    return -1;
+  }
+
+  if(game->source_kind == GC_SOURCE_COMPRESSED) {
+    pfs_decompress_info_t dec = {0};
+    if(pfs_decompress_detect_nested(game->source_path, &dec,
+                                    err, err_size) != 0) {
+      (void)mount_switch_restore_cleared_links(&link_backup, scan_err,
+                                               sizeof(scan_err));
+      return -1;
+    }
+    if(force_compressed_path_bounce_remount(op->title_id, game->source_path,
+                                            dec.nested_name, dec.nested_type,
+                                            err, err_size) != 0) {
+      (void)mount_switch_restore_cleared_links(&link_backup, scan_err,
+                                               sizeof(scan_err));
+      return -1;
+    }
+  } else if(game->source_kind == GC_SOURCE_IMAGE) {
+    if(force_image_path_bounce_remount(op->title_id, game->source_path,
+                                       game->nested_type,
+                                       err, err_size) != 0) {
+      (void)mount_switch_restore_cleared_links(&link_backup, scan_err,
+                                               sizeof(scan_err));
+      return -1;
+    }
+  } else {
+    gc_checkpoint("update-ampr mount selected source");
+    job_set_phase("mounting", 0, 0, "Mounting APR-EMU update");
+    if(gc_shadowmount_request_title_source_scan_cancelable(
+           game->title_id, game->source_path, scan_err,
+           sizeof(scan_err)) != 0) {
+      snprintf(err, err_size, "%s",
+               scan_err[0] ? scan_err : "could not request ShadowMount scan");
+      (void)mount_switch_restore_cleared_links(&link_backup, scan_err,
+                                               sizeof(scan_err));
+      return -1;
+    }
+    if(wait_for_shadowmount_links(op->title_id, expected_mount,
+                                  expected_image, err, err_size) != 0) {
+      (void)mount_switch_restore_cleared_links(&link_backup, scan_err,
+                                               sizeof(scan_err));
+      return -1;
+    }
+  }
+  artifact_cache_invalidate();
+  return 0;
+}
+
+static int
+update_ampr_verify_mounted_hash(const char *title_id,
+                                const char *mounted_root,
+                                const char *expected_sha,
+                                char *err, size_t err_size) {
+  char ampr_path[1024];
+  char mounted_sha[65];
+
+  if(!mounted_root || !mounted_root[0] || !sha256_hex_valid(expected_sha)) {
+    snprintf(err, err_size, "%s", "bad AMPR mounted hash verification input");
+    errno = EINVAL;
+    return -1;
+  }
+  if(!ampr_folder_target_probe(mounted_root, ampr_path, sizeof(ampr_path),
+                               mounted_sha)) {
+    snprintf(err, err_size,
+             "mounted AMPR binary was not found after hot-swap at %s",
+             mounted_root);
+    return -1;
+  }
+  if(!sha256_hex_valid(mounted_sha) ||
+     strcasecmp(mounted_sha, expected_sha) != 0) {
+    snprintf(err, err_size,
+             "mounted AMPR hash mismatch after hot-swap: expected %.64s got %.64s",
+             expected_sha, mounted_sha[0] ? mounted_sha : "(unreadable)");
+    return -1;
+  }
+  gc_log("update-ampr mounted verify title=%s path=%s sha=%s",
+         title_id ? title_id : "", ampr_path, mounted_sha);
+  return 0;
+}
+
+static int
 mount_switch_delete_hidden_source(gc_operation_t *op,
                                   gc_hidden_instance_t *hidden,
                                   size_t hidden_count,
@@ -6025,7 +6943,8 @@ run_move_op(gc_operation_t *op) {
   if(copy_only && game.source_kind == GC_SOURCE_COMPRESSED) {
     (void)write_validation_marker_ex(
         op->title_id, target_path, NULL, "compression-stats",
-        game.compression_source_size, game.apr_indexed);
+        game.compression_source_size, game.apr_indexed,
+        game.ampr_hot_swap_optimized);
   }
 
   if(copy_only) {
@@ -6707,7 +7626,8 @@ run_compress_op(gc_operation_t *op) {
       operation_store_compression_stats(op, game.source_size, info.output_path);
       (void)write_validation_marker_ex(op->title_id, info.output_path, NULL,
                                        "compression-stats", game.source_size,
-                                       op->apr_indexed);
+                                       op->apr_indexed,
+                                       op->ampr_hot_swap_optimized);
       return 0;
     }
     gc_log("compress mount retry succeeded title=%s output=%s",
@@ -6759,7 +7679,8 @@ run_compress_op(gc_operation_t *op) {
       operation_mark_verified_not_mounted(op, err);
       (void)write_validation_marker_ex(op->title_id, info.output_path, &repair,
                                        op->result, game.source_size,
-                                       op->apr_indexed);
+                                       op->apr_indexed,
+                                       op->ampr_hot_swap_optimized);
       return 0;
     }
     {
@@ -6780,7 +7701,8 @@ run_compress_op(gc_operation_t *op) {
 
   (void)write_validation_marker_ex(op->title_id, info.output_path, &repair,
                                    op->result, game.source_size,
-                                   op->apr_indexed);
+                                   op->apr_indexed,
+                                   op->ampr_hot_swap_optimized);
   char final_result[32];
   snprintf(final_result, sizeof(final_result), "%s", op->result);
   if(delete_after) {
@@ -7379,7 +8301,7 @@ run_validate_repair_op(gc_operation_t *op) {
       operation_mark_verified_not_mounted(op, err);
       snprintf(final_result, sizeof(final_result), "%s", op->result);
       (void)write_validation_marker_ex(op->title_id, repair_path, &repair,
-                                       op->result, 0, 0);
+                                       op->result, 0, 0, 0);
       if(mount_switch_restore_after_operation_ex(op, hidden, hidden_count, 0,
                                                  restore_err,
                                                  sizeof(restore_err)) != 0) {
@@ -7407,7 +8329,7 @@ run_validate_repair_op(gc_operation_t *op) {
     return -1;
   }
   (void)write_validation_marker_ex(op->title_id, repair_path, &repair,
-                                   op->result, 0, 0);
+                                   op->result, 0, 0, 0);
   if(mount_switch_restore_after_operation_ex(op, hidden, hidden_count, 0,
                                              restore_err,
                                              sizeof(restore_err)) != 0) {
@@ -7547,7 +8469,7 @@ run_validate_only_op(gc_operation_t *op) {
       if(repair.repaired_blocks == 0) {
         operation_mark_verified_not_mounted(op, err);
         (void)write_validation_marker_ex(op->title_id, repair_path, &repair,
-                                         op->result, 0, 0);
+                                         op->result, 0, 0, 0);
       } else {
 	        snprintf(op->result, sizeof(op->result), "%s",
 	                 "bad-blocks-found-not-mounted");
@@ -7586,7 +8508,7 @@ run_validate_only_op(gc_operation_t *op) {
   }
   if(repair.repaired_blocks == 0) {
     (void)write_validation_marker_ex(op->title_id, repair_path, &repair,
-                                     op->result, 0, 0);
+                                     op->result, 0, 0, 0);
 	  } else {
 	    delete_validation_marker_for_path(op->title_id, repair_path);
 	  }
@@ -7818,7 +8740,8 @@ run_refresh_mount_op(gc_operation_t *op) {
     snprintf(op->result, sizeof(op->result), "%s", "success");
     if(was_validated) {
       (void)write_validation_marker_ex(op->title_id, game.source_path, NULL,
-                                       "validated", 0, 0);
+                                       "validated", 0, 0,
+                                       game.ampr_hot_swap_optimized);
     }
     gc_log("refresh-mount complete title=%s path=%s", op->title_id,
            game.source_path);
@@ -8190,11 +9113,575 @@ run_delete_game_data_op(gc_operation_t *op) {
   return 0;
 }
 
+static const char *
+ui_theme_normalize(const char *theme) {
+  return theme && !strcasecmp(theme, "dark") ? "dark" : "light";
+}
+
+static int
+ui_settings_theme_read(char *out, size_t out_size) {
+  char *json = NULL;
+  size_t json_size = 0;
+  char theme[16] = {0};
+  const char *normalized;
+
+  if(!out || out_size == 0) return -1;
+  snprintf(out, out_size, "%s", "light");
+  if(read_file_limited(GC_UI_SETTINGS_FILE, &json, &json_size,
+                       64 * 1024) != 0) {
+    return 0;
+  }
+  (void)json_size;
+  json_find_string_value(json, "theme", theme, sizeof(theme));
+  normalized = ui_theme_normalize(theme);
+  snprintf(out, out_size, "%s", normalized);
+  free(json);
+  return 0;
+}
+
+static int
+ui_settings_theme_write(const char *theme) {
+  char tmp[1024];
+  const char *normalized = ui_theme_normalize(theme);
+  json_buf_t b = {0};
+  int fd;
+  int n;
+
+  if(mkdirs(GC_BASE) != 0) return -1;
+  n = snprintf(tmp, sizeof(tmp), "%s/.ui-settings.json.tmp", GC_BASE);
+  if(n < 0 || (size_t)n >= sizeof(tmp)) {
+    errno = ENAMETOOLONG;
+    return -1;
+  }
+  if(json_append(&b, "{\"theme\":") != 0 ||
+     json_string(&b, normalized) != 0 ||
+     json_appendf(&b, ",\"updatedAt\":%ld}\n", (long)time(NULL)) != 0) {
+    free(b.data);
+    errno = ENOMEM;
+    return -1;
+  }
+  fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+  if(fd < 0) {
+    free(b.data);
+    return -1;
+  }
+  if(write_all_fd(fd, b.data, b.len) != 0 || fsync(fd) != 0) {
+    int saved_errno = errno;
+    close(fd);
+    unlink(tmp);
+    free(b.data);
+    errno = saved_errno;
+    return -1;
+  }
+  close(fd);
+  free(b.data);
+  if(rename(tmp, GC_UI_SETTINGS_FILE) != 0) {
+    int saved_errno = errno;
+    unlink(tmp);
+    errno = saved_errno;
+    return -1;
+  }
+  fsync_parent_dir_best_effort(GC_BASE);
+  return 0;
+}
+
+static int
+ui_settings_request(const http_request_t *req) {
+  char theme[16] = {0};
+  json_buf_t b = {0};
+
+  if(!strcmp(req->method, "POST")) {
+    if(!websrv_get_query_arg(req, "theme", theme, sizeof(theme))) {
+      return serve_error(req, 400, "theme required");
+    }
+    if(strcasecmp(theme, "light") && strcasecmp(theme, "dark")) {
+      return serve_error(req, 400, "bad theme");
+    }
+    if(ui_settings_theme_write(theme) != 0) {
+      return serve_error(req, 500, "save UI settings failed");
+    }
+  } else if(strcmp(req->method, "GET")) {
+    return serve_error(req, 405, "method not allowed");
+  }
+
+  if(ui_settings_theme_read(theme, sizeof(theme)) != 0) {
+    snprintf(theme, sizeof(theme), "%s", "light");
+  }
+  if(json_append(&b, "{\"ok\":true,\"theme\":") != 0 ||
+     json_string(&b, ui_theme_normalize(theme)) != 0 ||
+     json_append(&b, "}") != 0) {
+    free(b.data);
+    return serve_error(req, 500, "out of memory");
+  }
+  return serve_owned(req, 200, b.data, b.len);
+}
+
+static int
+ampr_versions_request(const http_request_t *req) {
+  DIR *d = opendir(GC_AMPR_DIR);
+  json_buf_t b = {0};
+  int first = 1;
+  if(json_append(&b, "{\"ok\":true,\"versions\":[") != 0) {
+    free(b.data);
+    return serve_error(req, 500, "out of memory");
+  }
+  if(d) {
+    struct dirent *ent;
+    while((ent = readdir(d)) != NULL) {
+      if(!ampr_version_safe(ent->d_name)) continue;
+      char bin[1024];
+      char hash[65] = {0};
+      char err[128] = {0};
+      struct stat st;
+      if(ampr_cache_binary_path(ent->d_name, bin, sizeof(bin)) != 0) continue;
+      if(stat(bin, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+      if(hash_file_sha256_hex(bin, hash, err, sizeof(err)) != 0) continue;
+      if(!first && json_append(&b, ",") != 0) {
+        closedir(d);
+        free(b.data);
+        return serve_error(req, 500, "out of memory");
+      }
+      first = 0;
+      if(json_append(&b, "{\"version\":") != 0 ||
+         json_string(&b, ent->d_name) != 0 ||
+         json_append(&b, ",\"path\":") != 0 ||
+         json_string(&b, bin) != 0 ||
+         json_append(&b, ",\"sha256\":") != 0 ||
+         json_string(&b, hash) != 0 ||
+         json_appendf(&b, ",\"size\":%llu,\"mtime\":%ld}",
+                      (unsigned long long)st.st_size,
+                      (long)st.st_mtime) != 0) {
+        closedir(d);
+        free(b.data);
+        return serve_error(req, 500, "out of memory");
+      }
+    }
+    closedir(d);
+  }
+  if(json_append(&b, "]}") != 0) {
+    free(b.data);
+    return serve_error(req, 500, "out of memory");
+  }
+  return serve_owned(req, 200, b.data, b.len);
+}
+
+static int
+ampr_upload_request(const http_request_t *req) {
+  char version[64];
+  char expected_sha[65];
+  char set_latest_arg[16] = "";
+  char source_url[1024] = "";
+  char dir[1024];
+  char bin[1024];
+  char tmp[1024];
+  char meta[1024];
+  char latest_tmp[1024];
+  char actual_sha[65] = {0};
+  unsigned char body_hash[PFS_VHASH_HASH_SIZE];
+  int fd = -1;
+  if(strcmp(req->method, "POST")) return serve_error(req, 405, "method not allowed");
+  if(!websrv_get_query_arg(req, "version", version, sizeof(version)) ||
+     !ampr_version_safe(version)) {
+    return serve_error(req, 400, "bad AMPR version");
+  }
+  expected_sha[0] = 0;
+  (void)websrv_get_query_arg(req, "sha256", expected_sha,
+                              sizeof(expected_sha));
+  int set_latest = 1;
+  if(websrv_get_query_arg(req, "setLatest", set_latest_arg,
+                          sizeof(set_latest_arg))) {
+    set_latest =
+        strcmp(set_latest_arg, "0") &&
+        strcasecmp(set_latest_arg, "false") &&
+        strcasecmp(set_latest_arg, "no");
+  }
+  if(expected_sha[0] && !sha256_hex_valid(expected_sha)) {
+    return serve_error(req, 400, "bad AMPR SHA-256");
+  }
+  (void)websrv_get_query_arg(req, "sourceUrl", source_url, sizeof(source_url));
+  if(!req->body || req->body_size == 0) {
+    return serve_error(req, 400, "AMPR binary upload is empty");
+  }
+  pfs_sha256(req->body, req->body_size, body_hash);
+  sha256_to_hex(body_hash, actual_sha);
+  if(expected_sha[0] && strcasecmp(actual_sha, expected_sha) != 0) {
+    return serve_error(req, 400, "AMPR binary hash mismatch");
+  }
+  if(ampr_cache_dir_for_version(version, dir, sizeof(dir)) != 0 ||
+     ampr_cache_binary_path(version, bin, sizeof(bin)) != 0) {
+    return serve_error(req, 400, "bad AMPR cache path");
+  }
+  if(mkdirs(dir) != 0) {
+    return serve_error(req, 500, "create AMPR cache failed");
+  }
+  int n = snprintf(tmp, sizeof(tmp), "%s/.%s.tmp", dir, GC_AMPR_BINARY_NAME);
+  if(n < 0 || (size_t)n >= sizeof(tmp)) {
+    return serve_error(req, 500, "AMPR temp path too long");
+  }
+  fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+  if(fd < 0) return serve_error(req, 500, "open AMPR cache failed");
+  if(write_all_fd(fd, req->body, req->body_size) != 0 ||
+     fsync(fd) != 0) {
+    close(fd);
+    unlink(tmp);
+    return serve_error(req, 500, "write AMPR cache failed");
+  }
+  close(fd);
+  fd = -1;
+  if(rename(tmp, bin) != 0) {
+    unlink(tmp);
+    return serve_error(req, 500, "publish AMPR cache failed");
+  }
+  fsync_parent_dir_best_effort(dir);
+  n = snprintf(meta, sizeof(meta), "%s/metadata.json", dir);
+  if(n >= 0 && (size_t)n < sizeof(meta)) {
+    json_buf_t mb = {0};
+    if(json_append(&mb, "{\"version\":") == 0 &&
+       json_string(&mb, version) == 0 &&
+       json_append(&mb, ",\"sourceUrl\":") == 0 &&
+       json_string(&mb, source_url) == 0 &&
+       json_append(&mb, ",\"sha256\":") == 0 &&
+       json_string(&mb, actual_sha) == 0 &&
+       json_appendf(&mb, ",\"size\":%llu,\"cachedAt\":%ld}\n",
+                    (unsigned long long)req->body_size, (long)time(NULL)) == 0) {
+      int mfd = open(meta, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+      if(mfd >= 0) {
+        (void)write_all_fd(mfd, mb.data, mb.len);
+        fsync(mfd);
+        close(mfd);
+      }
+    }
+    free(mb.data);
+  }
+  n = snprintf(latest_tmp, sizeof(latest_tmp), "%s/.latest.json.tmp",
+               GC_AMPR_DIR);
+  if(set_latest && n >= 0 && (size_t)n < sizeof(latest_tmp)) {
+    json_buf_t lb = {0};
+    if(json_append(&lb, "{\"version\":") == 0 &&
+       json_string(&lb, version) == 0 &&
+       json_append(&lb, ",\"sourceUrl\":") == 0 &&
+       json_string(&lb, source_url) == 0 &&
+       json_append(&lb, ",\"sha256\":") == 0 &&
+       json_string(&lb, actual_sha) == 0 &&
+       json_append(&lb, ",\"path\":") == 0 &&
+       json_string(&lb, bin) == 0 &&
+       json_appendf(&lb, ",\"size\":%llu,\"cachedAt\":%ld}\n",
+                    (unsigned long long)req->body_size, (long)time(NULL)) == 0) {
+      int lfd = open(latest_tmp, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+      if(lfd >= 0) {
+        if(write_all_fd(lfd, lb.data, lb.len) == 0 && fsync(lfd) == 0) {
+          close(lfd);
+          lfd = -1;
+          (void)rename(latest_tmp, GC_AMPR_LATEST_FILE);
+          fsync_parent_dir_best_effort(GC_AMPR_DIR);
+        }
+        if(lfd >= 0) close(lfd);
+      }
+    }
+    free(lb.data);
+  }
+  artifact_cache_invalidate();
+  json_buf_t b = {0};
+  if(json_append(&b, "{\"ok\":true,\"version\":") != 0 ||
+     json_string(&b, version) != 0 ||
+     json_append(&b, ",\"path\":") != 0 ||
+     json_string(&b, bin) != 0 ||
+     json_append(&b, ",\"sha256\":") != 0 ||
+     json_string(&b, actual_sha) != 0 ||
+     json_appendf(&b, ",\"size\":%llu}", (unsigned long long)req->body_size) != 0) {
+    free(b.data);
+    return serve_error(req, 500, "out of memory");
+  }
+  return serve_owned(req, 200, b.data, b.len);
+}
+
+static int
+copy_file_contents(const char *src, const char *dst, char *err, size_t err_size) {
+  int in = open(src, O_RDONLY);
+  char *buf = NULL;
+  if(in < 0) {
+    snprintf(err, err_size, "open source: %s", strerror(errno));
+    return -1;
+  }
+  int out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+  if(out < 0) {
+    snprintf(err, err_size, "open target: %s", strerror(errno));
+    close(in);
+    return -1;
+  }
+  buf = malloc(128 * 1024);
+  if(!buf) {
+    snprintf(err, err_size, "%s", "copy buffer allocation failed");
+    close(in);
+    close(out);
+    return -1;
+  }
+  for(;;) {
+    ssize_t n = read(in, buf, 128 * 1024);
+    if(n < 0) {
+      if(errno == EINTR) continue;
+      snprintf(err, err_size, "read source: %s", strerror(errno));
+      free(buf);
+      close(in);
+      close(out);
+      return -1;
+    }
+    if(n == 0) break;
+    if(write_all_fd(out, buf, (size_t)n) != 0) {
+      snprintf(err, err_size, "write target: %s", strerror(errno));
+      free(buf);
+      close(in);
+      close(out);
+      return -1;
+    }
+  }
+  free(buf);
+  close(in);
+  if(fsync(out) != 0) {
+    snprintf(err, err_size, "sync target: %s", strerror(errno));
+    close(out);
+    return -1;
+  }
+  close(out);
+  return 0;
+}
+
+static int
+ampr_find_folder_target(const char *root, char *out, size_t out_size) {
+  static const char *rels[] = {
+    "fakelib/" GC_AMPR_BINARY_NAME,
+    "fakelib/libSceAmpr.prx",
+    "sce_module/" GC_AMPR_BINARY_NAME,
+    "sce_module/libSceAmpr.prx",
+  };
+  struct stat st;
+  for(size_t i = 0; i < sizeof(rels) / sizeof(rels[0]); i++) {
+    char path[1024];
+    int n = snprintf(path, sizeof(path), "%s/%s", root, rels[i]);
+    if(n < 0 || (size_t)n >= sizeof(path)) continue;
+    if(stat(path, &st) == 0 && S_ISREG(st.st_mode)) {
+      snprintf(out, out_size, "%s", path);
+      return 0;
+    }
+  }
+  errno = ENOENT;
+  return -1;
+}
+
+static int
+run_update_ampr_op(gc_operation_t *op) {
+  gc_game_t game = {0};
+  char err[256] = {0};
+  char actual_sha[65] = {0};
+  char target[1024] = {0};
+  char parent[1024] = {0};
+  char tmp[1024] = {0};
+  char expected_mount[1024] = {0};
+
+  gc_checkpoint("update-ampr find game");
+  gc_log("update-ampr start op=%s title=%s version=%s sha=%s",
+         op->id, op->title_id, op->ampr_version, op->ampr_sha256);
+  append_operation_phase(op, "resolving");
+  job_set_phase("resolving", 0, 0, "Resolving selected source");
+  if(find_game_for_operation_source_path(op, &game, 0) != 0 ||
+     game.source_kind == GC_SOURCE_UNKNOWN) {
+    snprintf(op->error, sizeof(op->error), "%s", "game source is unavailable");
+    return -1;
+  }
+  snprintf(op->source_path, sizeof(op->source_path), "%s", game.source_path);
+  snprintf(op->source_kind, sizeof(op->source_kind), "%s",
+           source_kind_name(game.source_kind));
+  job_set_target(game.source_path);
+  if(hash_file_sha256_hex(op->ampr_cache_path, actual_sha,
+                          err, sizeof(err)) != 0) {
+    snprintf(op->error, sizeof(op->error), "%s",
+             err[0] ? err : "AMPR cache hash failed");
+    return -1;
+  }
+  if(strcasecmp(actual_sha, op->ampr_sha256) != 0) {
+    snprintf(op->error, sizeof(op->error), "%s", "cached AMPR hash mismatch");
+    return -1;
+  }
+  if(close_title_if_running(op->title_id, err, sizeof(err)) != 0) {
+    snprintf(op->error, sizeof(op->error), "%s",
+             err[0] ? err : "could not close game");
+    return -1;
+  }
+  if(ampr_original_backup_prepare(&game, err, sizeof(err)) != 0) {
+    snprintf(op->error, sizeof(op->error), "%s",
+             err[0] ? err : "original AMPR backup failed");
+    return -1;
+  }
+  append_operation_phase(op, "patching");
+  job_set_phase("patching", 0, 0, "Replacing APR-EMU binary");
+  if(game.source_kind == GC_SOURCE_FOLDER) {
+    if(ampr_find_folder_target(game.source_path, target, sizeof(target)) != 0) {
+      snprintf(op->error, sizeof(op->error), "%s",
+               "AMPR binary was not found in fakelib or sce_module");
+      return -1;
+    }
+    snprintf(op->ampr_result_mode, sizeof(op->ampr_result_mode), "%s",
+             "folder");
+    if(path_parent(target, parent, sizeof(parent)) != 0) {
+      snprintf(op->error, sizeof(op->error), "%s", "AMPR target path too long");
+      return -1;
+    }
+    int n = snprintf(tmp, sizeof(tmp), "%s/.%s.gc-ampr.tmp",
+                     parent, GC_AMPR_BINARY_NAME);
+    if(n < 0 || (size_t)n >= sizeof(tmp)) {
+      snprintf(op->error, sizeof(op->error), "%s", "AMPR temp path too long");
+      return -1;
+    }
+    unlink(tmp);
+    if(copy_file_contents(op->ampr_cache_path, tmp, err, sizeof(err)) != 0) {
+      unlink(tmp);
+      snprintf(op->error, sizeof(op->error), "%s",
+               err[0] ? err : "copy AMPR binary failed");
+      return -1;
+    }
+    if(rename(tmp, target) != 0) {
+      unlink(tmp);
+      snprintf(op->error, sizeof(op->error), "publish AMPR binary: %s",
+               strerror(errno));
+      return -1;
+    }
+    fsync_parent_dir_best_effort(parent);
+    if(hash_file_sha256_hex(target, actual_sha, err, sizeof(err)) != 0 ||
+       strcasecmp(actual_sha, op->ampr_sha256) != 0) {
+      snprintf(op->error, sizeof(op->error), "%s",
+               "AMPR target verification failed");
+      return -1;
+    }
+    snprintf(op->output_path, sizeof(op->output_path), "%s", target);
+  } else if(game.source_kind == GC_SOURCE_IMAGE) {
+    pfs_ampr_hotswap_info_t hs = {0};
+    if(game.nested_type != PFS_NESTED_EXFAT) {
+      snprintf(op->ampr_result_mode, sizeof(op->ampr_result_mode), "%s",
+               "failed");
+      snprintf(op->error, sizeof(op->error), "%s",
+               "AMPR hot-swap supports direct exFAT images only in this build");
+      return -1;
+    }
+    job_set_phase("patching", 0, 0, "Patching exFAT image");
+    if(pfs_ampr_hotswap_exfat_image(game.source_path,
+                                    op->ampr_cache_path,
+                                    &hs, err, sizeof(err)) != 0) {
+      snprintf(op->ampr_result_mode, sizeof(op->ampr_result_mode), "%s",
+               "failed");
+      snprintf(op->error, sizeof(op->error), "%s",
+               err[0] ? err : "exFAT AMPR hot-swap failed");
+      return -1;
+    }
+    snprintf(target, sizeof(target), "%s", game.source_path);
+    snprintf(op->output_path, sizeof(op->output_path), "%s", game.source_path);
+    snprintf(op->ampr_result_mode, sizeof(op->ampr_result_mode), "%s",
+             hs.mode[0] ? hs.mode : "exfat-in-place");
+    gc_log("update-ampr exfat patched title=%s path=%s logical=%s mode=%s "
+           "oldSize=%llu newSize=%llu oldCluster=%u newCluster=%u alloc=%u",
+           op->title_id, game.source_path, hs.logical_path,
+           op->ampr_result_mode,
+           (unsigned long long)hs.old_size,
+           (unsigned long long)hs.new_size,
+           hs.old_first_cluster, hs.new_first_cluster,
+           hs.allocated_clusters);
+  } else if(game.source_kind == GC_SOURCE_COMPRESSED) {
+    pfs_ampr_hotswap_info_t hs = {0};
+    if(game.nested_type != PFS_NESTED_EXFAT &&
+       game.nested_type != PFS_NESTED_PFS) {
+      snprintf(op->ampr_result_mode, sizeof(op->ampr_result_mode), "%s",
+               "failed");
+      snprintf(op->error, sizeof(op->error), "%s",
+               "AMPR hot-swap supports compressed nested exFAT or PFS images only");
+      return -1;
+    }
+    job_set_phase("patching", 0, 0,
+                  game.nested_type == PFS_NESTED_EXFAT
+                      ? "Patching compressed exFAT image"
+                      : "Patching compressed PFS image");
+    int hs_rc = game.nested_type == PFS_NESTED_EXFAT
+        ? pfs_ampr_hotswap_ffpfsc_exfat(game.source_path,
+                                        op->ampr_cache_path,
+                                        &hs, err, sizeof(err))
+        : pfs_ampr_hotswap_ffpfsc_pfs(game.source_path,
+                                      op->ampr_cache_path,
+                                      &hs, err, sizeof(err));
+    if(hs_rc != 0) {
+      snprintf(op->ampr_result_mode, sizeof(op->ampr_result_mode), "%s",
+               "failed");
+      snprintf(op->error, sizeof(op->error), "%s",
+               err[0] ? err : "compressed AMPR hot-swap failed");
+      return -1;
+    }
+    delete_vhash_sidecar_if_present(game.source_path, "update-ampr",
+                                    op->title_id);
+    delete_validation_marker_for_path(op->title_id, game.source_path);
+    snprintf(target, sizeof(target), "%s", game.source_path);
+    snprintf(op->output_path, sizeof(op->output_path), "%s", game.source_path);
+    snprintf(op->ampr_result_mode, sizeof(op->ampr_result_mode), "%s",
+             hs.mode[0] ? hs.mode : "ffpfsc-patch");
+    gc_log("update-ampr ffpfsc patched title=%s path=%s logical=%s mode=%s "
+           "oldSize=%llu newSize=%llu changedBlocks=%llu oldCluster=%u "
+           "newCluster=%u alloc=%u",
+           op->title_id, game.source_path, hs.logical_path,
+           op->ampr_result_mode,
+           (unsigned long long)hs.old_size,
+           (unsigned long long)hs.new_size,
+           (unsigned long long)hs.changed_blocks,
+           hs.old_first_cluster, hs.new_first_cluster,
+           hs.allocated_clusters);
+  } else {
+    snprintf(op->ampr_result_mode, sizeof(op->ampr_result_mode), "%s",
+             "failed");
+    snprintf(op->error, sizeof(op->error), "%s",
+             "AMPR hot-swap source is unavailable");
+    return -1;
+  }
+  snprintf(op->format, sizeof(op->format), "%s", "ampr");
+  snprintf(op->delete_policy, sizeof(op->delete_policy), "%s", "none");
+  append_operation_phase(op, "mounting");
+  job_set_phase("mounting", 0, 0, "Remounting APR-EMU update");
+  if(update_ampr_remount_source(op, &game, expected_mount,
+                                sizeof(expected_mount),
+                                err, sizeof(err)) != 0) {
+    snprintf(op->error, sizeof(op->error), "%s",
+             err[0] ? err : "AMPR hot-swap remount failed");
+    gc_log("update-ampr remount failed title=%s err=%s",
+           op->title_id, op->error);
+    return -1;
+  }
+  append_operation_phase(op, "validating");
+  job_set_phase("validating", 0, 0, "Verifying mounted APR-EMU");
+  if(update_ampr_verify_mounted_hash(op->title_id, expected_mount,
+                                     op->ampr_sha256,
+                                     err, sizeof(err)) != 0) {
+    snprintf(op->error, sizeof(op->error), "%s",
+             err[0] ? err : "AMPR mounted verification failed");
+    gc_log("update-ampr mounted verify failed title=%s err=%s",
+           op->title_id, op->error);
+    return -1;
+  }
+  snprintf(op->result, sizeof(op->result), "%s", "updated");
+  if(ampr_selection_write(op->title_id, game.source_path,
+                          op->ampr_intent[0] ? op->ampr_intent : "manual",
+                          op->ampr_version, op->ampr_sha256,
+                          op->ampr_result_mode) != 0) {
+    gc_log("update-ampr selection marker failed title=%s path=%s intent=%s",
+           op->title_id, game.source_path,
+           op->ampr_intent[0] ? op->ampr_intent : "manual");
+  }
+  artifact_cache_invalidate();
+  gc_log("update-ampr complete title=%s target=%s version=%s sha=%s",
+         op->title_id, target, op->ampr_version, op->ampr_sha256);
+  return 0;
+}
+
 static int
 run_build_ampr_index_op(gc_operation_t *op) {
   gc_game_t game = {0};
   pfs_app_info_t info;
+  pfs_ampr_hotswap_info_t hs;
   char err[256] = {0};
+  char expected_mount[1024] = {0};
 
   gc_checkpoint("build-ampr-index find game");
   gc_log("build-ampr-index start op=%s title=%s", op->id, op->title_id);
@@ -8202,58 +9689,136 @@ run_build_ampr_index_op(gc_operation_t *op) {
   job_set_phase("resolving", 0, 0, "Resolving selected source");
   if(find_game_for_operation_source_path(op, &game, 0) != 0 ||
      game.source_kind == GC_SOURCE_UNKNOWN) {
-    snprintf(op->error, sizeof(op->error), "%s", "game folder is unavailable");
+    snprintf(op->error, sizeof(op->error), "%s", "game source is unavailable");
     gc_log("build-ampr-index failed title=%s err=%s",
            op->title_id, op->error);
-    return -1;
-  }
-  if(game.source_kind != GC_SOURCE_FOLDER) {
-    snprintf(op->error, sizeof(op->error), "%s",
-             "AMPR index can only be built for a game folder");
-    gc_log("build-ampr-index denied title=%s sourceKind=%s path=%s",
-           op->title_id, source_kind_name(game.source_kind), game.source_path);
     return -1;
   }
   if(gc_cancel_requested(err, sizeof(err))) {
     snprintf(op->error, sizeof(op->error), "%s", err);
     return -1;
   }
+  if(!game.ampr_present) {
+    snprintf(op->error, sizeof(op->error), "%s",
+             "libSceAmpr.sprx or libSceAmpr.prx was not found for this game");
+    gc_log("build-ampr-index skipped title=%s path=%s err=%s",
+           op->title_id, game.source_path, op->error);
+    return -1;
+  }
 
   snprintf(op->source_path, sizeof(op->source_path), "%s", game.source_path);
-  snprintf(op->output_path, sizeof(op->output_path), "%s/ampr_emu.index",
-           game.source_path);
+  if(game.source_kind == GC_SOURCE_FOLDER) {
+    snprintf(op->output_path, sizeof(op->output_path), "%s/ampr_emu.index",
+             game.source_path);
+  } else {
+    snprintf(op->output_path, sizeof(op->output_path), "%s",
+             game.source_path);
+  }
   snprintf(op->source_kind, sizeof(op->source_kind), "%s",
            source_kind_name(game.source_kind));
   snprintf(op->format, sizeof(op->format), "%s", "ampr");
   snprintf(op->delete_policy, sizeof(op->delete_policy), "%s", "none");
   job_set_target(op->output_path);
 
-  gc_checkpoint("build-ampr-index scanning");
-  append_operation_phase(op, "scanning");
-  job_set_phase("scanning", 0, 0, "Scanning app folder");
   memset(&info, 0, sizeof(info));
-  if(pfs_build_ampr_index_for_folder(game.source_path, &info,
-                                     err, sizeof(err)) != 0) {
+  memset(&hs, 0, sizeof(hs));
+  if(game.source_kind == GC_SOURCE_FOLDER) {
+    gc_checkpoint("build-ampr-index scanning");
+    append_operation_phase(op, "scanning");
+    job_set_phase("scanning", 0, 0, "Scanning app folder");
+    if(pfs_build_ampr_index_for_folder(game.source_path, &info,
+                                       err, sizeof(err)) != 0) {
+      snprintf(op->error, sizeof(op->error), "%s",
+               err[0] ? err : "AMPR index build failed");
+      gc_log("build-ampr-index failed title=%s err=%s",
+             op->title_id, op->error);
+      return -1;
+    }
+    operation_store_scan_stats(op, &info);
+    op->compression_source_size = info.scan_bytes;
+    struct stat st;
+    if(stat(op->output_path, &st) == 0 && S_ISREG(st.st_mode) &&
+       st.st_size > 0) {
+      op->compressed_size = (uint64_t)st.st_size;
+    }
+  } else if(game.source_kind == GC_SOURCE_IMAGE) {
+    if(game.nested_type != PFS_NESTED_EXFAT) {
+      snprintf(op->error, sizeof(op->error), "%s",
+               "AMPR index image patch supports exFAT images only");
+      return -1;
+    }
+    gc_checkpoint("build-ampr-index patch image");
+    append_operation_phase(op, "patching");
+    job_set_phase("patching", 0, 0, "Building AMPR index into exFAT image");
+    if(pfs_ampr_index_exfat_image(game.source_path, &hs,
+                                  err, sizeof(err)) != 0) {
+      snprintf(op->error, sizeof(op->error), "%s",
+               err[0] ? err : "AMPR index image patch failed");
+      gc_log("build-ampr-index image failed title=%s err=%s",
+             op->title_id, op->error);
+      return -1;
+    }
+    snprintf(op->ampr_result_mode, sizeof(op->ampr_result_mode), "%s",
+             hs.mode[0] ? hs.mode : "exfat-index-tail");
+    op->compressed_size = hs.new_size;
+    if(update_ampr_remount_source(op, &game, expected_mount,
+                                  sizeof(expected_mount), err,
+                                  sizeof(err)) != 0) {
+      snprintf(op->error, sizeof(op->error), "%s",
+               err[0] ? err : "AMPR index remount failed");
+      gc_log("build-ampr-index image remount failed title=%s err=%s",
+             op->title_id, op->error);
+      return -1;
+    }
+  } else if(game.source_kind == GC_SOURCE_COMPRESSED) {
+    if(game.nested_type != PFS_NESTED_EXFAT) {
+      snprintf(op->error, sizeof(op->error), "%s",
+               "AMPR index compressed patch supports nested exFAT only");
+      return -1;
+    }
+    gc_checkpoint("build-ampr-index patch compressed");
+    append_operation_phase(op, "patching");
+    job_set_phase("patching", 0, 0,
+                  "Building AMPR index into compressed exFAT image");
+    if(pfs_ampr_index_ffpfsc_exfat(game.source_path, &hs,
+                                   err, sizeof(err)) != 0) {
+      snprintf(op->error, sizeof(op->error), "%s",
+               err[0] ? err : "AMPR index compressed patch failed");
+      gc_log("build-ampr-index compressed failed title=%s err=%s",
+             op->title_id, op->error);
+      return -1;
+    }
+    delete_vhash_sidecar_if_present(game.source_path, "build-ampr-index",
+                                    op->title_id);
+    snprintf(op->ampr_result_mode, sizeof(op->ampr_result_mode), "%s",
+             hs.mode[0] ? hs.mode : "ffpfsc-index-tail");
+    op->compressed_size = hs.new_size;
+    op->repaired_blocks = hs.changed_blocks;
+    if(update_ampr_remount_source(op, &game, expected_mount,
+                                  sizeof(expected_mount), err,
+                                  sizeof(err)) != 0) {
+      snprintf(op->error, sizeof(op->error), "%s",
+               err[0] ? err : "AMPR index remount failed");
+      gc_log("build-ampr-index compressed remount failed title=%s err=%s",
+             op->title_id, op->error);
+      return -1;
+    }
+  } else {
     snprintf(op->error, sizeof(op->error), "%s",
-             err[0] ? err : "AMPR index build failed");
-    gc_log("build-ampr-index failed title=%s err=%s",
-           op->title_id, op->error);
+             "AMPR index can only be built for a folder, exFAT image, or compressed image");
+    gc_log("build-ampr-index denied title=%s sourceKind=%s path=%s",
+           op->title_id, source_kind_name(game.source_kind), game.source_path);
     return -1;
-  }
-  operation_store_scan_stats(op, &info);
-  op->compression_source_size = info.scan_bytes;
-  struct stat st;
-  if(stat(op->output_path, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0) {
-    op->compressed_size = (uint64_t)st.st_size;
   }
   op->saved_bytes = 0;
   op->apr_indexed = 1;
   snprintf(op->result, sizeof(op->result), "%s", "indexed");
   artifact_cache_invalidate();
-  gc_log("build-ampr-index complete title=%s output=%s bytes=%llu files=%llu",
+  gc_log("build-ampr-index complete title=%s output=%s bytes=%llu files=%llu mode=%s",
          op->title_id, op->output_path,
          (unsigned long long)op->compressed_size,
-         (unsigned long long)info.scan_files);
+         (unsigned long long)info.scan_files,
+         op->ampr_result_mode);
   return 0;
 }
 
@@ -8311,6 +9876,8 @@ operation_thread(void *arg) {
 	    rc = run_build_ampr_index_op(op);
 	  } else if(op->action == GC_ACTION_SET_READ_ONLY) {
 	    rc = run_set_read_only_op(op);
+	  } else if(op->action == GC_ACTION_UPDATE_AMPR) {
+	    rc = run_update_ampr_op(op);
 	  }
 
   int cancelled = job_cancelled();
@@ -9054,6 +10621,9 @@ enqueue_build_ampr_index_action(const http_request_t *req) {
   char title_id[64];
   char source_path_arg[1024] = "";
   struct stat st;
+  gc_source_kind_t source_kind;
+  gc_game_t game;
+  int ampr_present = 0;
 
   if(strcmp(req->method, "POST")) {
     return serve_error(req, 405, "method not allowed");
@@ -9063,9 +10633,27 @@ enqueue_build_ampr_index_action(const http_request_t *req) {
                                                source_path_arg,
                                                sizeof(source_path_arg));
   if(arg_err) return serve_error(req, 400, arg_err);
-  if(stat(source_path_arg, &st) != 0 || !S_ISDIR(st.st_mode)) {
+  if(stat(source_path_arg, &st) != 0) {
+    return serve_error(req, 400, "AMPR index source is unavailable");
+  }
+  source_kind =
+      source_kind_from_name(source_kind_name_from_path(source_path_arg));
+  if(source_kind != GC_SOURCE_FOLDER &&
+     source_kind != GC_SOURCE_IMAGE &&
+     source_kind != GC_SOURCE_COMPRESSED) {
     return serve_error(req, 400,
-                       "AMPR index can only be built for a game folder");
+                       "AMPR index can only be built for a folder, exFAT image, or compressed image");
+  }
+  memset(&game, 0, sizeof(game));
+  if(lookup_game_by_source_path(source_path_arg, &game) == 0) {
+    ampr_present = game.ampr_present;
+  } else if(source_kind == GC_SOURCE_FOLDER) {
+    ampr_present =
+        ampr_folder_target_probe(source_path_arg, NULL, 0, NULL);
+  }
+  if(!ampr_present) {
+    return serve_error(req, 400,
+                       "libSceAmpr.sprx or libSceAmpr.prx was not found for this game");
   }
 
   if(title_operation_busy(title_id)) {
@@ -9078,11 +10666,150 @@ enqueue_build_ampr_index_action(const http_request_t *req) {
       req, title_id, GC_ACTION_BUILD_AMPR_INDEX, title_id, &response);
   if(!op) return response;
   snprintf(op->source_path, sizeof(op->source_path), "%s", source_path_arg);
-  snprintf(op->output_path, sizeof(op->output_path), "%s/ampr_emu.index",
-           source_path_arg);
-  snprintf(op->source_kind, sizeof(op->source_kind), "%s", "folder");
+  if(source_kind == GC_SOURCE_FOLDER) {
+    snprintf(op->output_path, sizeof(op->output_path), "%s/ampr_emu.index",
+             source_path_arg);
+  } else {
+    snprintf(op->output_path, sizeof(op->output_path), "%s", source_path_arg);
+  }
+  snprintf(op->source_kind, sizeof(op->source_kind), "%s",
+           source_kind_name(source_kind));
   snprintf(op->format, sizeof(op->format), "%s", "ampr");
   snprintf(op->delete_policy, sizeof(op->delete_policy), "%s", "none");
+  return enqueue_start_response_locked(req, op);
+}
+
+static int
+enqueue_update_ampr_action(const http_request_t *req) {
+  char title_id[64];
+  char source_path_arg[1024] = "";
+  char version[64] = "";
+  char sha[65] = "";
+  char intent_arg[16] = "";
+  const char *intent = "manual";
+  char cache_path[1024] = "";
+  char actual_sha[65] = {0};
+  char err[256] = {0};
+  gc_game_t game;
+  if(strcmp(req->method, "POST")) {
+    return serve_error(req, 405, "method not allowed");
+  }
+  const char *arg_err = read_title_source_args(req, title_id,
+                                               sizeof(title_id),
+                                               source_path_arg,
+                                               sizeof(source_path_arg));
+  if(arg_err) return serve_error(req, 400, arg_err);
+  if(!websrv_get_query_arg(req, "version", version, sizeof(version)) ||
+     !ampr_version_safe(version)) {
+    return serve_error(req, 400, "bad AMPR version");
+  }
+  if(!websrv_get_query_arg(req, "sha256", sha, sizeof(sha)) ||
+     !sha256_hex_valid(sha)) {
+    return serve_error(req, 400, "bad AMPR SHA-256");
+  }
+  if(ampr_cache_binary_path(version, cache_path, sizeof(cache_path)) != 0) {
+    return serve_error(req, 400, "bad AMPR cache path");
+  }
+  if(hash_file_sha256_hex(cache_path, actual_sha, err, sizeof(err)) != 0) {
+    return serve_error(req, 404, err[0] ? err : "cached AMPR binary not found");
+  }
+  if(strcasecmp(actual_sha, sha) != 0) {
+    return serve_error(req, 409, "cached AMPR hash mismatch");
+  }
+  if(websrv_get_query_arg(req, "intent", intent_arg, sizeof(intent_arg))) {
+    intent = ampr_normalized_intent(intent_arg, version);
+  } else {
+    intent = ampr_normalized_intent(NULL, version);
+  }
+  if(!strcmp(intent, "latest")) {
+    char latest_version[64] = {0};
+    char latest_sha[65] = {0};
+    if(!ampr_latest_cached(latest_version, sizeof(latest_version),
+                           latest_sha) ||
+       strcmp(latest_version, version) ||
+       strcasecmp(latest_sha, sha) != 0) {
+      intent = "manual";
+    }
+  }
+  memset(&game, 0, sizeof(game));
+  snprintf(game.title_id, sizeof(game.title_id), "%s", title_id);
+  snprintf(game.name, sizeof(game.name), "%s", title_id);
+  snprintf(game.source_path, sizeof(game.source_path), "%s", source_path_arg);
+  game.source_kind = source_kind_from_name(source_kind_name_from_path(source_path_arg));
+  (void)lookup_game_by_source_path(source_path_arg, &game);
+  pthread_mutex_lock(&g_gc_lock);
+  int response = 0;
+  gc_operation_t *op = alloc_queued_operation_locked(
+      req, title_id, GC_ACTION_UPDATE_AMPR, game.name, &response);
+  if(!op) return response;
+  snprintf(op->source_path, sizeof(op->source_path), "%s", game.source_path);
+  snprintf(op->source_kind, sizeof(op->source_kind), "%s",
+           source_kind_name(game.source_kind));
+  snprintf(op->format, sizeof(op->format), "%s", "ampr");
+  snprintf(op->delete_policy, sizeof(op->delete_policy), "%s", "none");
+  snprintf(op->ampr_version, sizeof(op->ampr_version), "%s", version);
+  snprintf(op->ampr_sha256, sizeof(op->ampr_sha256), "%s", sha);
+  snprintf(op->ampr_cache_path, sizeof(op->ampr_cache_path), "%s", cache_path);
+  snprintf(op->ampr_intent, sizeof(op->ampr_intent), "%s", intent);
+  return enqueue_start_response_locked(req, op);
+}
+
+static int
+enqueue_restore_ampr_original_action(const http_request_t *req) {
+  char title_id[64];
+  char source_path_arg[1024] = "";
+  char original_path[1024] = "";
+  char original_sha[65] = {0};
+  char actual_sha[65] = {0};
+  char err[256] = {0};
+  uint64_t original_size = 0;
+  gc_game_t game;
+  if(strcmp(req->method, "POST")) {
+    return serve_error(req, 405, "method not allowed");
+  }
+  const char *arg_err = read_title_source_args(req, title_id,
+                                               sizeof(title_id),
+                                               source_path_arg,
+                                               sizeof(source_path_arg));
+  if(arg_err) return serve_error(req, 400, arg_err);
+  if(title_operation_busy(title_id)) {
+    return serve_error(req, 409, "action already running for this game");
+  }
+  if(!ampr_original_lookup(title_id, source_path_arg, original_path,
+                           original_sha, &original_size)) {
+    return serve_error(req, 404, "original APR-EMU backup was not found");
+  }
+  (void)original_size;
+  if(hash_file_sha256_hex(original_path, actual_sha, err, sizeof(err)) != 0) {
+    return serve_error(req, 404,
+                       err[0] ? err : "original APR-EMU backup is unreadable");
+  }
+  if(strcasecmp(actual_sha, original_sha) != 0) {
+    return serve_error(req, 409, "original APR-EMU backup hash mismatch");
+  }
+  memset(&game, 0, sizeof(game));
+  snprintf(game.title_id, sizeof(game.title_id), "%s", title_id);
+  snprintf(game.name, sizeof(game.name), "%s", title_id);
+  snprintf(game.source_path, sizeof(game.source_path), "%s", source_path_arg);
+  game.source_kind =
+      source_kind_from_name(source_kind_name_from_path(source_path_arg));
+  (void)lookup_game_by_source_path(source_path_arg, &game);
+
+  pthread_mutex_lock(&g_gc_lock);
+  int response = 0;
+  gc_operation_t *op = alloc_queued_operation_locked(
+      req, title_id, GC_ACTION_UPDATE_AMPR, game.name, &response);
+  if(!op) return response;
+  snprintf(op->source_path, sizeof(op->source_path), "%s", game.source_path);
+  snprintf(op->source_kind, sizeof(op->source_kind), "%s",
+           source_kind_name(game.source_kind));
+  snprintf(op->format, sizeof(op->format), "%s", "ampr");
+  snprintf(op->delete_policy, sizeof(op->delete_policy), "%s", "none");
+  snprintf(op->ampr_version, sizeof(op->ampr_version), "%s", "original");
+  snprintf(op->ampr_sha256, sizeof(op->ampr_sha256), "%s", original_sha);
+  snprintf(op->ampr_cache_path, sizeof(op->ampr_cache_path), "%s",
+           original_path);
+  snprintf(op->ampr_intent, sizeof(op->ampr_intent), "%s", "custom");
   return enqueue_start_response_locked(req, op);
 }
 
@@ -9275,6 +11002,9 @@ append_game_summary(json_buf_t *b, int *first, const gc_game_t *game,
   int apr_indexed = game->apr_indexed ||
       (active && active->apr_indexed) ||
       (pending && pending->apr_indexed);
+  int ampr_hot_swap_optimized = game->ampr_hot_swap_optimized ||
+      (active && active->ampr_hot_swap_optimized) ||
+      (pending && pending->ampr_hot_swap_optimized);
   if(json_append(b, "{\"titleId\":") != 0 ||
      json_string(b, game->title_id) != 0 ||
      json_append(b, ",\"instanceId\":") != 0 ||
@@ -9296,6 +11026,18 @@ append_game_summary(json_buf_t *b, int *first, const gc_game_t *game,
      json_string(b, game->validation_status) != 0 ||
      json_append(b, ",\"primaryAction\":") != 0 ||
      json_string(b, game->primary_action) != 0 ||
+     json_append(b, ",\"amprPath\":") != 0 ||
+     json_string(b, game->ampr_path) != 0 ||
+     json_append(b, ",\"amprVersion\":") != 0 ||
+     json_string(b, game->ampr_version) != 0 ||
+     json_append(b, ",\"amprSha256\":") != 0 ||
+     json_string(b, game->ampr_sha256) != 0 ||
+     json_append(b, ",\"amprLatestVersion\":") != 0 ||
+     json_string(b, game->ampr_latest_version) != 0 ||
+     json_append(b, ",\"amprLatestSha256\":") != 0 ||
+     json_string(b, game->ampr_latest_sha256) != 0 ||
+     json_append(b, ",\"amprOriginalSha256\":") != 0 ||
+     json_string(b, game->ampr_original_sha256) != 0 ||
      json_appendf(b,
                   ",\"sourceSize\":%llu,\"freeBytes\":%llu,"
                   "\"requiredBytes\":%llu,\"extraBytes\":%llu,"
@@ -9304,6 +11046,12 @@ append_game_summary(json_buf_t *b, int *first, const gc_game_t *game,
                   "\"compressedSize\":%llu,"
                   "\"savedBytes\":%llu,"
                   "\"aprIndexed\":%s,"
+                  "\"amprHotSwapOptimized\":%s,"
+                  "\"amprPresent\":%s,"
+                  "\"amprUpdateNeeded\":%s,"
+                  "\"amprUpdateSupported\":%s,"
+                  "\"amprOriginalAvailable\":%s,"
+                  "\"amprOriginalSize\":%llu,"
                   "\"sizePending\":%s,"
                   "\"sizeStatus\":\"%s\","
                   "\"sizeEstimated\":%s,"
@@ -9324,6 +11072,12 @@ append_game_summary(json_buf_t *b, int *first, const gc_game_t *game,
                   (unsigned long long)game->compressed_size,
                   (unsigned long long)game->saved_bytes,
                   apr_indexed ? "true" : "false",
+                  ampr_hot_swap_optimized ? "true" : "false",
+                  game->ampr_present ? "true" : "false",
+                  game->ampr_update_needed ? "true" : "false",
+                  game->ampr_update_supported ? "true" : "false",
+                  game->ampr_original_available ? "true" : "false",
+                  (unsigned long long)game->ampr_original_size,
                   game->size_pending ? "true" : "false",
                   gc_size_status_name(game->size_status),
                   game->size_estimated ? "true" : "false",
@@ -9884,7 +11638,9 @@ job_request(const http_request_t *req) {
   char current[512], phase[32], verb[16], err[256], active_id[32] = {0};
   char cancel_disabled_reason[128] = {0};
   time_t started_at = 0;
+  time_t phase_started_at = 0;
   long elapsed_seconds = 0;
+  long phase_elapsed_seconds = 0;
   long speed_metric_bytes = 0;
   long speed_bytes_per_second = 0;
   const char *speed_source = "none";
@@ -9897,11 +11653,15 @@ job_request(const http_request_t *req) {
   snprintf(cancel_disabled_reason, sizeof(cancel_disabled_reason), "%s",
            g_job.cancel_disabled_reason);
   started_at = g_job.started_at;
+  phase_started_at = g_job.phase_started_at;
   pthread_mutex_unlock(&g_job.lock);
 
   if(busy && started_at > 0) {
     time_t now = time(NULL);
     if(now > started_at) elapsed_seconds = (long)(now - started_at);
+    if(phase_started_at > 0 && now > phase_started_at) {
+      phase_elapsed_seconds = (long)(now - phase_started_at);
+    }
   }
   pthread_mutex_lock(&g_gc_lock);
   gc_operation_t *active = active_op_locked();
@@ -9971,7 +11731,9 @@ job_request(const http_request_t *req) {
     cancel_disabled_reason[0] = 0;
     active_id[0] = 0;
     started_at = 0;
+    phase_started_at = 0;
     elapsed_seconds = 0;
+    phase_elapsed_seconds = 0;
     speed_metric_bytes = 0;
     speed_bytes_per_second = 0;
     speed_source = "none";
@@ -10044,18 +11806,20 @@ job_request(const http_request_t *req) {
      json_string(&b, cancel_disabled_reason) != 0 ||
      json_appendf(&b,
 		                  ",\"cancelRequested\":%s,"
-		                  "\"rollbackRequested\":%s,"
-		                  "\"startedAt\":%ld,"
-		                  "\"elapsedSeconds\":%ld,"
-		                  "\"speedMetricBytes\":%ld,"
-		                  "\"speedBytesPerSec\":%ld,"
+			                  "\"rollbackRequested\":%s,"
+			                  "\"startedAt\":%ld,"
+			                  "\"elapsedSeconds\":%ld,"
+			                  "\"phaseElapsedSeconds\":%ld,"
+			                  "\"speedMetricBytes\":%ld,"
+			                  "\"speedBytesPerSec\":%ld,"
 		                  "\"compressBytesPerSecond\":%ld,"
 		                  "\"speedSource\":",
 		                  cancel_requested ? "true" : "false",
-		                  rollback_requested ? "true" : "false",
-		                  (long)started_at, elapsed_seconds,
-		                  speed_metric_bytes, speed_bytes_per_second,
-		                  speed_bytes_per_second) != 0 ||
+			                  rollback_requested ? "true" : "false",
+			                  (long)started_at, elapsed_seconds,
+			                  phase_elapsed_seconds,
+			                  speed_metric_bytes, speed_bytes_per_second,
+			                  speed_bytes_per_second) != 0 ||
      json_string(&b, speed_source) != 0 ||
      json_append(&b, "}") != 0) {
     free(b.data);
@@ -10207,6 +11971,30 @@ gc_api_icon_request(const http_request_t *req) {
     close(fd);
     return websrv_send_error_json(req->fd, 404, "icon not found");
   }
+
+  char size_arg[32];
+  int want_thumb =
+      websrv_get_query_arg(req, "size", size_arg, sizeof(size_arg)) &&
+      !strcasecmp(size_arg, "thumb");
+  if(want_thumb) {
+    char thumb_path[1024];
+    if(gc_icon_thumb_path(title_id, path, &st, thumb_path,
+                          sizeof(thumb_path)) == 0) {
+      int thumb_fd = open(thumb_path, O_RDONLY);
+      if(thumb_fd >= 0) {
+        struct stat thumb_st;
+        if(fstat(thumb_fd, &thumb_st) == 0 && thumb_st.st_size > 0 &&
+           thumb_st.st_size <= 2 * 1024 * 1024) {
+          close(fd);
+          fd = thumb_fd;
+          st = thumb_st;
+        } else {
+          close(thumb_fd);
+        }
+      }
+    }
+  }
+
   char *data = malloc((size_t)st.st_size);
   if(!data) {
     close(fd);
@@ -10249,6 +12037,9 @@ gc_api_request(const http_request_t *req, const char *url) {
     return uncompress_plan_request(req);
   }
   if(!strcmp(req->path, "/api/gc/history")) return history_request(req);
+  if(!strcmp(req->path, "/api/gc/ui-settings")) return ui_settings_request(req);
+  if(!strcmp(req->path, "/api/gc/ampr/versions")) return ampr_versions_request(req);
+  if(!strcmp(req->path, "/api/gc/ampr/upload")) return ampr_upload_request(req);
   if(!strcmp(req->path, "/api/gc/job")) return job_request(req);
   if(!strcmp(req->path, "/api/gc/bad-blocks")) return bad_blocks_request(req);
   if(!strcmp(req->path, "/api/gc/job/cancel")) return cancel_active_request(req);
@@ -10297,6 +12088,12 @@ gc_api_request(const http_request_t *req, const char *url) {
 	  }
 	  if(!strcmp(req->path, "/api/gc/build-ampr-index")) {
 	    return enqueue_build_ampr_index_action(req);
+	  }
+	  if(!strcmp(req->path, "/api/gc/update-ampr")) {
+	    return enqueue_update_ampr_action(req);
+	  }
+	  if(!strcmp(req->path, "/api/gc/restore-ampr-original")) {
+	    return enqueue_restore_ampr_original_action(req);
 	  }
 	  return serve_error(req, 404, "not found");
 	}

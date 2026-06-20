@@ -12,6 +12,8 @@ typedef struct http_request {
   char method[8];
   char path[1024];
   char query[2048];
+  char *body;
+  size_t body_size;
 } http_request_t;
 
 typedef void (*websrv_ready_cb_t)(unsigned short port, void *arg);

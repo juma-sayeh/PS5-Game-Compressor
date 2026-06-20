@@ -24,6 +24,7 @@
 #include "websrv.h"
 
 #define HEADER_MAX 65536
+#define BODY_MAX (2 * 1024 * 1024)
 #define CLIENT_RCVBUF_SIZE (1024 * 1024)
 #define CLIENT_THREAD_STACK_SIZE (1024 * 1024)
 #define GC_HANDOFF_TOKEN "gc-local-reload"
@@ -44,6 +45,7 @@ status_text(int status) {
   case 404: return "Not Found";
   case 405: return "Method Not Allowed";
   case 409: return "Conflict";
+  case 413: return "Payload Too Large";
   case 500: return "Internal Server Error";
   default:  return "OK";
   }
@@ -294,7 +296,11 @@ dispatch_request(const http_request_t *req) {
 	       !strcmp(req->path, "/api/gc/copy-to-internal") ||
 	       !strcmp(req->path, "/api/gc/delete-game-data") ||
 	       !strcmp(req->path, "/api/gc/read-speed-test") ||
-	       !strcmp(req->path, "/api/gc/build-ampr-index")) {
+	       !strcmp(req->path, "/api/gc/build-ampr-index") ||
+	       !strcmp(req->path, "/api/gc/ui-settings") ||
+	       !strcmp(req->path, "/api/gc/ampr/upload") ||
+	       !strcmp(req->path, "/api/gc/update-ampr") ||
+	       !strcmp(req->path, "/api/gc/restore-ampr-original")) {
       return gc_api_request(req, req->path);
     }
     return websrv_send_error_json(req->fd, 404, "not found");
@@ -345,6 +351,51 @@ drain_request_body(int fd, size_t already, size_t total) {
     if(n == 0) break;
     remaining -= (size_t)n;
   }
+}
+
+static int
+read_request_body(int fd, char **body_out, size_t *body_size_out,
+                  const char *initial, size_t initial_size, size_t total) {
+  char *body = NULL;
+  size_t copied = 0;
+  if(body_out) *body_out = NULL;
+  if(body_size_out) *body_size_out = 0;
+  if(total == 0) return 0;
+  if(total > BODY_MAX) {
+    drain_request_body(fd, initial_size, total);
+    errno = EFBIG;
+    return -1;
+  }
+  body = malloc(total + 1);
+  if(!body) {
+    drain_request_body(fd, initial_size, total);
+    errno = ENOMEM;
+    return -1;
+  }
+  if(initial_size > total) initial_size = total;
+  if(initial && initial_size > 0) {
+    memcpy(body, initial, initial_size);
+    copied = initial_size;
+  }
+  while(copied < total) {
+    ssize_t n = recv(fd, body + copied, total - copied, 0);
+    if(n < 0) {
+      if(errno == EINTR) continue;
+      free(body);
+      return -1;
+    }
+    if(n == 0) {
+      free(body);
+      errno = ECONNRESET;
+      return -1;
+    }
+    copied += (size_t)n;
+  }
+  body[total] = 0;
+  if(body_out) *body_out = body;
+  else free(body);
+  if(body_size_out) *body_size_out = total;
+  return 0;
 }
 
 static void *
@@ -408,11 +459,21 @@ client_thread(void *arg) {
   size_t content_len = parse_content_length(line_end + 2);
   size_t header_bytes = (size_t)(header_end - buf);
   size_t initial_body = len > header_bytes ? len - header_bytes : 0;
-  if(content_len > initial_body) {
-    drain_request_body(fd, initial_body, content_len);
+  if(content_len > 0) {
+    char *initial = len > header_bytes ? buf + header_bytes : NULL;
+    if(read_request_body(fd, &req.body, &req.body_size, initial,
+                         initial_body, content_len) != 0) {
+      websrv_send_error_json(fd, errno == EFBIG ? 413 : 400,
+                             errno == EFBIG ? "request body too large" :
+                             "bad request body");
+      free(buf);
+      close(fd);
+      return NULL;
+    }
   }
 
   dispatch_request(&req);
+  free(req.body);
   free(buf);
   close(fd);
   return NULL;
