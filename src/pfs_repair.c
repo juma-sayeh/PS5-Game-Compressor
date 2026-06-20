@@ -32,9 +32,32 @@
 #define PFS_INODE_SIZE 0xA8ULL
 #define PFS_VERSION_PS5 2ULL
 #define PFS_MAGIC 20130315ULL
+#define PFS_MODE_CASE_INSENSITIVE 0x8U
+#define PFS_INODE_MODE_O_READ 0x001U
+#define PFS_INODE_MODE_O_WRITE 0x002U
+#define PFS_INODE_MODE_O_EXEC 0x004U
+#define PFS_INODE_MODE_G_READ 0x008U
+#define PFS_INODE_MODE_G_WRITE 0x010U
+#define PFS_INODE_MODE_G_EXEC 0x020U
+#define PFS_INODE_MODE_U_READ 0x040U
+#define PFS_INODE_MODE_U_WRITE 0x080U
+#define PFS_INODE_MODE_U_EXEC 0x100U
 #define PFS_INODE_MODE_DIR 0x4000U
+#define PFS_INODE_MODE_FILE 0x8000U
+#define PFS_INODE_RX_ONLY \
+  (PFS_INODE_MODE_O_READ | PFS_INODE_MODE_O_EXEC | \
+   PFS_INODE_MODE_G_READ | PFS_INODE_MODE_G_EXEC | \
+   PFS_INODE_MODE_U_READ | PFS_INODE_MODE_U_EXEC)
+#define PFS_INODE_RWX_ALL \
+  (PFS_INODE_RX_ONLY | PFS_INODE_MODE_O_WRITE | \
+   PFS_INODE_MODE_G_WRITE | PFS_INODE_MODE_U_WRITE)
 #define PFS_INODE_FLAG_COMPRESSED 0x1U
+#define PFS_INODE_FLAG_READONLY 0x10U
+#define PFS_INODE_FLAG_INTERNAL 0x20000U
 #define PFS_DIRENT_TYPE_FILE 2U
+#define PFS_DIRENT_TYPE_DIRECTORY 3U
+#define PFS_DIRENT_TYPE_DOT 4U
+#define PFS_DIRENT_TYPE_DOTDOT 5U
 
 #define PFSC_MAGIC 0x43534650U
 #define PFSC_UNK4 0U
@@ -88,6 +111,7 @@
 
 typedef struct pfs_inode_info {
   uint16_t mode;
+  uint16_t nlink;
   uint32_t flags;
   uint64_t size;
   uint64_t size_comp;
@@ -159,6 +183,12 @@ rd32(const void *p) {
   const unsigned char *b = p;
   return (uint32_t)b[0] | ((uint32_t)b[1] << 8) |
          ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+}
+
+static uint16_t
+rd16(const void *p) {
+  const unsigned char *b = p;
+  return (uint16_t)(b[0] | ((uint16_t)b[1] << 8));
 }
 
 static uint64_t
@@ -665,7 +695,8 @@ progress_line(repair_ctx_t *ctx, const char *fmt, ...) {
 static void
 parse_inode_info(const unsigned char *data, pfs_inode_info_t *ino) {
   memset(ino, 0, sizeof(*ino));
-  ino->mode = (uint16_t)(data[0] | ((uint16_t)data[1] << 8));
+  ino->mode = rd16(data + 0x00);
+  ino->nlink = rd16(data + 0x02);
   ino->flags = rd32(data + 0x04);
   ino->size = rd64(data + 0x08);
   ino->size_comp = rd64(data + 0x10);
@@ -916,6 +947,430 @@ pfsc_open(const char *path, int writable, pfsc_image_t *img,
 done:
   free(table);
   free(header);
+  return rc;
+}
+
+static uint64_t
+outer_dirent_span(const char *name) {
+  size_t name_len = strlen(name ? name : "");
+  uint64_t ent_size = (uint64_t)name_len + 17ULL;
+  uint64_t rem = ent_size % 8ULL;
+  if(rem) ent_size += 8ULL - rem;
+  return ent_size;
+}
+
+static int
+ascii_toupper_local(int ch) {
+  return (ch >= 'a' && ch <= 'z') ? ch - 32 : ch;
+}
+
+static uint32_t
+outer_pfs_hash_path(const char *path) {
+  uint32_t h = 0;
+  for(const unsigned char *p = (const unsigned char *)path; p && *p; p++) {
+    h = (uint32_t)(ascii_toupper_local(*p) + (31U * h));
+  }
+  return h;
+}
+
+static int
+outer_inode_matches(const pfs_inode_info_t *ino, uint16_t mode,
+                    uint16_t nlink, uint32_t flags, uint64_t size,
+                    uint64_t size_comp, uint32_t blocks, int32_t db0) {
+  return ino &&
+      ino->mode == mode &&
+      ino->nlink == nlink &&
+      ino->flags == flags &&
+      ino->size == size &&
+      ino->size_comp == size_comp &&
+      ino->blocks == blocks &&
+      ino->db0 == db0;
+}
+
+static int
+outer_not_applicable(char *err, size_t err_size, const char *fmt, ...) {
+  if(err && err_size > 0) {
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(err, err_size, fmt, ap);
+    va_end(ap);
+  }
+  errno = ENOTSUP;
+  return PFS_REPAIR_OUTER_SLACK_NOT_APPLICABLE;
+}
+
+static int
+outer_dirent_match(const unsigned char *block, uint64_t off,
+                   uint32_t inode, uint32_t type, const char *name,
+                   uint64_t *next_out, char *err, size_t err_size) {
+  size_t name_len = strlen(name ? name : "");
+  uint64_t span = outer_dirent_span(name);
+  if(!block || !name || name_len == 0 || off > PFS_BLOCK_SIZE ||
+     span > PFS_BLOCK_SIZE - off) {
+    return outer_not_applicable(
+        err, err_size, "outer PFS directory entry is outside fixed wrapper");
+  }
+  if(rd32(block + off) != inode ||
+     rd32(block + off + 4ULL) != type ||
+     rd32(block + off + 8ULL) != (uint32_t)name_len ||
+     rd32(block + off + 12ULL) != (uint32_t)span ||
+     memcmp(block + off + 16ULL, name, name_len) != 0) {
+    return outer_not_applicable(
+        err, err_size, "outer PFS directory does not match GameCompressor wrapper");
+  }
+  for(uint64_t i = off + 16ULL + (uint64_t)name_len; i < off + span; i++) {
+    if(block[i] != 0) {
+      return outer_not_applicable(
+          err, err_size, "outer PFS directory entry padding is not fixed-wrapper zero padding");
+    }
+  }
+  if(next_out) *next_out = off + span;
+  return 0;
+}
+
+static int
+outer_tail_has_valid_dirent(const unsigned char *block, uint64_t off) {
+  if(!block || off + 16ULL > PFS_BLOCK_SIZE) return 0;
+  uint32_t child_inode = rd32(block + off);
+  uint32_t type = rd32(block + off + 4ULL);
+  uint32_t name_len = rd32(block + off + 8ULL);
+  uint32_t ent_size = rd32(block + off + 12ULL);
+  if(ent_size == 0 ||
+     ent_size < 16U ||
+     ent_size > PFS_BLOCK_SIZE - off ||
+     (ent_size % 8U) != 0 ||
+     name_len == 0 ||
+     name_len >= 256U ||
+     16ULL + (uint64_t)name_len > (uint64_t)ent_size ||
+     child_inode > 3U) {
+    return 0;
+  }
+  char name[256];
+  memcpy(name, block + off + 16ULL, name_len);
+  name[name_len] = 0;
+  if(type == PFS_DIRENT_TYPE_DOT) {
+    return child_inode == 2U && !strcmp(name, ".");
+  }
+  if(type == PFS_DIRENT_TYPE_DOTDOT) {
+    return child_inode == 2U && !strcmp(name, "..");
+  }
+  if(type == PFS_DIRENT_TYPE_FILE || type == PFS_DIRENT_TYPE_DIRECTORY) {
+    return path_segment_supported(name);
+  }
+  return 0;
+}
+
+static int
+outer_verify_no_extra_dirent(const unsigned char *block, uint64_t used,
+                             char *err, size_t err_size) {
+  if(outer_tail_has_valid_dirent(block, used)) {
+    return outer_not_applicable(
+        err, err_size, "outer PFS directory has entries outside GameCompressor wrapper");
+  }
+  return 0;
+}
+
+static int
+outer_verify_fixed_wrapper_dirs(int fd, const char *nested_name,
+                                uint64_t *superroot_used_out,
+                                uint64_t *root_used_out,
+                                char *err, size_t err_size) {
+  unsigned char *block = malloc((size_t)PFS_BLOCK_SIZE);
+  uint64_t off = 0;
+  int rc = -1;
+  if(!block) {
+    set_err(err, err_size, "out of memory");
+    errno = ENOMEM;
+    return -1;
+  }
+  if(read_exact_at(fd, block, (size_t)PFS_BLOCK_SIZE,
+                   2ULL * PFS_BLOCK_SIZE, err, err_size) != 0) {
+    goto done;
+  }
+  rc = outer_dirent_match(block, off, 1, PFS_DIRENT_TYPE_FILE,
+                          "flat_path_table", &off, err, err_size);
+  if(rc != 0) goto done;
+  rc = outer_dirent_match(block, off, 2, PFS_DIRENT_TYPE_DIRECTORY,
+                          "uroot", &off, err, err_size);
+  if(rc != 0) goto done;
+  rc = outer_verify_no_extra_dirent(block, off, err, err_size);
+  if(rc != 0) goto done;
+  if(superroot_used_out) *superroot_used_out = off;
+
+  off = 0;
+  if(read_exact_at(fd, block, (size_t)PFS_BLOCK_SIZE,
+                   5ULL * PFS_BLOCK_SIZE, err, err_size) != 0) {
+    goto done;
+  }
+  rc = outer_dirent_match(block, off, 2, PFS_DIRENT_TYPE_DOT,
+                          ".", &off, err, err_size);
+  if(rc != 0) goto done;
+  rc = outer_dirent_match(block, off, 2, PFS_DIRENT_TYPE_DOTDOT,
+                          "..", &off, err, err_size);
+  if(rc != 0) goto done;
+  rc = outer_dirent_match(block, off, 3, PFS_DIRENT_TYPE_FILE,
+                          nested_name && nested_name[0]
+                            ? nested_name
+                            : "pfs_image.dat",
+                          &off, err, err_size);
+  if(rc != 0) goto done;
+  rc = outer_verify_no_extra_dirent(block, off, err, err_size);
+  if(rc != 0) goto done;
+  if(root_used_out) *root_used_out = off;
+  rc = 0;
+
+done:
+  free(block);
+  return rc;
+}
+
+static int
+outer_verify_gamecompressor_wrapper(const pfsc_image_t *img,
+                                    uint64_t *superroot_used_out,
+                                    uint64_t *root_used_out,
+                                    char *err, size_t err_size) {
+  unsigned char *header = NULL;
+  unsigned char *inode_block = NULL;
+  unsigned char fpt[8];
+  pfs_inode_info_t ino[4];
+  uint64_t final_ndblock;
+  uint64_t file_blocks;
+  char nested_path[320];
+  int rc = -1;
+
+  if(!img || img->fd < 0) {
+    set_err(err, err_size, "bad outer PFS image");
+    errno = EINVAL;
+    return -1;
+  }
+  header = malloc((size_t)PFS_BLOCK_SIZE);
+  inode_block = malloc((size_t)PFS_BLOCK_SIZE);
+  if(!header || !inode_block) {
+    set_err(err, err_size, "out of memory");
+    errno = ENOMEM;
+    goto done;
+  }
+  if(read_exact_at(img->fd, header, (size_t)PFS_BLOCK_SIZE,
+                   0, err, err_size) != 0 ||
+     read_exact_at(img->fd, inode_block, (size_t)PFS_BLOCK_SIZE,
+                   PFS_BLOCK_SIZE, err, err_size) != 0) {
+    goto done;
+  }
+  final_ndblock = rd64(header + 0x38);
+  if(rd64(header + 0x00) != PFS_VERSION_PS5 ||
+     rd64(header + 0x08) != PFS_MAGIC ||
+     header[0x1a] != 1 ||
+     rd16(header + 0x1c) != PFS_MODE_CASE_INSENSITIVE ||
+     rd32(header + 0x20) != (uint32_t)PFS_BLOCK_SIZE ||
+     rd64(header + 0x28) != 1ULL ||
+     rd64(header + 0x30) != 4ULL ||
+     rd64(header + 0x40) != 1ULL ||
+     rd32(header + 0x368) != 1U ||
+     final_ndblock == 0 ||
+     final_ndblock > UINT64_MAX / PFS_BLOCK_SIZE ||
+     final_ndblock * PFS_BLOCK_SIZE != img->outer_size) {
+    rc = outer_not_applicable(
+        err, err_size, "not a GameCompressor fixed .ffpfsc wrapper");
+    goto done;
+  }
+
+  for(size_t i = 0; i < 4; i++) {
+    parse_inode_info(inode_block + i * PFS_INODE_SIZE, &ino[i]);
+  }
+  file_blocks = ceil_div_u64(img->stored_size, PFS_BLOCK_SIZE);
+  if(file_blocks == 0 || file_blocks > UINT32_MAX) {
+    rc = outer_not_applicable(
+        err, err_size, "outer PFS nested file block count is not fixed-wrapper compatible");
+    goto done;
+  }
+  if(!outer_inode_matches(&ino[0],
+                          PFS_INODE_MODE_DIR | PFS_INODE_RWX_ALL, 1,
+                          PFS_INODE_FLAG_INTERNAL | PFS_INODE_FLAG_READONLY,
+                          PFS_BLOCK_SIZE, PFS_BLOCK_SIZE, 1, 2) ||
+     !outer_inode_matches(&ino[1],
+                          PFS_INODE_MODE_FILE | PFS_INODE_RWX_ALL, 1,
+                          PFS_INODE_FLAG_INTERNAL | PFS_INODE_FLAG_READONLY,
+                          8, 8, 1, 3) ||
+     !outer_inode_matches(&ino[2],
+                          PFS_INODE_MODE_DIR | PFS_INODE_RWX_ALL, 3,
+                          PFS_INODE_FLAG_READONLY,
+                          PFS_BLOCK_SIZE, PFS_BLOCK_SIZE, 1, 5) ||
+     !outer_inode_matches(&ino[3],
+                          PFS_INODE_MODE_FILE | PFS_INODE_RWX_ALL, 1,
+                          PFS_INODE_FLAG_READONLY | PFS_INODE_FLAG_COMPRESSED,
+                          img->stored_size, img->nested_size,
+                          (uint32_t)file_blocks, 6)) {
+    rc = outer_not_applicable(
+        err, err_size, "outer PFS inodes do not match GameCompressor wrapper");
+    goto done;
+  }
+
+  int n = snprintf(nested_path, sizeof(nested_path), "/%s",
+                   img->nested_name[0] ? img->nested_name : "pfs_image.dat");
+  if(n < 0 || (size_t)n >= sizeof(nested_path)) {
+    rc = outer_not_applicable(
+        err, err_size, "nested image name is too long for fixed-wrapper cleanup");
+    goto done;
+  }
+  if(read_exact_at(img->fd, fpt, sizeof(fpt), 3ULL * PFS_BLOCK_SIZE,
+                   err, err_size) != 0) {
+    goto done;
+  }
+  if(rd32(fpt + 0) != outer_pfs_hash_path(nested_path) ||
+     rd32(fpt + 4) != 3U) {
+    rc = outer_not_applicable(
+        err, err_size, "outer PFS flat path table does not match GameCompressor wrapper");
+    goto done;
+  }
+  rc = outer_verify_fixed_wrapper_dirs(img->fd, img->nested_name,
+                                       superroot_used_out, root_used_out,
+                                       err, err_size);
+  if(rc != 0) {
+    goto done;
+  }
+  rc = 0;
+
+done:
+  free(header);
+  free(inode_block);
+  return rc;
+}
+
+static int
+zero_exact_at(int fd, uint64_t offset, uint64_t size,
+              char *err, size_t err_size) {
+  unsigned char zeroes[64 * 1024];
+  uint64_t written = 0;
+  memset(zeroes, 0, sizeof(zeroes));
+  while(written < size) {
+    size_t chunk = sizeof(zeroes);
+    uint64_t remaining = size - written;
+    if(remaining < (uint64_t)chunk) chunk = (size_t)remaining;
+    if(write_exact_at(fd, zeroes, chunk, offset + written,
+                      err, err_size) != 0) {
+      return -1;
+    }
+    written += chunk;
+  }
+  return 0;
+}
+
+static int
+zero_outer_slack_range(int fd, uint64_t offset, uint64_t size,
+                       uint64_t outer_size, uint64_t *fixed_bytes,
+                       char *err, size_t err_size) {
+  if(size == 0) return 0;
+  if(offset > outer_size || size > outer_size - offset) {
+    set_err(err, err_size, "outer PFS slack range is outside image");
+    errno = EINVAL;
+    return -1;
+  }
+  if(zero_exact_at(fd, offset, size, err, err_size) != 0) return -1;
+  if(fixed_bytes) *fixed_bytes += size;
+  return 0;
+}
+
+int
+pfs_repair_ffpfsc_outer_slack(const char *path, uint64_t *fixed_bytes,
+                              char *err, size_t err_size) {
+  pfsc_image_t img;
+  int rc = -1;
+  const uint64_t superroot_block = 2ULL;
+  const uint64_t fpt_block = 3ULL;
+  const uint64_t collision_block = 4ULL;
+  const uint64_t uroot_block = 5ULL;
+  const uint64_t expected_file_block = 6ULL;
+  uint64_t superroot_used;
+  uint64_t root_used;
+  uint64_t tail_start;
+  uint64_t final_size;
+  uint64_t fixed = 0;
+  int verify_rc = 0;
+
+  if(fixed_bytes) *fixed_bytes = 0;
+  if(!path || !path[0]) {
+    set_err(err, err_size, "bad repair path");
+    errno = EINVAL;
+    return -1;
+  }
+
+  memset(&img, 0, sizeof(img));
+  if(pfsc_open(path, 1, &img, err, err_size) != 0) {
+    int open_errno = errno;
+    char detail[256];
+    snprintf(detail, sizeof(detail), "%s", err && err[0] ? err : "");
+    pfsc_close(&img);
+    if(open_errno == EINVAL || open_errno == ENOTSUP) {
+      return outer_not_applicable(
+          err, err_size, "%s",
+          detail[0] ? detail : "not a GameCompressor fixed .ffpfsc wrapper");
+    }
+    return -1;
+  }
+
+  if(img.file_start != expected_file_block * PFS_BLOCK_SIZE) {
+    rc = outer_not_applicable(
+        err, err_size, "outer PFS nested image offset is not GameCompressor fixed-wrapper layout");
+    goto done;
+  }
+  if(img.outer_size == 0 || img.outer_size % PFS_BLOCK_SIZE != 0) {
+    rc = outer_not_applicable(
+        err, err_size, "outer PFS image size is not fixed-wrapper compatible");
+    goto done;
+  }
+  final_size = img.outer_size;
+  if(img.stored_size > UINT64_MAX - img.file_start) {
+    set_err(err, err_size, "outer PFS payload size overflow");
+    errno = EOVERFLOW;
+    goto done;
+  }
+  tail_start = img.file_start + img.stored_size;
+  if(tail_start > final_size) {
+    set_err(err, err_size, "outer PFS payload exceeds image size");
+    errno = EINVAL;
+    goto done;
+  }
+
+  verify_rc = outer_verify_gamecompressor_wrapper(&img, &superroot_used,
+                                                  &root_used, err, err_size);
+  if(verify_rc != 0) {
+    rc = verify_rc;
+    goto done;
+  }
+  if(superroot_used > PFS_BLOCK_SIZE || root_used > PFS_BLOCK_SIZE) {
+    set_err(err, err_size, "outer PFS directory metadata is too large");
+    errno = EINVAL;
+    goto done;
+  }
+
+  if(zero_outer_slack_range(img.fd,
+                            superroot_block * PFS_BLOCK_SIZE + superroot_used,
+                            PFS_BLOCK_SIZE - superroot_used,
+                            final_size, &fixed, err, err_size) != 0 ||
+     zero_outer_slack_range(img.fd, fpt_block * PFS_BLOCK_SIZE + 8ULL,
+                            PFS_BLOCK_SIZE - 8ULL,
+                            final_size, &fixed, err, err_size) != 0 ||
+     zero_outer_slack_range(img.fd, collision_block * PFS_BLOCK_SIZE,
+                            PFS_BLOCK_SIZE,
+                            final_size, &fixed, err, err_size) != 0 ||
+     zero_outer_slack_range(img.fd,
+                            uroot_block * PFS_BLOCK_SIZE + root_used,
+                            PFS_BLOCK_SIZE - root_used,
+                            final_size, &fixed, err, err_size) != 0 ||
+     zero_outer_slack_range(img.fd, tail_start, final_size - tail_start,
+                            final_size, &fixed, err, err_size) != 0) {
+    goto done;
+  }
+  if(fsync(img.fd) != 0) {
+    set_err(err, err_size, "sync outer PFS slack cleanup: %s",
+            strerror(errno));
+    goto done;
+  }
+  if(fixed_bytes) *fixed_bytes = fixed;
+  rc = 0;
+
+done:
+  pfsc_close(&img);
   return rc;
 }
 

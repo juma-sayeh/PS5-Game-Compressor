@@ -5487,6 +5487,35 @@ write_pfsc_header(int fd, uint64_t file_start, uint64_t header_size,
 }
 
 static int
+write_zero_range_local(int fd, uint64_t offset, uint64_t size,
+                       const char *label, char *err, size_t err_size) {
+  unsigned char zeroes[64 * 1024];
+  uint64_t written = 0;
+  memset(zeroes, 0, sizeof(zeroes));
+  while(written < size) {
+    size_t chunk = sizeof(zeroes);
+    uint64_t remaining = size - written;
+    if(remaining < (uint64_t)chunk) chunk = (size_t)remaining;
+    if(pwrite_all_local(fd, zeroes, chunk,
+                        (off_t)(offset + written)) != 0) {
+      set_err(err, err_size, "write %s: %s",
+              label && label[0] ? label : "zero range", strerror(errno));
+      return -1;
+    }
+    written += chunk;
+  }
+  return 0;
+}
+
+static int
+write_pfsc_header_placeholder(int fd, uint64_t file_start,
+                              uint64_t header_size,
+                              char *err, size_t err_size) {
+  return write_zero_range_local(fd, file_start, header_size,
+                                "PFSC header placeholder", err, err_size);
+}
+
+static int
 pfs_vhash_writer_resume_local(pfs_vhash_writer_t *w, const char *path,
                               uint64_t block_count,
                               char *err, size_t err_size) {
@@ -6639,6 +6668,11 @@ compress_nested_to_pfsc_windowed(int fd, uint64_t file_start,
     goto done;
   }
   vhash_open = 1;
+  job_set_current("Allocating PFSC header");
+  if(write_pfsc_header_placeholder(fd, file_start, header_size,
+                                   err, err_size) != 0) {
+    goto done;
+  }
   if(lseek(fd, (off_t)(file_start + header_size), SEEK_SET) < 0) {
     set_err(err, err_size, "seek compressed payload: %s", strerror(errno));
     goto done;
@@ -6966,6 +7000,11 @@ compress_nested_to_pfsc(int fd, uint64_t file_start, pfs_layout_t *nested,
                              nested_type, err, err_size) != 0) {
       goto done;
     }
+    job_set_current("Allocating PFSC header");
+    if(write_pfsc_header_placeholder(fd, file_start, header_size,
+                                     err, err_size) != 0) {
+      goto done;
+    }
   }
   vhash_open = 1;
   atomic_store(&g_job.total_bytes,
@@ -7239,6 +7278,8 @@ write_outer_pfs_metadata(int fd, uint64_t nested_size, uint64_t stored_size,
   uint64_t file_blocks = ceil_div_u64(stored_size, PFS_BLOCK_SIZE);
   if(file_blocks == 0) file_blocks = 1;
   uint64_t final_ndblock = file_block + file_blocks;
+  uint64_t final_size = final_ndblock * PFS_BLOCK_SIZE;
+  uint64_t file_tail_start = file_block * PFS_BLOCK_SIZE + stored_size;
   time_t now = time(NULL);
   unsigned char *header = calloc(1, (size_t)PFS_BLOCK_SIZE);
   unsigned char *inode_block = calloc(1, (size_t)PFS_BLOCK_SIZE);
@@ -7251,8 +7292,18 @@ write_outer_pfs_metadata(int fd, uint64_t nested_size, uint64_t stored_size,
     set_err(err, err_size, "out of memory");
     goto done;
   }
-  if(ftruncate(fd, (off_t)(final_ndblock * PFS_BLOCK_SIZE)) != 0) {
+  if(file_tail_start > final_size) {
+    set_err(err, err_size, "outer PFS size overflow");
+    errno = EOVERFLOW;
+    goto done;
+  }
+  if(ftruncate(fd, (off_t)final_size) != 0) {
     set_err(err, err_size, "truncate output: %s", strerror(errno));
+    goto done;
+  }
+  if(file_tail_start < final_size &&
+     write_zero_range_local(fd, file_tail_start, final_size - file_tail_start,
+                            "outer PFS tail padding", err, err_size) != 0) {
     goto done;
   }
 
@@ -7921,8 +7972,9 @@ pfs_compress_execute_prepared_to_ffpfsc(pfs_compress_plan_t *plan,
     set_err(err, err_size, "open output: %s", strerror(errno));
     goto done;
   }
-  if(ftruncate(fd, (off_t)outer_file_start) != 0) {
-    set_err(err, err_size, "reserve output: %s", strerror(errno));
+  job_set_current("Allocating outer PFS metadata");
+  if(write_zero_range_local(fd, 0, outer_file_start,
+                            "outer PFS metadata", err, err_size) != 0) {
     goto done;
   }
 

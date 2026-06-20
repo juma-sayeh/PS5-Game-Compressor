@@ -1,5 +1,30 @@
 # Changelog
 
+## 1.0.3 - 2026-06-20
+
+Compared PR #22 (`release1.0.3`) against `v1.0.2`.
+
+Full release notes: [RELEASE_NOTES_1.0.3.md](RELEASE_NOTES_1.0.3.md).
+
+### Fixed
+
+- Fixed USB-to-USB compression reliability by zeroing the PFSC header area,
+  outer PFS metadata, and final outer PFS padding instead of relying on sparse
+  allocation or later backpatches.
+- Fixed compressed APR-EMU update and AMPR index rebuild paths so rewritten
+  compressed images also zero their final outer PFS padding.
+- Fixed validate and repair so older Game Compressor `.ffpfsc` images can have
+  outer wrapper padding cleaned before mount, while third-party or non-wrapper
+  layouts skip that cleanup and continue normal validation.
+- Fixed post-operation reminders so the terminate reminder waits behind failure
+  notices and only appears after successful operations.
+
+### Changed
+
+- Clarified the compression format picker: compression always outputs a
+  compressed `.ffpfsc` archive, and the selected format controls the nested
+  image inside that archive.
+
 ## 1.0.2 - 2026-06-20
 
 Compared PR #20 (`new_release_items`) against `origin/main` / `v1.0.1`.

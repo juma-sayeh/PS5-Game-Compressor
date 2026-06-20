@@ -296,6 +296,25 @@ hs_write_exact_at(int fd, const void *data, size_t size, uint64_t offset,
 }
 
 static int
+hs_zero_exact_at(int fd, uint64_t offset, uint64_t size,
+                 char *err, size_t err_size) {
+  unsigned char zeroes[64 * 1024];
+  uint64_t written = 0;
+  memset(zeroes, 0, sizeof(zeroes));
+  while(written < size) {
+    size_t chunk = sizeof(zeroes);
+    uint64_t remaining = size - written;
+    if(remaining < (uint64_t)chunk) chunk = (size_t)remaining;
+    if(hs_write_exact_at(fd, zeroes, chunk, offset + written,
+                         err, err_size) != 0) {
+      return -1;
+    }
+    written += chunk;
+  }
+  return 0;
+}
+
+static int
 hs_copy_fd_range(int src_fd, int dst_fd, uint64_t size,
                  uint64_t src_off, uint64_t dst_off,
                  char *err, size_t err_size) {
@@ -2792,12 +2811,30 @@ hs_update_outer_metadata(int fd, const hs_pfsc_image_t *img,
                          char *err, size_t err_size) {
   uint64_t file_blocks = hs_ceil_div_u64(new_stored_size, HS_BLOCK_SIZE);
   if(file_blocks == 0) file_blocks = 1;
+  if(file_blocks > UINT64_MAX / HS_BLOCK_SIZE - 6ULL) {
+    hs_set_err(err, err_size, "hot-swap outer PFS size overflow");
+    errno = EOVERFLOW;
+    return -1;
+  }
   uint64_t final_ndblock = 6ULL + file_blocks;
   uint64_t final_size = final_ndblock * HS_BLOCK_SIZE;
+  uint64_t file_tail_start = 0;
   unsigned char raw8[8];
   unsigned char raw4[4];
+  if(img->file_start > final_size ||
+     new_stored_size > final_size - img->file_start) {
+    hs_set_err(err, err_size, "hot-swap payload size exceeds outer PFS size");
+    errno = EINVAL;
+    return -1;
+  }
+  file_tail_start = img->file_start + new_stored_size;
   if(ftruncate(fd, (off_t)final_size) != 0) {
     hs_set_err(err, err_size, "truncate hot-swap image: %s", strerror(errno));
+    return -1;
+  }
+  if(file_tail_start < final_size &&
+     hs_zero_exact_at(fd, file_tail_start, final_size - file_tail_start,
+                      err, err_size) != 0) {
     return -1;
   }
   hs_le64(raw8, final_ndblock);
