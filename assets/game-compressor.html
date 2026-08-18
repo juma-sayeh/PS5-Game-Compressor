@@ -157,7 +157,7 @@
     .sidebar {
       min-height: 0;
       display: grid;
-      grid-template-rows: auto 1fr;
+      grid-template-rows: auto auto 1fr;
       border: 1px solid var(--line);
       border-radius: 28px;
       background: var(--surface);
@@ -1605,6 +1605,105 @@
       text-align: center;
     }
 
+    .empty.is-rich {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 6px;
+      padding: 36px 18px;
+    }
+
+    .empty-icon {
+      width: 34px;
+      height: 34px;
+      opacity: .55;
+    }
+
+    .empty-title {
+      color: var(--text);
+      font-weight: 600;
+      font-size: 14px;
+    }
+
+    .empty-subtitle {
+      color: var(--muted);
+      font-size: 12.5px;
+      max-width: 220px;
+    }
+
+    .list-toolbar {
+      display: flex;
+      gap: 6px;
+      padding: 0 14px 10px;
+    }
+
+    .list-search {
+      flex: 1 1 auto;
+      min-width: 0;
+      background: var(--control-bg);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 7px 10px;
+      font-size: 12.5px;
+      color: var(--text);
+      outline: none;
+    }
+
+    .list-search::placeholder {
+      color: var(--muted);
+    }
+
+    .list-search:focus {
+      border-color: var(--accent);
+    }
+
+    .list-sort {
+      flex: 0 0 auto;
+      background: var(--control-bg);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 7px 8px;
+      font-size: 12.5px;
+      color: var(--text);
+      outline: none;
+    }
+
+    .list-sort:focus {
+      border-color: var(--accent);
+    }
+
+    .toast-stack {
+      position: fixed;
+      left: 50%;
+      bottom: 22px;
+      transform: translateX(-50%);
+      z-index: 9999;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 8px;
+      pointer-events: none;
+    }
+
+    .toast {
+      background: var(--modal-bg);
+      color: var(--text);
+      border: 1px solid var(--line);
+      box-shadow: var(--soft-shadow);
+      border-radius: 10px;
+      padding: 9px 16px;
+      font-size: 12.5px;
+      opacity: 0;
+      transform: translateY(6px);
+      transition: opacity .18s ease, transform .18s ease;
+      backdrop-filter: blur(18px);
+    }
+
+    .toast.is-visible {
+      opacity: 1;
+      transform: translateY(0);
+    }
+
     .loading-state {
       width: 100%;
       display: grid;
@@ -2510,6 +2609,15 @@
             id="sidebar-version"></span></h1>
         <div class="sidebar-meta" id="count-label">Scanning games</div>
       </div>
+      <div class="list-toolbar">
+        <input type="text" class="list-search" id="game-search" placeholder="Search games"
+          aria-label="Search games" autocomplete="off" />
+        <select class="list-sort" id="game-sort" aria-label="Sort games">
+          <option value="smart">Sort: Default</option>
+          <option value="name">Sort: Name</option>
+          <option value="size">Sort: Size</option>
+        </select>
+      </div>
       <div class="game-list" id="game-list">
         <div class="loading-state is-list" role="status" aria-live="polite">
           <div class="loading-pill" aria-hidden="true">
@@ -2826,6 +2934,8 @@
       gamesLoading: true,
       gamesLoaded: false,
       gamesError: '',
+      searchQuery: '',
+      sortMode: cookieValue('game_compressor_sort') || 'smart',
       terminated: false,
       appName: 'Game Compressor',
       appVersion: '',
@@ -2933,6 +3043,20 @@
       const maxAge = Math.max(1, Math.floor(Number(maxAgeDays || 180))) * 24 * 60 * 60;
       document.cookie = encodeURIComponent(name) + '=' + encodeURIComponent(value) +
         '; Max-Age=' + maxAge + '; Path=/; SameSite=Lax';
+    }
+
+    function showToast(message) {
+      const stack = $('toast-stack');
+      if (!stack) return;
+      const el = document.createElement('div');
+      el.className = 'toast';
+      el.textContent = message;
+      stack.appendChild(el);
+      requestAnimationFrame(() => el.classList.add('is-visible'));
+      setTimeout(() => {
+        el.classList.remove('is-visible');
+        setTimeout(() => el.remove(), 220);
+      }, 2400);
     }
 
     function gameInstanceId(g) {
@@ -3896,6 +4020,41 @@
         if (byName) return byName;
         return String((a && a.titleId) || '').localeCompare(String((b && b.titleId) || ''));
       });
+    }
+
+    function gameSizeForSort(g) {
+      if (!g) return 0;
+      const exact = exactFolderScanSize(g);
+      if (exact > 0) return exact;
+      const stats = compressionStatsForGame(g);
+      const compressed = stats && Number(stats.compressedSize || 0);
+      if (compressed > 0) return compressed;
+      return Number(g.sourceSize || 0);
+    }
+
+    function gameMatchesSearch(g, query) {
+      if (!query) return true;
+      const q = query.toLowerCase();
+      const name = String((g && g.name) || (g && g.titleId) || '').toLowerCase();
+      const titleId = String((g && g.titleId) || '').toLowerCase();
+      return name.indexOf(q) !== -1 || titleId.indexOf(q) !== -1;
+    }
+
+    function visibleGames() {
+      let games = state.games;
+      const query = (state.searchQuery || '').trim();
+      if (query) games = games.filter((g) => gameMatchesSearch(g, query));
+      if (state.sortMode === 'name') {
+        games = games.slice().sort((a, b) => gameSortName(a).localeCompare(
+          gameSortName(b), undefined, { numeric: true, sensitivity: 'base' }));
+      } else if (state.sortMode === 'size') {
+        games = games.slice().sort((a, b) => gameSizeForSort(b) - gameSizeForSort(a));
+      } else if (query) {
+        // Default "smart" ordering already applies when unfiltered (state.games
+        // is kept pre-sorted); once filtered, re-apply it to the smaller set.
+        games = sortGamesForList(games);
+      }
+      return games;
     }
 
     function activeJob() {
@@ -5240,6 +5399,8 @@
         state.gamesLoading,
         state.gamesLoaded,
         state.gamesError,
+        state.searchQuery,
+        state.sortMode,
         state.games.map(gameKey).join('||')
       ].map(keyPart).join('::');
     }
@@ -5356,13 +5517,28 @@
         list.innerHTML = '<div class="empty">' + escapeHtml(state.gamesError) + '</div>';
         return;
       }
-      $('count-label').textContent = state.games.length +
-        (state.games.length === 1 ? ' game' : ' games');
       if (!state.games.length) {
-        list.innerHTML = '<div class="empty">No games found</div>';
+        $('count-label').textContent = '0 games';
+        list.innerHTML = '<div class="empty is-rich">' +
+          '<div class="empty-title">No games found</div>' +
+          '<div class="empty-subtitle">Mount a title with ShadowMountPlus or add one under a ' +
+          'watched storage folder, then it will show up here.</div>' +
+          '</div>';
         return;
       }
-	      list.innerHTML = state.games.map((g) => (
+      const games = visibleGames();
+      const query = (state.searchQuery || '').trim();
+      $('count-label').textContent = query
+        ? games.length + ' of ' + state.games.length + (state.games.length === 1 ? ' game' : ' games')
+        : state.games.length + (state.games.length === 1 ? ' game' : ' games');
+      if (!games.length) {
+        list.innerHTML = '<div class="empty is-rich">' +
+          '<div class="empty-title">No matches</div>' +
+          '<div class="empty-subtitle">No games match &ldquo;' + escapeHtml(query) + '&rdquo;.</div>' +
+          '</div>';
+        return;
+      }
+	      list.innerHTML = games.map((g) => (
 	        '<button class="game-row ' +
 	        (gameInstanceId(g) === state.selected ? 'is-selected ' : '') +
 	        (g.isMounted === false ? 'is-unmounted' : '') +
@@ -6117,11 +6293,13 @@
         if (!copied && navigator.clipboard && navigator.clipboard.writeText) {
           await navigator.clipboard.writeText(path);
         }
+        showToast('Path copied');
       } catch (err) {
         if (text && text.parentNode) document.body.removeChild(text);
         if (navigator.clipboard && navigator.clipboard.writeText) {
           try {
             await navigator.clipboard.writeText(path);
+            showToast('Path copied');
             return;
           } catch (clipboardErr) { }
         }
@@ -7618,6 +7796,23 @@
 
       $('theme-light').addEventListener('click', () => setUiTheme('light'));
       $('theme-dark').addEventListener('click', () => setUiTheme('dark'));
+
+      $('game-sort').value = state.sortMode;
+      $('game-sort').addEventListener('change', (event) => {
+        state.sortMode = event.target.value || 'smart';
+        writeCookie('game_compressor_sort', state.sortMode, 365);
+        renderList(true);
+      });
+      let searchDebounce = 0;
+      $('game-search').addEventListener('input', (event) => {
+        const value = event.target.value || '';
+        clearTimeout(searchDebounce);
+        searchDebounce = setTimeout(() => {
+          state.searchQuery = value;
+          renderList(true);
+        }, 120);
+      });
+
       $('info-top').addEventListener('click', () => showModal('info-modal'));
       $('info-close').addEventListener('click', () => hideModal('info-modal'));
       $('history-top').addEventListener('click', () => showModal('history-modal'));
@@ -7771,6 +7966,7 @@
       }, 10000);
     });
   </script>
+  <div class="toast-stack" id="toast-stack" aria-live="polite"></div>
 </body>
 
 </html>

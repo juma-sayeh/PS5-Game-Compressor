@@ -58,8 +58,12 @@ PFSC_ENCODER ?= runtime
 PFSC_ZLIB_LEVEL ?= 7
 PFSC_THRESHOLD_GAIN ?= 5
 PFSC_FORCE_RAW_EXEC ?= 1
-ZLIB_INCLUDE ?= /Users/jumasayeh/Developer/etaHEN/Source\ Code/include
-ZLIB_LIB ?= /Users/jumasayeh/Developer/etaHEN/Source\ Code/lib/libz.a
+# Defaults assume zlib has been cross-compiled for the PS5 target and
+# installed into the SDK tree (include/, lib/libz.a) — see
+# .github/workflows/build.yml for how CI does this. Override either
+# variable if your zlib lives somewhere else.
+ZLIB_INCLUDE ?= $(PS5_PAYLOAD_SDK)/include
+ZLIB_LIB ?= $(PS5_PAYLOAD_SDK)/lib/libz.a
 
 ifneq ($(filter $(PFSC_ENCODER),runtime zlib miniz),)
 CFLAGS_COMMON += -DGC_PFSC_ZLIB_LEVEL=$(PFSC_ZLIB_LEVEL)

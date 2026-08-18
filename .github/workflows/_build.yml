@@ -1,0 +1,101 @@
+name: Build ELF (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      sdk_version:
+        description: 'ps5-payload-dev/sdk release tag to build against, or "latest"'
+        type: string
+        required: false
+        default: latest
+    outputs:
+      artifact-name:
+        description: 'Name of the uploaded artifact containing the ELF and checksum'
+        value: ${{ jobs.build.outputs.artifact-name }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      artifact-name: game-compressor-build
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bash \
+            build-essential \
+            clang-18 \
+            lld-18 \
+            llvm-18 \
+            wget \
+            unzip \
+            python3 \
+            python3-pyelftools \
+            pkg-config \
+            cmake \
+            meson \
+            socat
+
+      - name: Resolve SDK version
+        id: sdk-version
+        run: |
+          if [ "${{ inputs.sdk_version }}" = "latest" ]; then
+            TAG=$(curl -sSL https://api.github.com/repos/ps5-payload-dev/sdk/releases/latest \
+              | python3 -c "import sys, json; print(json.load(sys.stdin)['tag_name'])")
+          else
+            TAG="${{ inputs.sdk_version }}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "### PS5 Payload SDK: \`$TAG\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cache PS5 Payload SDK + cross-compiled zlib
+        id: sdk-cache
+        uses: actions/cache@v4
+        with:
+          path: /opt/ps5-payload-sdk
+          # Keyed on the *resolved* tag (never the literal "latest"), so a
+          # new SDK release naturally invalidates this cache instead of
+          # silently reusing a stale build.
+          key: ps5-payload-sdk-zlib-${{ runner.os }}-${{ steps.sdk-version.outputs.tag }}
+
+      - name: Download PS5 Payload SDK
+        if: steps.sdk-cache.outputs.cache-hit != 'true'
+        run: |
+          wget -q "https://github.com/ps5-payload-dev/sdk/releases/download/${{ steps.sdk-version.outputs.tag }}/ps5-payload-sdk.zip"
+          sudo unzip -q ps5-payload-sdk.zip -d /opt
+
+      - name: Cross-compile zlib for the PS5 target
+        if: steps.sdk-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 https://github.com/madler/zlib.git
+          cd zlib
+          CC=/opt/ps5-payload-sdk/bin/prospero-clang \
+          AR=/opt/ps5-payload-sdk/bin/prospero-ar \
+          RANLIB=/opt/ps5-payload-sdk/bin/prospero-ranlib \
+          ./configure --static
+          make -j"$(nproc)"
+          sudo mkdir -p /opt/ps5-payload-sdk/include
+          sudo mkdir -p /opt/ps5-payload-sdk/lib
+          sudo cp zlib.h zconf.h /opt/ps5-payload-sdk/include/
+          sudo cp libz.a /opt/ps5-payload-sdk/lib/
+
+      - name: Build
+        env:
+          PS5_PAYLOAD_SDK: /opt/ps5-payload-sdk
+        run: make
+
+      - name: Compute checksum
+        run: sha256sum game-compressor.elf | awk '{print $1}' > game-compressor.elf.sha256
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: game-compressor-build
+          path: |
+            game-compressor.elf
+            game-compressor.elf.sha256
+          if-no-files-found: error

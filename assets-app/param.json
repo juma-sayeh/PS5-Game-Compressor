@@ -1,5 +1,5 @@
 {
-  "applicationCategoryType": 0,
+  "applicationCategoryType": 65536,
   "titleId": "PSGC50001",
   "deeplinkUri": "http://127.0.0.1:5910/",
   "localizedParameters": {

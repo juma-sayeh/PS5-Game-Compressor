@@ -1,0 +1,37 @@
+name: Pre-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Pre-release tag to create (e.g. v1.1.0-rc1)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    uses: ./.github/workflows/_build.yml
+    with:
+      sdk_version: ${{ vars.PS5_SDK_VERSION || 'latest' }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.artifact-name }}
+
+      - name: Create GitHub Pre-release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag_name }}
+          name: ${{ inputs.tag_name }}
+          prerelease: true
+          generate_release_notes: true
+          files: |
+            game-compressor.elf
+            game-compressor.elf.sha256
