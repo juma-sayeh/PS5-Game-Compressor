@@ -2,3 +2,6 @@ build/
 gen/
 game-compressor.elf
 .DS_Store
+.idea
+ps5-zlib
+build.sh

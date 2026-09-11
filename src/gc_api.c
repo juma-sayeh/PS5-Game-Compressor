@@ -26,6 +26,7 @@
 #include "gc_icon_thumb.h"
 #include "gc_notify.h"
 #include "gc_shadowmount.h"
+#include "gc_shadowmount_api.h"
 #include "gc_size_cache.h"
 #include "pfs_ampr_hotswap.h"
 #include "pfs_compress.h"
@@ -65,10 +66,11 @@
 #define GC_MOUNT_HIDE_PREFIX ".gc-hide-"
 #define GC_WORKER_THREAD_STACK_SIZE (1024 * 1024)
 #define GC_SYSTEM_APP_BASE "/system_ex/app"
-#define GC_SHADOW_PFSC_BASE "/mnt/shadowmnt/pfsc"
 #define GC_SHADOW_IMAGE_BASE "/mnt/shadowmnt"
-#define GC_SHADOW_CONFIG_FILE "/data/shadowmount/config.ini"
-#define GC_SHADOW_MANUAL_LIST_FILE "/data/shadowmount/manual.lst"
+#define GC_SHADOW_PFSC_BASE GC_SHADOW_IMAGE_BASE "/pfsc"
+#define GC_SHADOW_FOLDER "/data/shadowmount"
+#define GC_SHADOW_CONFIG_FILE GC_SHADOW_FOLDER "/config.ini"
+#define GC_SHADOW_MANUAL_LIST_FILE GC_SHADOW_FOLDER "/manual.lst"
 #define GC_INTERNAL_GAME_ROOT "/data/homebrew"
 #define GC_USB_COUNT 8
 #define GC_STORAGE_TARGET_COUNT (GC_USB_COUNT + 2)
@@ -78,6 +80,16 @@
 #define GC_GIB (1024ULL * 1024ULL * 1024ULL)
 #define GC_STREAM_MIN_FREE_BYTES (1ULL * GC_GIB)
 #define GC_READ_SPEED_TEST_SECONDS 60
+
+/*
+ * Browser cache lifetime (seconds) for /api/gc/icon responses. Icons are
+ * served with Cache-Control: public, max-age=<this>, immutable; the request
+ * URL carries a &v=<iconSize>-<iconMtime> cache-buster, so a stale icon can
+ * never be served: when icon0.png changes the version argument changes and
+ * the browser fetches the new URL. A 30-day lifetime lets page reloads serve
+ * icons straight from the browser cache without hitting the PS5 at all.
+ */
+#define GC_ICON_CACHE_MAX_AGE 2592000
 
 static void
 gc_job_set_cancel_disabled(const char *reason) {
@@ -208,6 +220,7 @@ typedef struct gc_game {
   uint64_t ampr_original_size;
   char ampr_latest_version[64];
   char ampr_latest_sha256[65];
+  char ampr_pinned_version[64];
   char mount_status[32];
   gc_validation_state_t validation;
   char validation_status[32];
@@ -299,6 +312,7 @@ static pthread_mutex_t g_gc_lock = PTHREAD_MUTEX_INITIALIZER;
 static gc_operation_t g_ops[GC_MAX_OPS];
 static uint64_t g_next_seq = 1;
 static int g_worker_running = 0;
+static atomic_int g_enqueue_in_progress = 0;
 static pthread_mutex_t g_folder_size_recheck_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_folder_size_initial_recheck_done = 0;
 static pthread_mutex_t g_artifact_cache_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -307,22 +321,123 @@ static size_t g_artifact_cache_count = 0;
 static time_t g_artifact_cache_scanned_at = 0;
 static int g_artifact_cache_force = 1;
 
+/*
+ * Persistent games list cache returned by /api/gc/games. In ShadowMount 1.7
+ * mounting is dynamic (the ShadowMountPlus device is single-mount and games
+ * are mounted on demand), so the transient on-disk mount.lnk hint only ever
+ * reflects the single active mount. Re-reading it on every /api/gc/games
+ * poll therefore flickers every title to "not mounted" as soon as the
+ * temporary mount is released. Instead the games list is discovered once at
+ * startup, the per-title is_mounted flag is cached (and marked mounted for
+ * every discovered title while the ShadowMountPlus API is available, since
+ * all titles are mountable on demand), and /api/gc/games always returns this
+ * cache. The cache is refreshed lazily after operations/mount-switches and
+ * the mounted flag is updated each time a game is actually mounted.
+ */
+static pthread_mutex_t g_games_cache_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_games_cache_cond = PTHREAD_COND_INITIALIZER;
+static gc_game_t g_games_cache[GC_MAX_GAMES];
+static size_t g_games_cache_count = 0;
+static int g_games_cache_ready = 0;
+static int g_games_cache_dirty = 1;
+static int g_games_cache_refreshing = 0;
+
+typedef struct gc_ampr_cache_entry {
+  char source_path[1024];
+  char ampr_path[1024];
+  char ampr_sha256[65];
+  time_t cached_at;
+} gc_ampr_cache_entry_t;
+
+static pthread_mutex_t g_ampr_cache_lock = PTHREAD_MUTEX_INITIALIZER;
+static gc_ampr_cache_entry_t g_ampr_cache[GC_MAX_GAMES];
+static size_t g_ampr_cache_count = 0;
+
+typedef struct gc_icon_cache_entry {
+  char title_id[16];
+  unsigned char *data; /* full-size PNG */
+  size_t size;
+  unsigned char *thumb_data; /* 96x96 thumbnail PNG */
+  size_t thumb_size;
+  time_t cached_at;
+} gc_icon_cache_entry_t;
+
+static pthread_mutex_t g_icon_cache_lock = PTHREAD_MUTEX_INITIALIZER;
+static gc_icon_cache_entry_t g_icon_cache[GC_MAX_GAMES];
+static size_t g_icon_cache_count = 0;
+
+/* Forward declarations — these cache helpers are defined after the
+ * functions that use them (near artifact_cache_invalidate). */
+static void gc_ampr_cache_store(const char *source_path, const char *ampr_path,
+                                const char *ampr_sha256);
+static int gc_ampr_cache_lookup(const char *source_path, char *ampr_path_out,
+                                size_t ampr_path_size, char *ampr_sha256_out,
+                                size_t ampr_sha256_size);
+static void gc_ampr_cache_drop(const char *source_path);
+static void gc_icon_cache_store(const char *title_id, const unsigned char *data,
+                                size_t size, const unsigned char *thumb_data,
+                                size_t thumb_size);
+static int gc_icon_cache_lookup(const char *title_id, int thumb,
+                                unsigned char **data_out, size_t *size_out);
+static int gc_icon_cache_has(const char *title_id);
+static void gc_icon_cache_drop(const char *title_id);
+static void gc_games_cache_refresh(void);
+static size_t gc_games_cache_snapshot(gc_game_t *out, size_t max_games);
+static void gc_games_cache_set_mounted(const char *title_id, int is_mounted,
+                                       const char *status);
+static void gc_games_cache_invalidate(void);
+
+/* Forward declarations — _sm helpers live in gc_api_sm.c (included at end). */
+static int gc_shadowmount_source_enable_sm(gc_game_t *g);
+static int gc_shadowmount_ampr_mount_game_sm(gc_game_t *g);
+static int wait_for_shadowmount_links_sm(const char *title_id,
+                                         const char *expected_mount_link,
+                                         const char *expected_image_link,
+                                         char *err, size_t err_size);
+static void gc_games_cache_refresh_sm(void);
+static int force_compressed_path_bounce_remount_sm(
+    const char *title_id, const char *original_path,
+    const char *nested_name, int nested_type, int keep_mounted,
+    char *err, size_t err_size);
+static int force_image_path_bounce_remount_sm(
+    const char *title_id, const char *original_path,
+    int nested_type, int keep_mounted, char *err, size_t err_size);
+static int run_refresh_mount_op_sm(gc_operation_t *op);
+static int run_build_ampr_index_op_sm(gc_operation_t *op);
+static int run_validate_repair_op_sm(gc_operation_t *op);
+static int gc_api_icon_request_sm(const http_request_t *req);
+static int run_read_speed_test_op_sm(gc_operation_t *op);
+static int run_set_read_only_op_sm(gc_operation_t *op);
+static int wait_for_compressed_shadowmount_sm(const char *title_id,
+                                              const char *path,
+                                              const char *nested_name,
+                                              int nested_type,
+                                              const char *current,
+                                              int keep_mounted,
+                                              char *err, size_t err_size);
+static int wait_for_image_shadowmount_sm(const char *title_id,
+                                         const char *path,
+                                         int nested_type,
+                                         const char *current,
+                                         int keep_mounted,
+                                         char *err, size_t err_size);
+
 extern int sceSystemServiceGetAppIdOfRunningBigApp(void);
 extern int sceSystemServiceGetAppTitleId(int app_id, char *title_id);
 extern uint32_t sceLncUtilKillApp(uint32_t app_id);
 
 static const gc_storage_target_def_t GC_STORAGE_TARGETS[GC_STORAGE_TARGET_COUNT] = {
-  { "ext0", "External SSD", "/mnt/ext0", "/mnt/ext0/homebrew" },
-  { "ext1", "M.2 SSD", "/mnt/ext1", "/mnt/ext1/homebrew" },
-  { "usb0", "USB 0", "/mnt/usb0", "/mnt/usb0/homebrew" },
-  { "usb1", "USB 1", "/mnt/usb1", "/mnt/usb1/homebrew" },
-  { "usb2", "USB 2", "/mnt/usb2", "/mnt/usb2/homebrew" },
-  { "usb3", "USB 3", "/mnt/usb3", "/mnt/usb3/homebrew" },
-  { "usb4", "USB 4", "/mnt/usb4", "/mnt/usb4/homebrew" },
-  { "usb5", "USB 5", "/mnt/usb5", "/mnt/usb5/homebrew" },
-  { "usb6", "USB 6", "/mnt/usb6", "/mnt/usb6/homebrew" },
-  { "usb7", "USB 7", "/mnt/usb7", "/mnt/usb7/homebrew" },
-};
+    { "ext0", "External SSD", "/mnt/ext0", "/mnt/ext0/homebrew" },
+    { "ext1", "M.2 SSD", "/mnt/ext1", "/mnt/ext1/homebrew" },
+    { "usb0", "USB 0", "/mnt/usb0", "/mnt/usb0/homebrew" },
+    { "usb1", "USB 1", "/mnt/usb1", "/mnt/usb1/homebrew" },
+    { "usb2", "USB 2", "/mnt/usb2", "/mnt/usb2/homebrew" },
+    { "usb3", "USB 3", "/mnt/usb3", "/mnt/usb3/homebrew" },
+    { "usb4", "USB 4", "/mnt/usb4", "/mnt/usb4/homebrew" },
+    { "usb5", "USB 5", "/mnt/usb5", "/mnt/usb5/homebrew" },
+    { "usb6", "USB 6", "/mnt/usb6", "/mnt/usb6/homebrew" },
+    { "usb7", "USB 7", "/mnt/usb7", "/mnt/usb7/homebrew" },
+  };
 
 static void fsync_parent_dir_best_effort(const char *path);
 static int copy_file_contents(const char *src, const char *dst, char *err,
@@ -394,7 +509,7 @@ static int
 error_is_output_exists(const char *err) {
   const char *s = err ? err : "";
   return !strcasecmp(s, "output exists") ||
-      !strcasecmp(s, "target already exists");
+         !strcasecmp(s, "target already exists");
 }
 
 static const char *
@@ -414,7 +529,7 @@ set_output_exists_error(gc_operation_t *op, const char *path) {
              "Output already exists: %s. Delete or move it first.", output);
   } else {
     snprintf(op->error, sizeof(op->error),
-             "%s", "Output already exists. Delete or move it first.");
+      "%s", "Output already exists. Delete or move it first.");
   }
 }
 
@@ -577,7 +692,7 @@ ampr_folder_target_probe(const char *root, char *path_out, size_t path_size,
     int n = snprintf(path, sizeof(path), "%s/%s", root, rels[i]);
     if(n < 0 || (size_t)n >= sizeof(path)) continue;
     if(stat(path, &st) == 0 && S_ISREG(st.st_mode)) {
-      char err[128] = {0};
+      char err[128] = { 0 };
       if(path_out && path_size) snprintf(path_out, path_size, "%s", path);
       if(sha_out && hash_file_sha256_hex(path, sha_out, err, sizeof(err)) != 0) {
         sha_out[0] = 0;
@@ -673,7 +788,7 @@ static int
 statvfs_with_storage_root_fallback(const char *path, struct statvfs *sv,
                                    char *used_path, size_t used_path_size) {
   char probe[1024];
-  char floor[1024] = {0};
+  char floor[1024] = { 0 };
   int have_floor;
   int first_errno = 0;
   if(!path || !path[0] || !sv) {
@@ -827,7 +942,7 @@ shadow_image_mount_point(const char *image_path, int nested_type,
   char mount_name[384];
   const char *base = nested_type == PFS_NESTED_UNKNOWN
       ? GC_SHADOW_IMAGE_BASE
-      : GC_SHADOW_IMAGE_BASE;
+                                                       : GC_SHADOW_IMAGE_BASE;
   if(strip_extension_base(image_path, stem, sizeof(stem)) != 0) return -1;
   int n = snprintf(mount_name, sizeof(mount_name), "%s_%08x", stem,
                    fnv1a32_string(image_path));
@@ -958,9 +1073,57 @@ static int
 game_uses_system_app_path(const gc_game_t *g) {
   if(!g) return 0;
   return path_is_system_app_path(g->mount_path) ||
-      path_is_system_app_path(g->image_path) ||
-      path_is_system_app_path(g->source_path) ||
-      path_is_system_app_path(g->output_path);
+         path_is_system_app_path(g->image_path) ||
+         path_is_system_app_path(g->source_path) ||
+         path_is_system_app_path(g->output_path);
+}
+
+static int
+gc_shadowmount_source_enable(gc_game_t *g) {
+  if(!gc_shadowmount_api_available()) {
+    return 0;
+  }
+  return gc_shadowmount_source_enable_sm(g);
+}
+
+static int
+gc_any_operation_pending(void) {
+  if(atomic_load(&g_enqueue_in_progress)) return 1;
+  pthread_mutex_lock(&g_gc_lock);
+  for(int i = 0; i < GC_MAX_OPS; i++) {
+    if(g_ops[i].used &&
+       (g_ops[i].status == GC_OP_QUEUED || g_ops[i].status == GC_OP_RUNNING)) {
+      pthread_mutex_unlock(&g_gc_lock);
+      return 1;
+    }
+  }
+  pthread_mutex_unlock(&g_gc_lock);
+  return 0;
+}
+
+/*
+ * Best-effort: temporarily mount a compressed/image game under
+ * GC_SHADOW_IMAGE_BASE so the embedded libSceAmpr.sprx (APR-EMU)
+ * binary can be probed. ShadowMountPlus supports a single active
+ * mount at a time, so the function mounts, probes AMPR, then
+ * immediately unmounts to free the device for the next game.
+ * Folder games do not need this (their AMPR binary is reachable
+ * directly from source_path). Mounting is skipped while a GC
+ * operation is running or while a game (big app) is active to
+ * avoid disrupting it. The ShadowMountPlus mount API is
+ * synchronous, so once gc_shadowmount_request_title_source_scan()
+ * returns success the mount is already live and no link-wait
+ * polling is needed. Returns 1 when the AMPR binary was found
+ * (g->ampr_path / g->ampr_sha256 populated), 0 otherwise, or the
+ * error result of gc_shadowmount_request_title_source_scan() when
+ * that call is unsuccessful.
+ */
+static int
+gc_shadowmount_ampr_mount_game(gc_game_t *g) {
+  if(!gc_shadowmount_api_available()) {
+    return 0;
+  }
+  return gc_shadowmount_ampr_mount_game_sm(g);
 }
 
 static const char *
@@ -1279,7 +1442,7 @@ unmountable_game_folder_segment(const char *name) {
   if(!name || !name[0]) return 0;
   if(name[0] == '.') return 1;
   return !strcasecmp(name, "$RECYCLE.BIN") ||
-      !strcasecmp(name, "System Volume Information") ||
+         !strcasecmp(name, "System Volume Information") ||
       !strcasecmp(name, "RECYCLER") ||
       !strcasecmp(name, "RECYCLED") ||
       !strcasecmp(name, "found.000") ||
@@ -1373,7 +1536,7 @@ populate_game_size_ex(gc_game_t *g, int exact_folder_size, int honor_cancel) {
     if(exact_folder_size) {
       int cancelled = 0;
       g->source_size = source_size_bytes_exact_ex(
-          g->source_path, g->source_kind, honor_cancel, &cancelled);
+        g->source_path, g->source_kind, honor_cancel, &cancelled);
       if(cancelled) {
         g->size_pending = 1;
         g->size_status = GC_SIZE_STATUS_UNKNOWN;
@@ -1384,7 +1547,7 @@ populate_game_size_ex(gc_game_t *g, int exact_folder_size, int honor_cancel) {
       g->size_measured_at = (uint64_t)time(NULL);
       gc_size_cache_store(g->source_path, g->source_size);
     } else if(gc_size_cache_lookup(g->source_path, &cached_size, &measured_at,
-                                &status) == 0) {
+                                   &status) == 0) {
       g->source_size = cached_size;
       g->required_bytes = 0;
       g->size_estimated = 1;
@@ -1417,8 +1580,8 @@ populate_game_size_ex(gc_game_t *g, int exact_folder_size, int honor_cancel) {
                                                 &g->free_bytes) == 0 &&
      !g->size_pending && !g->size_estimated) {
     g->extra_needed = g->free_bytes >= g->required_bytes
-        ? 0
-        : g->required_bytes - g->free_bytes;
+                        ? 0
+                        : g->required_bytes - g->free_bytes;
   }
 }
 
@@ -1429,7 +1592,7 @@ size_cache_apply_display_to_game(gc_game_t *g) {
   time_t measured_at = 0;
   gc_size_status_t status = GC_SIZE_STATUS_UNKNOWN;
   if(gc_size_cache_lookup(g->source_path, &cached_size, &measured_at,
-                       &status) == 0) {
+                          &status) == 0) {
     g->source_size = cached_size;
     g->required_bytes = 0;
     g->extra_needed = 0;
@@ -1490,7 +1653,7 @@ stream_delete_allowed_by_space_budget(const gc_game_t *game,
                                       uint64_t budget_bytes) {
   if(!game || !game->can_stream_delete || game->source_size == 0) return 0;
   return game->free_bytes >=
-      stream_min_free_bytes_for_budget(game->source_size, budget_bytes);
+         stream_min_free_bytes_for_budget(game->source_size, budget_bytes);
 }
 
 static uint64_t
@@ -1545,7 +1708,7 @@ find_outer_pfsc_by_shadow_hash(const char *title_id, uint32_t shadow_hash,
 static int
 find_exact_pfsc_by_title(const char *title_id, char *out, size_t out_size) {
   char candidate[1024];
-  char err[256] = {0};
+  char err[256] = { 0 };
   struct stat st;
   gc_source_roots_t roots;
   if(!valid_title_id(title_id) || !out || out_size == 0) return -1;
@@ -1555,7 +1718,7 @@ find_exact_pfsc_by_title(const char *title_id, char *out, size_t out_size) {
                      roots.roots[i], title_id);
     if(n < 0 || (size_t)n >= sizeof(candidate)) continue;
     if(stat(candidate, &st) != 0 || !S_ISREG(st.st_mode)) continue;
-    pfs_decompress_info_t info = {0};
+    pfs_decompress_info_t info = { 0 };
     err[0] = 0;
     if(pfs_decompress_probe(candidate, &info, err, sizeof(err)) != 0) {
       continue;
@@ -1637,7 +1800,7 @@ cleanup_force_remount_temps_in_root(const char *root) {
     struct stat st;
 
     if(force_remount_original_name_for_temp(ent->d_name, original_name,
-                                           sizeof(original_name)) != 0) {
+                                            sizeof(original_name)) != 0) {
       continue;
     }
     join_path(temp_path, sizeof(temp_path), root, ent->d_name);
@@ -1680,7 +1843,7 @@ cleanup_force_remount_temps_on_startup(void) {
     restored += cleanup_force_remount_temps_in_root(roots.roots[i]);
   }
   if(restored > 0) {
-    char err[256] = {0};
+    char err[256] = { 0 };
     if(gc_shadowmount_request_scan(err, sizeof(err)) != 0) {
       gc_log("force remount cleanup scan request failed restored=%d err=%s",
              restored, err[0] ? err : "unknown");
@@ -1737,7 +1900,7 @@ cleanup_delete_pending_temps_on_startup(void) {
         GC_STORAGE_TARGETS[i].target_root);
   }
   if(removed > 0) {
-    char err[256] = {0};
+    char err[256] = { 0 };
     artifact_cache_invalidate();
     if(gc_shadowmount_request_scan(err, sizeof(err)) != 0) {
       gc_log("delete pending cleanup scan request failed removed=%d err=%s",
@@ -1811,8 +1974,8 @@ ampr_latest_cached(char *version, size_t version_size,
                    char sha[65]) {
   char *json = NULL;
   size_t json_size = 0;
-  char local_version[64] = {0};
-  char local_sha[65] = {0};
+  char local_version[64] = { 0 };
+  char local_sha[65] = { 0 };
   if(version && version_size) version[0] = 0;
   if(sha) sha[0] = 0;
   if(read_file_limited(GC_AMPR_LATEST_FILE, &json, &json_size, 64 * 1024) != 0) {
@@ -1842,8 +2005,8 @@ ampr_cached_version_for_sha(const char sha[65], char *version,
   struct dirent *ent;
   while((ent = readdir(d)) != NULL) {
     char bin[1024];
-    char hash[65] = {0};
-    char err[128] = {0};
+    char hash[65] = { 0 };
+    char err[128] = { 0 };
     struct stat st;
     if(!ampr_version_safe(ent->d_name)) continue;
     if(ampr_cache_binary_path(ent->d_name, bin, sizeof(bin)) != 0) continue;
@@ -1862,8 +2025,8 @@ ampr_cached_version_for_sha(const char sha[65], char *version,
 static int
 ampr_intent_valid(const char *intent) {
   return !strcmp(intent ? intent : "", "latest") ||
-      !strcmp(intent ? intent : "", "manual") ||
-      !strcmp(intent ? intent : "", "custom");
+         !strcmp(intent ? intent : "", "manual") ||
+         !strcmp(intent ? intent : "", "custom");
 }
 
 static const char *
@@ -1892,10 +2055,10 @@ ampr_selection_read(const char *title_id, const char *source_path,
                     char *version, size_t version_size,
                     char sha[65]) {
   char path[1024];
-  char marker_path[1024] = {0};
-  char marker_intent[16] = {0};
-  char marker_version[64] = {0};
-  char marker_sha[65] = {0};
+  char marker_path[1024] = { 0 };
+  char marker_intent[16] = { 0 };
+  char marker_version[64] = { 0 };
+  char marker_sha[65] = { 0 };
   char *json = NULL;
   size_t json_size = 0;
   if(intent && intent_size) intent[0] = 0;
@@ -1933,7 +2096,7 @@ ampr_selection_write(const char *title_id, const char *source_path,
                      const char sha[65], const char *result_mode) {
   char path[1024];
   char tmp[1024];
-  json_buf_t b = {0};
+  json_buf_t b = { 0 };
   int fd = -1;
   const char *normalized = ampr_normalized_intent(intent, version);
   if(!valid_title_id(title_id) || !source_path || !source_path[0] ||
@@ -2030,8 +2193,8 @@ ampr_original_lookup(const char *title_id, const char *source_path,
                      char path_out[1024], char sha_out[65],
                      uint64_t *size_out) {
   char path[1024];
-  char sha[65] = {0};
-  char err[128] = {0};
+  char sha[65] = { 0 };
+  char err[128] = { 0 };
   struct stat st;
   if(path_out) path_out[0] = 0;
   if(sha_out) sha_out[0] = 0;
@@ -2057,7 +2220,7 @@ ampr_write_original_metadata(const gc_game_t *game, const char *backup_path,
                              char *err, size_t err_size) {
   char meta[1024];
   char tmp[1024];
-  json_buf_t b = {0};
+  json_buf_t b = { 0 };
   int fd = -1;
   if(ampr_original_metadata_path(game->title_id, game->source_path,
                                  meta, sizeof(meta)) != 0) {
@@ -2121,8 +2284,8 @@ ampr_original_backup_prepare(const gc_game_t *game, char *err,
   char backup_path[1024];
   char backup_dir[1024];
   char tmp[1024];
-  char backup_sha[65] = {0};
-  char cached_version[64] = {0};
+  char backup_sha[65] = { 0 };
+  char cached_version[64] = { 0 };
   struct stat st;
   uint64_t backup_size = 0;
   if(!game || !game->ampr_present || !sha256_hex_valid(game->ampr_sha256)) {
@@ -2196,9 +2359,9 @@ ampr_original_backup_prepare(const gc_game_t *game, char *err,
 static int
 ampr_latest_update_needed_for_game(const gc_game_t *g, int have_latest,
                                    int current_sha_cached) {
-  char intent[16] = {0};
-  char version[64] = {0};
-  char selected_sha[65] = {0};
+  char intent[16] = { 0 };
+  char version[64] = { 0 };
+  char selected_sha[65] = { 0 };
   if(!g || !have_latest || !g->ampr_present ||
      !sha256_hex_valid(g->ampr_sha256) ||
      !sha256_hex_valid(g->ampr_latest_sha256)) {
@@ -2211,7 +2374,7 @@ ampr_latest_update_needed_for_game(const gc_game_t *g, int have_latest,
                          version, sizeof(version),
                          selected_sha)) {
     return !strcmp(intent, "latest") &&
-        strcasecmp(selected_sha, g->ampr_sha256) == 0;
+           strcasecmp(selected_sha, g->ampr_sha256) == 0;
   }
 
   /*
@@ -2538,7 +2701,7 @@ delete_validation_marker_for_path(const char *title_id,
   char legacy[1024];
   char *json = NULL;
   size_t json_size = 0;
-  char marker_path[1024] = {0};
+  char marker_path[1024] = { 0 };
 
   if(!valid_title_id(title_id) || !source_path || !source_path[0]) {
     delete_validation_marker(title_id);
@@ -2610,20 +2773,20 @@ load_validation_state(gc_game_t *g) {
   uint64_t old_size = json_find_u64_value(json, "sourceSize", 0);
   int stat_ok = stat(g->source_path, &st) == 0;
   int marker_matches_path = stat_ok &&
-      strcmp(image_path, g->source_path) == 0 &&
-      (uint64_t)st.st_size == old_size;
+                            strcmp(image_path, g->source_path) == 0 &&
+                            (uint64_t)st.st_size == old_size;
   int stats_only_marker = !strcmp(marker_status, "compression-stats") ||
-      !strcmp(marker_status, "not-mounted");
+                          !strcmp(marker_status, "not-mounted");
   if(marker_matches_path) {
     g->compression_source_size =
-        json_find_u64_value(json, "compressionSourceSize", 0);
+      json_find_u64_value(json, "compressionSourceSize", 0);
     g->compressed_size =
-        json_find_u64_value(json, "compressionCompressedSize", 0);
+      json_find_u64_value(json, "compressionCompressedSize", 0);
     g->saved_bytes =
         json_find_u64_value(json, "compressionSavedBytes", 0);
     g->apr_indexed = json_find_bool_value(json, "aprIndexed", 0);
     g->ampr_hot_swap_optimized =
-        json_find_bool_value(json, "amprHotSwapOptimized", 0);
+      json_find_bool_value(json, "amprHotSwapOptimized", 0);
   } else {
     g->apr_indexed = 0;
     g->ampr_hot_swap_optimized = 0;
@@ -2723,7 +2886,7 @@ write_validation_marker_ex(const char *title_id, const char *image_path,
   int marker_ampr_hot_swap_optimized = ampr_hot_swap_optimized ? 1 : 0;
   char *old_json = NULL;
   size_t old_json_size = 0;
-  char old_path[1024] = {0};
+  char old_path[1024] = { 0 };
 
   if(marker_path_for_title_source(title_id, image_path, marker,
                                   sizeof(marker)) != 0 ||
@@ -2743,7 +2906,7 @@ write_validation_marker_ex(const char *title_id, const char *image_path,
       }
       if(compression_source_size == 0) {
         compression_source_size =
-            json_find_u64_value(old_json, "compressionSourceSize", 0);
+          json_find_u64_value(old_json, "compressionSourceSize", 0);
       }
     }
     free(old_json);
@@ -2751,8 +2914,8 @@ write_validation_marker_ex(const char *title_id, const char *image_path,
 
   if(compression_source_size > 0) {
     saved_bytes = compression_source_size > compressed_size
-        ? compression_source_size - compressed_size
-        : 0;
+                    ? compression_source_size - compressed_size
+                    : 0;
   } else {
     if(compression_source_size == 0) {
       compression_source_size =
@@ -2764,58 +2927,58 @@ write_validation_marker_ex(const char *title_id, const char *image_path,
     }
   }
 
-  json_buf_t b = {0};
+  json_buf_t b = { 0 };
   int ok = json_append(&b, "{\n  \"titleId\":") == 0 &&
       json_string(&b, title_id) == 0 &&
       json_append(&b, ",\n  \"path\":") == 0 &&
-      json_string(&b, image_path) == 0 &&
-      json_appendf(&b,
-                   ",\n  \"sourceSize\":%llu,\n  \"sourceMtime\":%llu,"
-                   "\n  \"compressionSourceSize\":%llu,"
-                   "\n  \"compressionCompressedSize\":%llu,"
-                   "\n  \"compressionSavedBytes\":%llu,"
-                   "\n  \"aprIndexed\":%s,"
-                   "\n  \"amprHotSwapOptimized\":%s,"
-                   "\n  \"status\":",
-                   (unsigned long long)(st.st_size > 0 ? st.st_size : 0),
-                   (unsigned long long)st.st_mtime,
-                   (unsigned long long)compression_source_size,
-                   (unsigned long long)compressed_size,
-                   (unsigned long long)saved_bytes,
-                   marker_apr_indexed ? "true" : "false",
-                   marker_ampr_hot_swap_optimized ? "true" : "false") == 0 &&
-      json_string(&b, result ? result : "") == 0 &&
+    json_string(&b, image_path) == 0 &&
+    json_appendf(&b,
+                 ",\n  \"sourceSize\":%llu,\n  \"sourceMtime\":%llu,"
+                 "\n  \"compressionSourceSize\":%llu,"
+                 "\n  \"compressionCompressedSize\":%llu,"
+                 "\n  \"compressionSavedBytes\":%llu,"
+                 "\n  \"aprIndexed\":%s,"
+                 "\n  \"amprHotSwapOptimized\":%s,"
+                 "\n  \"status\":",
+                 (unsigned long long)(st.st_size > 0 ? st.st_size : 0),
+                 (unsigned long long)st.st_mtime,
+                 (unsigned long long)compression_source_size,
+                 (unsigned long long)compressed_size,
+                 (unsigned long long)saved_bytes,
+                 marker_apr_indexed ? "true" : "false",
+                 marker_ampr_hot_swap_optimized ? "true" : "false") == 0 &&
+    json_string(&b, result ? result : "") == 0 &&
       json_appendf(&b,
                    ",\n  \"nestedName\":") == 0 &&
       json_string(&b, info && info->nested_name[0] ? info->nested_name : "") == 0 &&
+    json_appendf(&b,
+                 ",\n  \"blockCount\":%llu,"
+                 "\n  \"logicalSize\":%llu,"
+                 "\n  \"oldStoredSize\":%llu,"
+                 "\n  \"newStoredSize\":%llu,"
+                 "\n  \"repairedBlocks\":%llu,"
+                 "\n  \"hashMode\":",
+                 (unsigned long long)(info ? info->block_count : 0),
+                 (unsigned long long)(info ? info->logical_size : 0),
+                 (unsigned long long)(info ? info->old_stored_size : 0),
+                 (unsigned long long)(info ? info->new_stored_size : 0),
+                 (unsigned long long)(info ? info->repaired_blocks : 0)) == 0 &&
+    json_string(&b, info && info->hash_mode[0] ? info->hash_mode : "") == 0 &&
       json_appendf(&b,
-                   ",\n  \"blockCount\":%llu,"
-                   "\n  \"logicalSize\":%llu,"
-                   "\n  \"oldStoredSize\":%llu,"
-                   "\n  \"newStoredSize\":%llu,"
-                   "\n  \"repairedBlocks\":%llu,"
-                   "\n  \"hashMode\":",
-                   (unsigned long long)(info ? info->block_count : 0),
-                   (unsigned long long)(info ? info->logical_size : 0),
-                   (unsigned long long)(info ? info->old_stored_size : 0),
-                   (unsigned long long)(info ? info->new_stored_size : 0),
-                   (unsigned long long)(info ? info->repaired_blocks : 0)) == 0 &&
-      json_string(&b, info && info->hash_mode[0] ? info->hash_mode : "") == 0 &&
-      json_appendf(&b,
-                   ",\n  \"hashCheckedBlocks\":%llu,"
-                   "\n  \"hashMatchedBlocks\":%llu,"
-                   "\n  \"hashMismatchedBlocks\":%llu,"
-                   "\n  \"softwareComparedBlocks\":%llu,"
-                   "\n  \"postVerifyBlocks\":%llu,"
-                   "\n  \"postVerifyMountBlocks\":%llu,"
-                   "\n  \"updatedAt\":%llu\n}\n",
-                   (unsigned long long)(info ? info->hash_checked_blocks : 0),
+      ",\n  \"hashCheckedBlocks\":%llu,"
+      "\n  \"hashMatchedBlocks\":%llu,"
+      "\n  \"hashMismatchedBlocks\":%llu,"
+      "\n  \"softwareComparedBlocks\":%llu,"
+      "\n  \"postVerifyBlocks\":%llu,"
+      "\n  \"postVerifyMountBlocks\":%llu,"
+      "\n  \"updatedAt\":%llu\n}\n",
+      (unsigned long long)(info ? info->hash_checked_blocks : 0),
                    (unsigned long long)(info ? info->hash_matched_blocks : 0),
                    0ULL,
-                   (unsigned long long)(info ? info->software_compared_blocks : 0),
-                   (unsigned long long)(info ? info->post_verify_blocks : 0),
-                   (unsigned long long)(info ? info->post_verify_mount_blocks : 0),
-                   (unsigned long long)time(NULL)) == 0;
+      (unsigned long long)(info ? info->software_compared_blocks : 0),
+      (unsigned long long)(info ? info->post_verify_blocks : 0),
+      (unsigned long long)(info ? info->post_verify_mount_blocks : 0),
+      (unsigned long long)time(NULL)) == 0;
   if(!ok) {
     free(b.data);
     return -1;
@@ -2856,11 +3019,11 @@ rewrite_moved_validation_marker(const char *title_id, const char *old_path,
   marker_path[0] = 0;
   json_find_string_value(json, "path", marker_path, sizeof(marker_path));
   compression_source_size =
-      json_find_u64_value(json, "compressionSourceSize", 0);
+    json_find_u64_value(json, "compressionSourceSize", 0);
   compression_compressed_size =
-      json_find_u64_value(json, "compressionCompressedSize", 0);
+    json_find_u64_value(json, "compressionCompressedSize", 0);
   compression_saved_bytes =
-      json_find_u64_value(json, "compressionSavedBytes", 0);
+    json_find_u64_value(json, "compressionSavedBytes", 0);
   free(json);
   if(strcmp(marker_path, old_path) || stat(new_path, &st) != 0) return 0;
   if(compression_compressed_size == 0 && st.st_size > 0) {
@@ -2871,30 +3034,30 @@ rewrite_moved_validation_marker(const char *title_id, const char *old_path,
     compression_saved_bytes = compression_source_size - compression_compressed_size;
   }
 
-  json_buf_t b = {0};
+  json_buf_t b = { 0 };
   int ok = json_append(&b, "{\n  \"titleId\":") == 0 &&
-      json_string(&b, title_id) == 0 &&
-      json_append(&b, ",\n  \"path\":") == 0 &&
-      json_string(&b, new_path) == 0 &&
-      json_appendf(&b,
-                   ",\n  \"sourceSize\":%llu,\n  \"sourceMtime\":%llu,"
-                   "\n  \"compressionSourceSize\":%llu,"
-                   "\n  \"compressionCompressedSize\":%llu,"
-                   "\n  \"compressionSavedBytes\":%llu,"
-                   "\n  \"status\":\"moved\","
-                   "\n  \"nestedName\":\"\","
-                   "\n  \"blockCount\":0,"
-                   "\n  \"logicalSize\":0,"
-                   "\n  \"oldStoredSize\":0,"
-                   "\n  \"newStoredSize\":0,"
-                   "\n  \"repairedBlocks\":0,"
-                   "\n  \"updatedAt\":%llu\n}\n",
-                   (unsigned long long)(st.st_size > 0 ? st.st_size : 0),
-                   (unsigned long long)st.st_mtime,
-                   (unsigned long long)compression_source_size,
-                   (unsigned long long)compression_compressed_size,
-                   (unsigned long long)compression_saved_bytes,
-                   (unsigned long long)time(NULL)) == 0;
+           json_string(&b, title_id) == 0 &&
+           json_append(&b, ",\n  \"path\":") == 0 &&
+           json_string(&b, new_path) == 0 &&
+           json_appendf(&b,
+                        ",\n  \"sourceSize\":%llu,\n  \"sourceMtime\":%llu,"
+                        "\n  \"compressionSourceSize\":%llu,"
+                        "\n  \"compressionCompressedSize\":%llu,"
+                        "\n  \"compressionSavedBytes\":%llu,"
+                        "\n  \"status\":\"moved\","
+                        "\n  \"nestedName\":\"\","
+                        "\n  \"blockCount\":0,"
+                        "\n  \"logicalSize\":0,"
+                        "\n  \"oldStoredSize\":0,"
+                        "\n  \"newStoredSize\":0,"
+                        "\n  \"repairedBlocks\":0,"
+                        "\n  \"updatedAt\":%llu\n}\n",
+                        (unsigned long long)(st.st_size > 0 ? st.st_size : 0),
+                        (unsigned long long)st.st_mtime,
+                        (unsigned long long)compression_source_size,
+                        (unsigned long long)compression_compressed_size,
+                        (unsigned long long)compression_saved_bytes,
+                        (unsigned long long)time(NULL)) == 0;
   if(!ok) {
     free(b.data);
     return -1;
@@ -2987,6 +3150,10 @@ wait_for_shadowmount_links(const char *title_id,
                            const char *expected_mount_link,
                            const char *expected_image_link,
                            char *err, size_t err_size) {
+  if(gc_shadowmount_api_available()) {
+    return wait_for_shadowmount_links_sm(title_id, expected_mount_link,
+                                         expected_image_link, err, err_size);
+  }
   time_t deadline = time(NULL) + GC_REMOUNT_WAIT_SECONDS;
   char mount_link[1024];
   char image_link[1024];
@@ -3015,14 +3182,14 @@ wait_for_shadowmount_links(const char *title_id,
     int has_image = read_title_link(title_id, "mount_img.lnk", image_link,
                                     sizeof(image_link)) == 0;
     int mount_ok = has_mount && expected_mount_link &&
-        strcmp(mount_link, expected_mount_link) == 0;
+                   strcmp(mount_link, expected_mount_link) == 0;
     int image_ok = expected_image_link && expected_image_link[0]
         ? (has_image && strcmp(image_link, expected_image_link) == 0)
         : !has_image;
     int system_ex_ok = system_ex_title_bound_to(
-        title_id, expected_mount_link, actual_type, sizeof(actual_type),
-        actual_source, sizeof(actual_source), actual_mountpoint,
-        sizeof(actual_mountpoint));
+      title_id, expected_mount_link, actual_type, sizeof(actual_type),
+      actual_source, sizeof(actual_source), actual_mountpoint,
+      sizeof(actual_mountpoint));
 
     if(mount_ok && image_ok && system_ex_ok) {
       gc_log("shadowmount ready title=%s mount=%s image=%s system_ex=%s:%s",
@@ -3074,7 +3241,7 @@ wait_for_shadowmount_links(const char *title_id,
     }
     if(now >= deadline) {
       if(!restart_recovery_attempted) {
-        char restart_detail[512] = {0};
+        char restart_detail[512] = { 0 };
         restart_recovery_attempted = 1;
         job_set_phase("mounting", 0, 0, "Restarting ShadowMountPlus");
         if(gc_shadowmount_restart_running(restart_detail,
@@ -3108,21 +3275,21 @@ wait_for_shadowmount_links(const char *title_id,
                restart_detail[0] ? restart_detail : "unknown");
       }
       snprintf(err, err_size,
-               "ShadowMountPlus did not remount %s; mount.lnk=%s%s%s "
-               "mount_img.lnk=%s%s%s system_ex=%s:%s%s%s",
+        "ShadowMountPlus did not remount %s; mount.lnk=%s%s%s "
+        "mount_img.lnk=%s%s%s system_ex=%s:%s%s%s",
                title_id ? title_id : "",
                has_mount ? mount_link : "(missing)",
-               expected_mount_link ? " expected=" : "",
-               expected_mount_link ? expected_mount_link : "",
-               has_image ? image_link : "(missing)",
-               expected_image_link && expected_image_link[0] ? " expected=" : "",
+        expected_mount_link ? " expected=" : "",
+        expected_mount_link ? expected_mount_link : "",
+        has_image ? image_link : "(missing)",
+        expected_image_link && expected_image_link[0] ? " expected=" : "",
                expected_image_link && expected_image_link[0]
                    ? expected_image_link
-                   : "(absent)",
-               actual_type[0] ? actual_type : "(unknown)",
-               actual_source[0] ? actual_source : "(unknown)",
-               expected_mount_link ? " expectedFrom=" : "",
-               expected_mount_link ? expected_mount_link : "");
+                                                      : "(absent)",
+        actual_type[0] ? actual_type : "(unknown)",
+        actual_source[0] ? actual_source : "(unknown)",
+        expected_mount_link ? " expectedFrom=" : "",
+        expected_mount_link ? expected_mount_link : "");
       gc_log("shadowmount wait failed title=%s err=%s",
              title_id ? title_id : "", err && err[0] ? err : "unknown");
       return -1;
@@ -3139,7 +3306,7 @@ wait_for_shadowmount_links(const char *title_id,
 static int
 get_running_big_app(char *title_id, size_t title_id_size, int *app_id_out) {
   int app_id;
-  char tid[64] = {0};
+  char tid[64] = { 0 };
   int rc;
 
   app_id = sceSystemServiceGetAppIdOfRunningBigApp();
@@ -3161,7 +3328,7 @@ get_running_big_app(char *title_id, size_t title_id_size, int *app_id_out) {
 
 static int
 close_title_if_running(const char *title_id, char *err, size_t err_size) {
-  char running_title[64] = {0};
+  char running_title[64] = { 0 };
   int app_id = 0;
   int state;
   uint32_t kill_rc = 0;
@@ -3209,12 +3376,64 @@ close_title_if_running(const char *title_id, char *err, size_t err_size) {
   return -1;
 }
 
+static int
+ampr_pinned_version_for_title(const char *title_id, char *out,
+                              size_t out_size) {
+  char path[1024];
+  int n;
+  if(!out || out_size == 0 || !valid_title_id(title_id)) {
+    out[0] = 0;
+    return 0;
+  }
+  n = snprintf(path, sizeof(path), "%s/%s", GC_AMPR_SELECTION_DIR, title_id);
+  if(n < 0 || (size_t)n >= sizeof(path)) {
+    out[0] = 0;
+    return 0;
+  }
+  if(read_link_file(path, out, out_size) != 0) {
+    out[0] = 0;
+    return 0;
+  }
+  if(!ampr_version_safe(out)) {
+    out[0] = 0;
+    return 0;
+  }
+  return 1;
+}
+
+static int
+ampr_pin_version(const char *title_id, const char *version) {
+  char path[1024];
+  char dir[1024];
+  int n;
+  if(!valid_title_id(title_id)) return -1;
+  n = snprintf(dir, sizeof(dir), "%s", GC_AMPR_SELECTION_DIR);
+  if(n < 0 || (size_t)n >= sizeof(dir)) return -1;
+  mkdir(dir, 0777);
+  chmod(dir, 0777);
+  n = snprintf(path, sizeof(path), "%s/%s", GC_AMPR_SELECTION_DIR, title_id);
+  if(n < 0 || (size_t)n >= sizeof(path)) return -1;
+  if(!version || !version[0]) {
+    unlink(path);
+    return 0;
+  }
+  if(!ampr_version_safe(version)) return -1;
+  {
+    FILE *f = fopen(path, "w");
+    if(!f) return -1;
+    fprintf(f, "%s", version);
+    fclose(f);
+    chmod(path, 0666);
+  }
+  return 0;
+}
+
 static void
 detect_game_source_ex(gc_game_t *g, int exact_folder_size, int honor_cancel) {
-  pfs_app_info_t app_info = {0};
-  pfs_decompress_info_t dec_info = {0};
-  char err[256] = {0};
-  char outer_pfsc[1024] = {0};
+  pfs_app_info_t app_info = { 0 };
+  pfs_decompress_info_t dec_info = { 0 };
+  char err[256] = { 0 };
+  char outer_pfsc[1024] = { 0 };
   struct stat st;
 
   if(g->image_path[0]) {
@@ -3273,20 +3492,47 @@ detect_game_source_ex(gc_game_t *g, int exact_folder_size, int honor_cancel) {
   g->can_stream_delete =
       g->source_kind == GC_SOURCE_FOLDER ||
       g->source_kind == GC_SOURCE_COMPRESSED;
-  if(ampr_folder_target_probe(g->source_path, g->ampr_path,
-                              sizeof(g->ampr_path), g->ampr_sha256) ||
-     (g->is_mounted &&
-      ampr_folder_target_probe(g->mount_path, g->ampr_path,
-                               sizeof(g->ampr_path), g->ampr_sha256))) {
+  /*
+   * For compressed/image games the embedded libSceAmpr.sprx (APR-EMU)
+   * binary lives inside the mounted shadow image under
+   * GC_SHADOW_IMAGE_BASE. gc_shadowmount_ampr_mount_game() temporarily
+   * mounts, probes, and unmounts each game so the single-mount device
+   * is freed for the next game. Fall back to a direct probe for folder
+   * games or when the API is unavailable.
+   */
+  int ampr_found = gc_shadowmount_ampr_mount_game(g);
+  if(ampr_found != 1) {
+    if(ampr_folder_target_probe(g->source_path, g->ampr_path,
+                                sizeof(g->ampr_path), g->ampr_sha256) ||
+       (g->is_mounted &&
+        ampr_folder_target_probe(g->mount_path, g->ampr_path,
+                                 sizeof(g->ampr_path), g->ampr_sha256))) {
+      ampr_found = 1;
+    }
+  }
+  if(ampr_found == 1) {
     g->ampr_present = 1;
+    gc_ampr_cache_store(g->source_path, g->ampr_path, g->ampr_sha256);
   } else {
-    g->ampr_present = 0;
-    g->ampr_path[0] = 0;
-    g->ampr_sha256[0] = 0;
+    /*
+     * The probe may have been skipped because a GC operation is running
+     * or a game is active (gc_shadowmount_ampr_mount_game returns 0 in
+     * those cases). Fall back to the AMPR cache so the frontend still
+     * receives the last known amprPath/amprSha256 instead of empty
+     * fields.
+     */
+    if(gc_ampr_cache_lookup(g->source_path, g->ampr_path, sizeof(g->ampr_path),
+                            g->ampr_sha256, sizeof(g->ampr_sha256))) {
+      g->ampr_present = 1;
+    } else {
+      g->ampr_present = 0;
+      g->ampr_path[0] = 0;
+      g->ampr_sha256[0] = 0;
+    }
   }
   g->ampr_version[0] = 0;
   int ampr_have_latest =
-      ampr_latest_cached(g->ampr_latest_version,
+    ampr_latest_cached(g->ampr_latest_version,
                          sizeof(g->ampr_latest_version),
                          g->ampr_latest_sha256);
   int ampr_current_cached = 0;
@@ -3302,9 +3548,9 @@ detect_game_source_ex(gc_game_t *g, int exact_folder_size, int honor_cancel) {
                                       sizeof(g->ampr_version));
     }
     if(!g->ampr_version[0]) {
-      char selected_intent[16] = {0};
-      char selected_version[64] = {0};
-      char selected_sha[65] = {0};
+      char selected_intent[16] = { 0 };
+      char selected_version[64] = { 0 };
+      char selected_sha[65] = { 0 };
       if(ampr_selection_read(g->title_id, g->source_path,
                              selected_intent, sizeof(selected_intent),
                              selected_version, sizeof(selected_version),
@@ -3317,12 +3563,18 @@ detect_game_source_ex(gc_game_t *g, int exact_folder_size, int honor_cancel) {
     }
   }
   g->ampr_original_available =
-      ampr_original_lookup(g->title_id, g->source_path, NULL,
+    ampr_original_lookup(g->title_id, g->source_path, NULL,
                            g->ampr_original_sha256,
                            &g->ampr_original_size);
   g->ampr_update_needed =
       ampr_latest_update_needed_for_game(g, ampr_have_latest,
                                          ampr_current_cached);
+  ampr_pinned_version_for_title(g->title_id, g->ampr_pinned_version,
+                                sizeof(g->ampr_pinned_version));
+  if(g->ampr_pinned_version[0] && g->ampr_version[0] &&
+     strcasecmp(g->ampr_pinned_version, g->ampr_version) == 0) {
+    g->ampr_update_needed = 0;
+  }
   g->ampr_update_supported = g->ampr_present;
   load_validation_state(g);
   populate_apr_index_state_from_roots(g);
@@ -3331,7 +3583,7 @@ detect_game_source_ex(gc_game_t *g, int exact_folder_size, int honor_cancel) {
     snprintf(g->primary_action, sizeof(g->primary_action), "%s",
              g->validation == GC_VALIDATION_VALIDATED
                  ? "Revalidate and Repair"
-                 : "Validate and Repair");
+                                                      : "Validate and Repair");
   } else if(g->source_kind == GC_SOURCE_FOLDER ||
             g->source_kind == GC_SOURCE_IMAGE) {
     snprintf(g->primary_action, sizeof(g->primary_action), "%s", "Compress");
@@ -3368,13 +3620,18 @@ typedef struct gc_mount_link_backup {
   int cleared;
 } gc_mount_link_backup_t;
 
+static int mount_switch_clear_stale_links_sm(
+    const char *title_id, const char *expected_mount,
+    const char *expected_image, gc_mount_link_backup_t *backup,
+    char *err, size_t err_size);
+
 static int discover_games(gc_game_t *games, size_t max_games,
                           size_t *count_out, int exact_folder_sizes);
 
 static int
 game_source_matches(const gc_game_t *g, const char *source_path) {
   return g && source_path && source_path[0] && g->source_path[0] &&
-      paths_equal_ignoring_trailing_slash(g->source_path, source_path);
+         paths_equal_ignoring_trailing_slash(g->source_path, source_path);
 }
 
 static int
@@ -3438,7 +3695,7 @@ candidate_preferred_for_existing_instance(const gc_game_t *existing,
   same_shadow_pfsc = games_reference_same_shadow_pfsc(existing, candidate);
   if(same_shadow_pfsc) {
     return existing->source_kind != GC_SOURCE_COMPRESSED &&
-        candidate->source_kind == GC_SOURCE_COMPRESSED;
+           candidate->source_kind == GC_SOURCE_COMPRESSED;
   }
   return candidate->is_mounted && !existing->is_mounted;
 }
@@ -3563,10 +3820,10 @@ candidate_game_from_path(const char *source_path, const char *name,
                          gc_game_t *out, int exact_folder_size,
                          int is_mounted) {
   struct stat st;
-  char title_id[64] = {0};
+  char title_id[64] = { 0 };
   int expect_kind = GC_SOURCE_UNKNOWN;
-  pfs_app_info_t app_info = {0};
-  char err[256] = {0};
+  pfs_app_info_t app_info = { 0 };
+  char err[256] = { 0 };
 
   if(!source_path || !name || !out) return -1;
   if(path_is_system_app_path(source_path)) return -1;
@@ -3664,6 +3921,229 @@ artifact_cache_invalidate(void) {
   g_artifact_cache_force = 1;
   g_artifact_cache_scanned_at = 0;
   pthread_mutex_unlock(&g_artifact_cache_lock);
+  gc_games_cache_invalidate();
+  /*
+   * The icon and AMPR caches are intentionally NOT cleared here. icon0.png
+   * bytes and the APR-EMU binary sha are stable per source image; they are
+   * cached while a game is mounted (see gc_shadowmount_ampr_mount_game)
+   * so /api/gc/icon and the AMPR fields can be served without re-mounting.
+   * gc_icon_cache_store()/gc_ampr_cache_store() refresh existing entries
+   * on the next mount probe, so staleness is self-correcting. Clearing them
+   * on every invalidation would force every /api/gc/games poll to re-mount
+   * every game (a flood on the single-mount device). A title whose AMPR
+   * binary actually changes (update-ampr) drops its own cache entry so only
+   * that one title is re-probed.
+   */
+}
+
+static void
+gc_ampr_cache_store(const char *source_path, const char *ampr_path,
+                    const char *ampr_sha256) {
+  if(!source_path || !source_path[0]) return;
+  pthread_mutex_lock(&g_ampr_cache_lock);
+  for(size_t i = 0; i < g_ampr_cache_count; i++) {
+    if(!strcmp(g_ampr_cache[i].source_path, source_path)) {
+      snprintf(g_ampr_cache[i].ampr_path, sizeof(g_ampr_cache[i].ampr_path),
+               "%s", ampr_path ? ampr_path : "");
+      snprintf(g_ampr_cache[i].ampr_sha256, sizeof(g_ampr_cache[i].ampr_sha256),
+               "%s", ampr_sha256 ? ampr_sha256 : "");
+      g_ampr_cache[i].cached_at = time(NULL);
+      pthread_mutex_unlock(&g_ampr_cache_lock);
+      return;
+    }
+  }
+  if(g_ampr_cache_count < GC_MAX_GAMES) {
+    snprintf(g_ampr_cache[g_ampr_cache_count].source_path,
+             sizeof(g_ampr_cache[0].source_path), "%s", source_path);
+    snprintf(g_ampr_cache[g_ampr_cache_count].ampr_path,
+             sizeof(g_ampr_cache[0].ampr_path), "%s",
+             ampr_path ? ampr_path : "");
+    snprintf(g_ampr_cache[g_ampr_cache_count].ampr_sha256,
+             sizeof(g_ampr_cache[0].ampr_sha256), "%s",
+             ampr_sha256 ? ampr_sha256 : "");
+    g_ampr_cache[g_ampr_cache_count].cached_at = time(NULL);
+    g_ampr_cache_count++;
+  }
+  pthread_mutex_unlock(&g_ampr_cache_lock);
+}
+
+static int
+gc_ampr_cache_lookup(const char *source_path, char *ampr_path_out,
+                     size_t ampr_path_size, char *ampr_sha256_out,
+                     size_t ampr_sha256_size) {
+  int found = 0;
+  if(!source_path || !source_path[0]) return 0;
+  pthread_mutex_lock(&g_ampr_cache_lock);
+  for(size_t i = 0; i < g_ampr_cache_count; i++) {
+    if(!strcmp(g_ampr_cache[i].source_path, source_path) &&
+       g_ampr_cache[i].ampr_sha256[0]) {
+      if(ampr_path_out && ampr_path_size) {
+        snprintf(ampr_path_out, ampr_path_size, "%s",
+                 g_ampr_cache[i].ampr_path);
+      }
+      if(ampr_sha256_out && ampr_sha256_size) {
+        snprintf(ampr_sha256_out, ampr_sha256_size, "%s",
+                 g_ampr_cache[i].ampr_sha256);
+      }
+      found = 1;
+      break;
+    }
+  }
+  pthread_mutex_unlock(&g_ampr_cache_lock);
+  return found;
+}
+
+static void
+gc_ampr_cache_drop(const char *source_path) {
+  if(!source_path || !source_path[0]) return;
+  pthread_mutex_lock(&g_ampr_cache_lock);
+  for(size_t i = 0; i < g_ampr_cache_count; i++) {
+    if(!strcmp(g_ampr_cache[i].source_path, source_path)) {
+      /* Compact the array rather than leaving a hole. */
+      size_t remaining = g_ampr_cache_count - i - 1;
+      if(remaining) {
+        memmove(&g_ampr_cache[i], &g_ampr_cache[i + 1],
+                remaining * sizeof(g_ampr_cache[0]));
+      }
+      memset(&g_ampr_cache[g_ampr_cache_count - 1], 0, sizeof(g_ampr_cache[0]));
+      g_ampr_cache_count--;
+      break;
+    }
+  }
+  pthread_mutex_unlock(&g_ampr_cache_lock);
+}
+
+static void
+gc_icon_cache_store(const char *title_id, const unsigned char *data,
+                    size_t size, const unsigned char *thumb_data,
+                    size_t thumb_size) {
+  if(!title_id) return;
+  if(!data && !thumb_data) return;
+  if(size > 2 * 1024 * 1024) return;
+  pthread_mutex_lock(&g_icon_cache_lock);
+  for(size_t i = 0; i < g_icon_cache_count; i++) {
+    if(!strcmp(g_icon_cache[i].title_id, title_id)) {
+      if(data && size > 0) {
+        free(g_icon_cache[i].data);
+        g_icon_cache[i].data = malloc(size);
+        if(g_icon_cache[i].data) {
+          memcpy(g_icon_cache[i].data, data, size);
+          g_icon_cache[i].size = size;
+        } else {
+          g_icon_cache[i].size = 0;
+        }
+      }
+      if(thumb_data && thumb_size > 0) {
+        free(g_icon_cache[i].thumb_data);
+        g_icon_cache[i].thumb_data = malloc(thumb_size);
+        if(g_icon_cache[i].thumb_data) {
+          memcpy(g_icon_cache[i].thumb_data, thumb_data, thumb_size);
+          g_icon_cache[i].thumb_size = thumb_size;
+        } else {
+          g_icon_cache[i].thumb_size = 0;
+        }
+      }
+      g_icon_cache[i].cached_at = time(NULL);
+      pthread_mutex_unlock(&g_icon_cache_lock);
+      return;
+    }
+  }
+  if(g_icon_cache_count < GC_MAX_GAMES) {
+    gc_icon_cache_entry_t *e = &g_icon_cache[g_icon_cache_count];
+    snprintf(e->title_id, sizeof(e->title_id), "%s", title_id);
+    e->data = NULL;
+    e->size = 0;
+    e->thumb_data = NULL;
+    e->thumb_size = 0;
+    if(data && size > 0) {
+      e->data = malloc(size);
+      if(e->data) {
+        memcpy(e->data, data, size);
+        e->size = size;
+      }
+    }
+    if(thumb_data && thumb_size > 0) {
+      e->thumb_data = malloc(thumb_size);
+      if(e->thumb_data) {
+        memcpy(e->thumb_data, thumb_data, thumb_size);
+        e->thumb_size = thumb_size;
+      }
+    }
+    e->cached_at = time(NULL);
+    if(e->data || e->thumb_data) {
+      g_icon_cache_count++;
+    }
+  }
+  pthread_mutex_unlock(&g_icon_cache_lock);
+}
+
+static int
+gc_icon_cache_lookup(const char *title_id, int thumb, unsigned char **data_out,
+                     size_t *size_out) {
+  int found = 0;
+  if(!title_id || !data_out || !size_out) return 0;
+  *data_out = NULL;
+  *size_out = 0;
+  pthread_mutex_lock(&g_icon_cache_lock);
+  for(size_t i = 0; i < g_icon_cache_count; i++) {
+    if(!strcmp(g_icon_cache[i].title_id, title_id)) {
+      unsigned char *src;
+      size_t src_sz;
+      if(thumb) {
+        src = g_icon_cache[i].thumb_data;
+        src_sz = g_icon_cache[i].thumb_size;
+      } else {
+        src = g_icon_cache[i].data;
+        src_sz = g_icon_cache[i].size;
+      }
+      if(src && src_sz > 0) {
+        *data_out = malloc(src_sz);
+        if(*data_out) {
+          memcpy(*data_out, src, src_sz);
+          *size_out = src_sz;
+          found = 1;
+        }
+      }
+      break;
+    }
+  }
+  pthread_mutex_unlock(&g_icon_cache_lock);
+  return found;
+}
+
+static int
+gc_icon_cache_has(const char *title_id) {
+  int found = 0;
+  if(!title_id) return 0;
+  pthread_mutex_lock(&g_icon_cache_lock);
+  for(size_t i = 0; i < g_icon_cache_count; i++) {
+    if(!strcmp(g_icon_cache[i].title_id, title_id)) {
+      found = (g_icon_cache[i].data && g_icon_cache[i].size > 0) ||
+              (g_icon_cache[i].thumb_data && g_icon_cache[i].thumb_size > 0);
+      break;
+    }
+  }
+  pthread_mutex_unlock(&g_icon_cache_lock);
+  return found;
+}
+
+static void
+gc_icon_cache_drop(const char *title_id) {
+  if(!title_id) return;
+  pthread_mutex_lock(&g_icon_cache_lock);
+  for(size_t i = 0; i < g_icon_cache_count; i++) {
+    if(!strcmp(g_icon_cache[i].title_id, title_id)) {
+      free(g_icon_cache[i].data);
+      free(g_icon_cache[i].thumb_data);
+      g_icon_cache[i].data = NULL;
+      g_icon_cache[i].size = 0;
+      g_icon_cache[i].thumb_data = NULL;
+      g_icon_cache[i].thumb_size = 0;
+      g_icon_cache[i].cached_at = 0;
+      break;
+    }
+  }
+  pthread_mutex_unlock(&g_icon_cache_lock);
 }
 
 static void
@@ -3710,7 +4190,6 @@ discover_games_ex(gc_game_t *games, size_t max_games, size_t *count_out,
                   int exact_folder_sizes, int honor_cancel) {
   DIR *d = opendir(GC_APP_BASE);
   size_t count = 0;
-  struct dirent *ent;
   gc_game_t *artifacts = calloc(GC_MAX_GAMES, sizeof(*artifacts));
   size_t artifact_count = 0;
   if(!artifacts) return -1;
@@ -3718,7 +4197,17 @@ discover_games_ex(gc_game_t *games, size_t max_games, size_t *count_out,
   if(d) {
     while(count < max_games) {
       if(honor_cancel && job_cancelled()) break;
-      ent = readdir(d);
+      /*
+       * Only short-circuit the live scan while an operation is running
+       * when the ShadowMountPlus API is available (sm 1.7 games-cache
+       * path).  In legacy mode (old SM, api unavailable) /api/gc/games
+       * calls discover_games() directly on every poll and must keep
+       * scanning the full list — exactly like gc_api_old.c — so the
+       * games keep their mount status / AMPR / size fields instead of
+       * falling back to the (AMPR-less) artifact cache mid-operation.
+       */
+      if(gc_shadowmount_api_available() && gc_any_operation_pending()) break;
+      struct dirent *ent = readdir(d);
       if(!ent) break;
       if(!valid_title_id(ent->d_name)) continue;
       gc_game_t *g = &games[count];
@@ -3726,11 +4215,10 @@ discover_games_ex(gc_game_t *games, size_t max_games, size_t *count_out,
       snprintf(g->title_id, sizeof(g->title_id), "%s", ent->d_name);
 
       char link_path[1024];
-      int has_mount_link;
       snprintf(link_path, sizeof(link_path), "%s/%s/mount.lnk", GC_APP_BASE,
                g->title_id);
-      has_mount_link =
-          read_link_file(link_path, g->mount_path, sizeof(g->mount_path)) == 0;
+      int has_mount_link =
+        read_link_file(link_path, g->mount_path, sizeof(g->mount_path)) == 0;
       if(!has_mount_link) {
         if(find_exact_pfsc_by_title(g->title_id, g->image_path,
                                     sizeof(g->image_path)) != 0) {
@@ -3772,6 +4260,149 @@ discover_games(gc_game_t *games, size_t max_games, size_t *count_out,
   return discover_games_ex(games, max_games, count_out, exact_folder_sizes, 0);
 }
 
+static void
+gc_games_cache_invalidate(void) {
+  pthread_mutex_lock(&g_games_cache_lock);
+  g_games_cache_dirty = 1;
+  pthread_mutex_unlock(&g_games_cache_lock);
+}
+
+/*
+ * Rebuild the persistent games list cache from a fresh discover_games()
+ * scan. While the ShadowMountPlus API is available (sm 1.7) mounting is
+ * dynamic, so every discovered title is mountable on demand; the transient
+ * on-disk mount.lnk hint is not a useful availability signal, so all
+ * discovered games are cached as mounted. In legacy mode the actual hint
+ * is preserved (and a previously cached mounted flag is kept when a fresh
+ * scan transiently reports not-mounted). The cache is never rebuilt while
+ * an operation is pending to avoid clobbering it with a partial scan.
+ */
+static void
+gc_games_cache_refresh(void) {
+  if(gc_shadowmount_api_available()) {
+    gc_games_cache_refresh_sm();
+    return;
+  }
+  gc_game_t *games;
+  size_t count = 0;
+  if(gc_any_operation_pending()) {
+    gc_games_cache_invalidate();
+    return;
+  }
+  games = calloc(GC_MAX_GAMES, sizeof(*games));
+  if(!games) {
+    gc_games_cache_invalidate();
+    return;
+  }
+  discover_games(games, GC_MAX_GAMES, &count, 0);
+  pthread_mutex_lock(&g_games_cache_lock);
+  for(size_t i = 0; i < count; i++) {
+    for(size_t j = 0; j < g_games_cache_count; j++) {
+      if(!strcasecmp(g_games_cache[j].title_id, games[i].title_id)) {
+        if(g_games_cache[j].is_mounted && !games[i].is_mounted) {
+          set_game_mount_status(&games[i], 1,
+                                g_games_cache[j].mount_status[0]
+                                  ? g_games_cache[j].mount_status
+                                  : "mounted");
+        }
+        break;
+      }
+    }
+  }
+  pthread_mutex_unlock(&g_games_cache_lock);
+  pthread_mutex_lock(&g_games_cache_lock);
+  size_t copy_count = count < GC_MAX_GAMES ? count : GC_MAX_GAMES;
+  memcpy(g_games_cache, games, copy_count * sizeof(g_games_cache[0]));
+  g_games_cache_count = copy_count;
+  g_games_cache_ready = 1;
+  g_games_cache_dirty = 0;
+  pthread_mutex_unlock(&g_games_cache_lock);
+  free(games);
+}
+
+/*
+ * Acquire the "refreshing" role and rebuild the games cache if it is
+ * dirty/not-ready and no operation is pending and no other thread is
+ * already refreshing. Coordinates concurrent refreshers (background
+ * startup warmup vs. /api/gc/games polls) so the cache is built exactly
+ * once: the loser sees g_games_cache_refreshing already set and skips.
+ * Broadcasts g_games_cache_cond on completion so any games_request()
+ * waiter wakes up and returns the now-ready list instead of an empty one.
+ */
+static void
+gc_games_cache_refresh_if_needed(void) {
+  int op_pending = gc_any_operation_pending();
+  int dirty = 0;
+  pthread_mutex_lock(&g_games_cache_lock);
+  if((g_games_cache_dirty || !g_games_cache_ready) &&
+     !g_games_cache_refreshing && !op_pending) {
+    g_games_cache_refreshing = 1;
+    dirty = 1;
+  }
+  pthread_mutex_unlock(&g_games_cache_lock);
+  if(!dirty) return;
+  gc_games_cache_refresh();
+  pthread_mutex_lock(&g_games_cache_lock);
+  g_games_cache_refreshing = 0;
+  pthread_cond_broadcast(&g_games_cache_cond);
+  pthread_mutex_unlock(&g_games_cache_lock);
+}
+
+/*
+ * Wait until any in-progress games-cache refresh completes and the
+ * cache is ready, then return. Used by games_request() so the first
+ * /api/gc/games poll during startup warmup blocks until the warmup
+ * finishes and returns the full list instead of an empty one. Only
+ * actually blocks during the initial warmup (when refreshing is set and
+ * the cache has never been marked ready); once ready, subsequent lazy
+ * rebuilds keep ready set and do not block polls (they return the
+ * previous snapshot). Matches the rest of the codebase which uses
+ * unbounded pthread_cond_wait for bounded filesystem/mount work.
+ */
+static void
+gc_games_cache_wait_for_ready(void) {
+  pthread_mutex_lock(&g_games_cache_lock);
+  while(g_games_cache_refreshing && !g_games_cache_ready) {
+    pthread_cond_wait(&g_games_cache_cond, &g_games_cache_lock);
+  }
+  pthread_mutex_unlock(&g_games_cache_lock);
+}
+
+static size_t
+gc_games_cache_snapshot(gc_game_t *out, size_t max_games) {
+  size_t copy_count;
+  pthread_mutex_lock(&g_games_cache_lock);
+  copy_count =
+    g_games_cache_count < max_games ? g_games_cache_count : max_games;
+  if(out && copy_count) memcpy(out, g_games_cache, copy_count * sizeof(out[0]));
+  pthread_mutex_unlock(&g_games_cache_lock);
+  return copy_count;
+}
+
+/*
+ * Update the cached is_mounted flag for a title (used each time a game is
+ * actually mounted). In sm 1.7 the mount is dynamic and may be released
+ * immediately afterwards, but the cached flag remembers that the title is
+ * available/mountable so /api/gc/games keeps reporting the cached value
+ * instead of the transient on-disk hint.
+ */
+static void
+gc_games_cache_set_mounted(const char *title_id, int is_mounted,
+                           const char *status) {
+  if(!title_id || !title_id[0]) return;
+  pthread_mutex_lock(&g_games_cache_lock);
+  if(g_games_cache_ready) {
+    for(size_t i = 0; i < g_games_cache_count; i++) {
+      if(!strcasecmp(g_games_cache[i].title_id, title_id)) {
+        set_game_mount_status(
+          &g_games_cache[i], is_mounted,
+          status ? status : (is_mounted ? "mounted" : "not-mounted"));
+      }
+    }
+  }
+  pthread_mutex_unlock(&g_games_cache_lock);
+}
+
 static int
 preferred_transfer_root_score(const char *parent, const char *storage_root) {
   if(!parent || !parent[0] || !storage_root || !storage_root[0]) return 1000;
@@ -3790,7 +4421,7 @@ resolve_transfer_target_root(const char *storage_root,
   gc_game_t *games;
   size_t count = 0;
   int best_score = 1000;
-  char best[1024] = {0};
+  char best[1024] = { 0 };
 
   if(!storage_root || !storage_root[0] || !fallback_root ||
      !fallback_root[0] || !out || out_size == 0) {
@@ -3836,11 +4467,11 @@ static int
 find_game_for_operation_source_path(const gc_operation_t *op, gc_game_t *out,
                                     int exact_folder_sizes) {
   gc_game_t candidate;
-  pfs_decompress_info_t dec = {0};
-  pfs_app_info_t app = {0};
+  pfs_decompress_info_t dec = { 0 };
+  pfs_app_info_t app = { 0 };
   struct stat st;
-  char title_id[64] = {0};
-  char err[256] = {0};
+  char title_id[64] = { 0 };
+  char err[256] = { 0 };
   const char *name;
 
   if(!op) return -1;
@@ -3970,7 +4601,7 @@ find_game_for_operation_source_path(const gc_operation_t *op, gc_game_t *out,
   }
   candidate.can_stream_delete =
       candidate.source_kind == GC_SOURCE_FOLDER ||
-      candidate.source_kind == GC_SOURCE_COMPRESSED;
+                                candidate.source_kind == GC_SOURCE_COMPRESSED;
   if(candidate.source_kind == GC_SOURCE_COMPRESSED) {
     snprintf(candidate.primary_action, sizeof(candidate.primary_action), "%s",
              "Validate and Repair");
@@ -4063,8 +4694,8 @@ operation_store_compression_stats(gc_operation_t *op, uint64_t source_size,
   if(compressed_size > 0) op->compressed_size = compressed_size;
   if(op->compression_source_size > 0 && op->compressed_size > 0) {
     op->saved_bytes = op->compression_source_size > op->compressed_size
-        ? op->compression_source_size - op->compressed_size
-        : 0;
+                        ? op->compression_source_size - op->compressed_size
+                        : 0;
   }
 }
 
@@ -4138,112 +4769,112 @@ append_operation_json(json_buf_t *b, const gc_operation_t *op,
   }
   return json_append(b, "{\"id\":") == 0 &&
       json_string(b, id) == 0 &&
-      json_append(b, ",\"titleId\":") == 0 &&
-      json_string(b, op->title_id) == 0 &&
-      json_append(b, ",\"displayName\":") == 0 &&
-      json_string(b, op->display_name) == 0 &&
-      json_append(b, ",\"action\":") == 0 &&
-      json_string(b, action_name(op->action)) == 0 &&
-      json_append(b, ",\"status\":") == 0 &&
-      json_string(b, status_name(op->status)) == 0 &&
-      json_append(b, ",\"phase\":") == 0 &&
-      json_string(b, op->phase) == 0 &&
-      json_append(b, ",\"result\":") == 0 &&
-      json_string(b, op->result) == 0 &&
-      json_append(b, ",\"error\":") == 0 &&
-      json_string(b, op->error) == 0 &&
-      json_append(b, ",\"sourcePath\":") == 0 &&
-      json_string(b, op->source_path) == 0 &&
-      json_append(b, ",\"outputPath\":") == 0 &&
-      json_string(b, op->output_path) == 0 &&
-      json_append(b, ",\"sourceKind\":") == 0 &&
-      json_string(b, op->source_kind) == 0 &&
-      json_append(b, ",\"format\":") == 0 &&
-      json_string(b, op->format) == 0 &&
-      json_append(b, ",\"deletePolicy\":") == 0 &&
-      json_string(b, op->delete_policy) == 0 &&
-      json_append(b, ",\"compressionMode\":") == 0 &&
+             json_append(b, ",\"titleId\":") == 0 &&
+             json_string(b, op->title_id) == 0 &&
+             json_append(b, ",\"displayName\":") == 0 &&
+             json_string(b, op->display_name) == 0 &&
+             json_append(b, ",\"action\":") == 0 &&
+             json_string(b, action_name(op->action)) == 0 &&
+             json_append(b, ",\"status\":") == 0 &&
+             json_string(b, status_name(op->status)) == 0 &&
+             json_append(b, ",\"phase\":") == 0 &&
+             json_string(b, op->phase) == 0 &&
+             json_append(b, ",\"result\":") == 0 &&
+             json_string(b, op->result) == 0 &&
+             json_append(b, ",\"error\":") == 0 &&
+             json_string(b, op->error) == 0 &&
+             json_append(b, ",\"sourcePath\":") == 0 &&
+             json_string(b, op->source_path) == 0 &&
+             json_append(b, ",\"outputPath\":") == 0 &&
+             json_string(b, op->output_path) == 0 &&
+             json_append(b, ",\"sourceKind\":") == 0 &&
+             json_string(b, op->source_kind) == 0 &&
+             json_append(b, ",\"format\":") == 0 &&
+             json_string(b, op->format) == 0 &&
+             json_append(b, ",\"deletePolicy\":") == 0 &&
+             json_string(b, op->delete_policy) == 0 &&
+             json_append(b, ",\"compressionMode\":") == 0 &&
       json_string(b, compression_mode_or_default(op->compression_mode)) == 0 &&
-      json_append(b, ",\"streamOrder\":") == 0 &&
+             json_append(b, ",\"streamOrder\":") == 0 &&
       json_string(b, op->stream_order[0] ? op->stream_order : "budgeted-gain") == 0 &&
-      json_append(b, ",\"targetRoot\":") == 0 &&
-      json_string(b, op->target_root) == 0 &&
-      json_appendf(b, ",\"skipSpaceCheck\":%s",
-                   op->skip_space_check ? "true" : "false") == 0 &&
-      json_append(b, ",\"preserveOriginal\":") == 0 &&
-      json_string(b, op->preserve_original) == 0 &&
-      json_append(b, ",\"preservedOriginalPath\":") == 0 &&
-      json_string(b, op->preserved_original_path) == 0 &&
-      json_append(b, ",\"preservedHiddenPath\":") == 0 &&
-      json_string(b, op->preserved_hidden_path) == 0 &&
-      json_append(b, ",\"repairSummary\":") == 0 &&
-      json_string(b, op->repair_summary) == 0 &&
-      json_append(b, ",\"amprVersion\":") == 0 &&
-      json_string(b, op->ampr_version) == 0 &&
-      json_append(b, ",\"amprSha256\":") == 0 &&
-      json_string(b, op->ampr_sha256) == 0 &&
-      json_append(b, ",\"amprCachePath\":") == 0 &&
-      json_string(b, op->ampr_cache_path) == 0 &&
-      json_append(b, ",\"amprResultMode\":") == 0 &&
-      json_string(b, op->ampr_result_mode) == 0 &&
-      json_append(b, ",\"amprIntent\":") == 0 &&
-      json_string(b, op->ampr_intent) == 0 &&
-      json_append(b, ",\"readRoot\":") == 0 &&
-      json_string(b, op->read_root) == 0 &&
-      json_append(b, ",\"readStorage\":") == 0 &&
-      json_string(b, op->read_storage) == 0 &&
-      json_append(b, ",\"readFirstErrorPath\":") == 0 &&
-      json_string(b, op->read_first_error_path) == 0 &&
-      json_append(b, ",\"readFirstError\":") == 0 &&
-      json_string(b, op->read_first_error) == 0 &&
-      json_appendf(b,
-                   ",\"streamBudgetBytes\":%llu,"
-                   "\"compressionSourceSize\":%llu,"
-                   "\"compressedSize\":%llu,"
-                   "\"savedBytes\":%llu,"
-                   "\"scanBytes\":%llu,\"scanFiles\":%llu,"
-                   "\"scanDirs\":%llu,\"scanEntries\":%llu,"
-                   "\"scanElapsedMs\":%llu,\"scanWorkers\":%llu,"
-                   "\"aprIndexed\":%s,"
-                   "\"amprHotSwapOptimized\":%s,"
-                   "\"readBytes\":%llu,\"readFiles\":%llu,"
-                   "\"readDirs\":%llu,\"readElapsedMs\":%llu,"
-                   "\"readAvgBps\":%llu,\"readMinBps\":%llu,"
-                   "\"readMaxBps\":%llu,\"readErrors\":%llu,"
-                   "\"readSkipped\":%llu,"
-                   "\"createdAt\":%ld,\"startedAt\":%ld,\"endedAt\":%ld,"
-                   "\"repairedBlocks\":%llu,\"badBlocksFound\":%llu,"
-                   "\"hashCheckedBlocks\":%llu,"
-                   "\"hashMismatchedBlocks\":%llu,"
-                   "\"softwareComparedBlocks\":%llu}%s",
-                   (unsigned long long)op->stream_budget_bytes,
-                   (unsigned long long)op->compression_source_size,
-                   (unsigned long long)op->compressed_size,
-                   (unsigned long long)op->saved_bytes,
-                   (unsigned long long)op->scan_bytes,
-                   (unsigned long long)op->scan_files,
-                   (unsigned long long)op->scan_dirs,
-                   (unsigned long long)op->scan_entries,
-                   (unsigned long long)op->scan_elapsed_ms,
-                   (unsigned long long)op->scan_workers,
-                   op->apr_indexed ? "true" : "false",
-                   op->ampr_hot_swap_optimized ? "true" : "false",
-                   (unsigned long long)op->read_bytes,
-                   (unsigned long long)op->read_files,
-                   (unsigned long long)op->read_dirs,
-                   (unsigned long long)op->read_elapsed_ms,
-                   (unsigned long long)op->read_avg_bps,
-                   (unsigned long long)op->read_min_bps,
-                   (unsigned long long)op->read_max_bps,
-                   (unsigned long long)op->read_errors,
-                   (unsigned long long)op->read_skipped,
-                   (long)op->created_at, (long)op->started_at,
-                   (long)op->ended_at,
-                   (unsigned long long)op->repaired_blocks,
-                   (unsigned long long)bad_blocks_found,
-                   (unsigned long long)op->hash_checked_blocks,
-                   (unsigned long long)hash_mismatched_blocks,
-                   (unsigned long long)software_compared_blocks,
+             json_append(b, ",\"targetRoot\":") == 0 &&
+             json_string(b, op->target_root) == 0 &&
+             json_appendf(b, ",\"skipSpaceCheck\":%s",
+                          op->skip_space_check ? "true" : "false") == 0 &&
+             json_append(b, ",\"preserveOriginal\":") == 0 &&
+             json_string(b, op->preserve_original) == 0 &&
+             json_append(b, ",\"preservedOriginalPath\":") == 0 &&
+             json_string(b, op->preserved_original_path) == 0 &&
+             json_append(b, ",\"preservedHiddenPath\":") == 0 &&
+             json_string(b, op->preserved_hidden_path) == 0 &&
+             json_append(b, ",\"repairSummary\":") == 0 &&
+             json_string(b, op->repair_summary) == 0 &&
+             json_append(b, ",\"amprVersion\":") == 0 &&
+             json_string(b, op->ampr_version) == 0 &&
+             json_append(b, ",\"amprSha256\":") == 0 &&
+             json_string(b, op->ampr_sha256) == 0 &&
+             json_append(b, ",\"amprCachePath\":") == 0 &&
+             json_string(b, op->ampr_cache_path) == 0 &&
+             json_append(b, ",\"amprResultMode\":") == 0 &&
+             json_string(b, op->ampr_result_mode) == 0 &&
+             json_append(b, ",\"amprIntent\":") == 0 &&
+             json_string(b, op->ampr_intent) == 0 &&
+             json_append(b, ",\"readRoot\":") == 0 &&
+             json_string(b, op->read_root) == 0 &&
+             json_append(b, ",\"readStorage\":") == 0 &&
+             json_string(b, op->read_storage) == 0 &&
+             json_append(b, ",\"readFirstErrorPath\":") == 0 &&
+             json_string(b, op->read_first_error_path) == 0 &&
+             json_append(b, ",\"readFirstError\":") == 0 &&
+             json_string(b, op->read_first_error) == 0 &&
+             json_appendf(b,
+                          ",\"streamBudgetBytes\":%llu,"
+                          "\"compressionSourceSize\":%llu,"
+                          "\"compressedSize\":%llu,"
+                          "\"savedBytes\":%llu,"
+                          "\"scanBytes\":%llu,\"scanFiles\":%llu,"
+                          "\"scanDirs\":%llu,\"scanEntries\":%llu,"
+                          "\"scanElapsedMs\":%llu,\"scanWorkers\":%llu,"
+                          "\"aprIndexed\":%s,"
+                          "\"amprHotSwapOptimized\":%s,"
+                          "\"readBytes\":%llu,\"readFiles\":%llu,"
+                          "\"readDirs\":%llu,\"readElapsedMs\":%llu,"
+                          "\"readAvgBps\":%llu,\"readMinBps\":%llu,"
+                          "\"readMaxBps\":%llu,\"readErrors\":%llu,"
+                          "\"readSkipped\":%llu,"
+                          "\"createdAt\":%ld,\"startedAt\":%ld,\"endedAt\":%ld,"
+                          "\"repairedBlocks\":%llu,\"badBlocksFound\":%llu,"
+                          "\"hashCheckedBlocks\":%llu,"
+                          "\"hashMismatchedBlocks\":%llu,"
+                          "\"softwareComparedBlocks\":%llu}%s",
+                          (unsigned long long)op->stream_budget_bytes,
+                          (unsigned long long)op->compression_source_size,
+                          (unsigned long long)op->compressed_size,
+                          (unsigned long long)op->saved_bytes,
+                          (unsigned long long)op->scan_bytes,
+                          (unsigned long long)op->scan_files,
+                          (unsigned long long)op->scan_dirs,
+                          (unsigned long long)op->scan_entries,
+                          (unsigned long long)op->scan_elapsed_ms,
+                          (unsigned long long)op->scan_workers,
+                          op->apr_indexed ? "true" : "false",
+                          op->ampr_hot_swap_optimized ? "true" : "false",
+                          (unsigned long long)op->read_bytes,
+                          (unsigned long long)op->read_files,
+                          (unsigned long long)op->read_dirs,
+                          (unsigned long long)op->read_elapsed_ms,
+                          (unsigned long long)op->read_avg_bps,
+                          (unsigned long long)op->read_min_bps,
+                          (unsigned long long)op->read_max_bps,
+                          (unsigned long long)op->read_errors,
+                          (unsigned long long)op->read_skipped,
+                          (long)op->created_at, (long)op->started_at,
+                          (long)op->ended_at,
+                          (unsigned long long)op->repaired_blocks,
+                          (unsigned long long)bad_blocks_found,
+                          (unsigned long long)op->hash_checked_blocks,
+                          (unsigned long long)hash_mismatched_blocks,
+                          (unsigned long long)software_compared_blocks,
                    newline ? "\n" : "") == 0 ? 0 : -1;
 }
 
@@ -4254,7 +4885,7 @@ append_operation_log_file(const gc_operation_t *op, const char *dir,
   if(mkdirs(dir) != 0) return;
   int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0666);
   if(fd < 0) return;
-  json_buf_t b = {0};
+  json_buf_t b = { 0 };
   char row_id[64];
   if(op->status == GC_OP_RUNNING && op->phase[0]) {
     snprintf(row_id, sizeof(row_id), "%s:%s", op->id, op->phase);
@@ -4694,10 +5325,10 @@ game_source_delete_allowed(const gc_game_t *game) {
 static void
 cleanup_shadowmount_hints_for_deleted_source(const gc_operation_t *op,
                                              const gc_game_t *game) {
-  char hint_err[256] = {0};
+  char hint_err[256] = { 0 };
   if(!op || !game) return;
   if(game->source_kind == GC_SOURCE_COMPRESSED) {
-    pfs_decompress_info_t info = {0};
+    pfs_decompress_info_t info = { 0 };
     if(pfs_decompress_detect_nested(game->source_path, &info, hint_err,
                                     sizeof(hint_err)) == 0) {
       hint_err[0] = 0;
@@ -4754,7 +5385,7 @@ build_uncompress_quarantine_path(const char *source_path,
     int n = snprintf(out, out_size, "%s%s.gc-uncompress-%s-%s-%ld-%u-%02d.source",
                      parent, parent[1] ? "/" : "", title_id,
                      op_id && op_id[0] ? op_id : "op",
-                     (long)time(NULL), (unsigned)getpid(), attempt);
+      (long)time(NULL), (unsigned)getpid(), attempt);
     if(n < 0 || (size_t)n >= out_size) {
       errno = ENAMETOOLONG;
       return -1;
@@ -4822,7 +5453,7 @@ delete_quarantined_uncompress_source(gc_source_quarantine_t *q,
     return -1;
   }
   gc_log("uncompress quarantined source deleted title=%s original=%s quarantine=%s",
-         title_id ? title_id : "", q->original_path, q->quarantine_path);
+    title_id ? title_id : "", q->original_path, q->quarantine_path);
   q->active = 0;
   return 0;
 }
@@ -4857,7 +5488,7 @@ uncompress_complete_not_mounted(gc_operation_t *op,
   gc_size_cache_queue_measure(info->output_path);
   if(as_image) {
     gc_log("uncompress image complete but not mounted title=%s output=%s detail=%s",
-           op->title_id, op->output_path, detail && detail[0] ? detail : "");
+      op->title_id, op->output_path, detail && detail[0] ? detail : "");
   } else {
     gc_log("uncompress complete but not mounted title=%s output=%s detail=%s",
            op->title_id, op->output_path, detail && detail[0] ? detail : "");
@@ -4887,7 +5518,7 @@ restore_quarantined_uncompress_source(gc_source_quarantine_t *q,
     return;
   }
   gc_log("uncompress source quarantine restored title=%s original=%s quarantine=%s",
-         title_id ? title_id : "", q->original_path, q->quarantine_path);
+    title_id ? title_id : "", q->original_path, q->quarantine_path);
   q->active = 0;
 }
 
@@ -4949,7 +5580,7 @@ prepare_uncompress_plan(gc_game_t *game, int as_image,
                         const char *output_path,
                         pfs_decompress_info_t *info,
                         char *err, size_t err_size) {
-  pfs_decompress_info_t dec = {0};
+  pfs_decompress_info_t dec = { 0 };
   uint64_t free_bytes = 0;
   struct stat st;
   if(!game || game->source_kind != GC_SOURCE_COMPRESSED) {
@@ -4984,8 +5615,8 @@ prepare_uncompress_plan(gc_game_t *game, int as_image,
     game->free_bytes = free_bytes;
   }
   game->extra_needed = game->free_bytes >= game->required_bytes
-      ? 0
-      : game->required_bytes - game->free_bytes;
+                         ? 0
+                         : game->required_bytes - game->free_bytes;
   if(as_image) game->can_stream_delete = 0;
   if(info) *info = dec;
   return 0;
@@ -5019,9 +5650,9 @@ repair_with_wait(const char *title_id, const char *path,
       return -1;
     }
     {
-      char scan_err[256] = {0};
+      char scan_err[256] = { 0 };
       if(gc_shadowmount_request_title_source_scan_cancelable(
-             title_id, path, scan_err, sizeof(scan_err)) != 0) {
+           title_id, path, scan_err, sizeof(scan_err)) != 0) {
         if(job_cancelled()) return -1;
         gc_log("repair wait scan request failed title=%s err=%s",
                title_id ? title_id : "",
@@ -5066,9 +5697,9 @@ repair_scan_only_with_wait(const char *title_id, const char *path,
       return -1;
     }
     {
-      char scan_err[256] = {0};
+      char scan_err[256] = { 0 };
       if(gc_shadowmount_request_title_source_scan_cancelable(
-             title_id, path, scan_err, sizeof(scan_err)) != 0) {
+           title_id, path, scan_err, sizeof(scan_err)) != 0) {
         if(job_cancelled()) return -1;
         gc_log("validate-only wait scan request failed title=%s err=%s",
                title_id ? title_id : "",
@@ -5146,35 +5777,53 @@ build_force_remount_temp_path(const char *path, const char *title_id,
 static int
 wait_for_compressed_shadowmount(const char *title_id, const char *path,
                                 const char *nested_name, int nested_type,
-                                const char *current,
+                                const char *current, int keep_mounted,
                                 char *err, size_t err_size) {
+  if(gc_shadowmount_api_available()) {
+    return wait_for_compressed_shadowmount_sm(title_id, path, nested_name,
+                                               nested_type, current,
+                                               keep_mounted, err, err_size);
+  }
   char expected_image[1024];
   char expected_mount[1024];
-  char scan_err[256] = {0};
-  if(expected_compressed_shadow_paths(path, nested_name, nested_type,
-                                      expected_image, sizeof(expected_image),
-                                      expected_mount, sizeof(expected_mount)) != 0) {
+  char scan_err[256] = { 0 };
+  if(expected_compressed_shadow_paths(
+       path, nested_name, nested_type, expected_image, sizeof(expected_image),
+       expected_mount, sizeof(expected_mount)) != 0) {
     snprintf(err, err_size, "%s", "could not derive compressed remount path");
     return -1;
   }
   if(gc_cancel_requested(err, err_size)) return -1;
   job_set_phase("mounting", 0, 0, current ? current : "Waiting for remount");
   if(gc_shadowmount_request_title_source_scan_cancelable(
-         title_id, path, scan_err, sizeof(scan_err)) != 0) {
+       title_id, path, scan_err, sizeof(scan_err)) != 0) {
     if(job_cancelled()) return -1;
     gc_log("compressed remount scan request failed title=%s err=%s",
            title_id ? title_id : "", scan_err[0] ? scan_err : "unknown");
   }
-  return wait_for_shadowmount_links(title_id, expected_mount, expected_image,
-                                    err, err_size);
+  int rc_wait = wait_for_shadowmount_links(title_id, expected_mount,
+                                           expected_image, err, err_size);
+  if(rc_wait != 0 && scan_err[0]) {
+    char combined[512];
+    snprintf(combined, sizeof(combined), "%s; %s", scan_err,
+             err[0] ? err : "unknown");
+    snprintf(err, err_size, "%s", combined);
+    gc_log("compressed remount failed title=%s scan_err=%s wait_err=%s",
+           title_id ? title_id : "", scan_err, err[0] ? err : "unknown");
+  }
+  return rc_wait;
 }
 
 static int
 wait_for_image_shadowmount(const char *title_id, const char *path,
                            int nested_type, const char *current,
-                           char *err, size_t err_size) {
+                           int keep_mounted, char *err, size_t err_size) {
+  if(gc_shadowmount_api_available()) {
+    return wait_for_image_shadowmount_sm(title_id, path, nested_type, current,
+                                          keep_mounted, err, err_size);
+  }
   char expected_mount[1024];
-  char scan_err[256] = {0};
+  char scan_err[256] = { 0 };
   if(!path || !path[0] ||
      shadow_image_mount_point(path, nested_type, expected_mount,
                               sizeof(expected_mount)) != 0) {
@@ -5184,24 +5833,38 @@ wait_for_image_shadowmount(const char *title_id, const char *path,
   if(gc_cancel_requested(err, err_size)) return -1;
   job_set_phase("mounting", 0, 0, current ? current : "Waiting for remount");
   if(gc_shadowmount_request_title_source_scan_cancelable(
-         title_id, path, scan_err, sizeof(scan_err)) != 0) {
+       title_id, path, scan_err, sizeof(scan_err)) != 0) {
     if(job_cancelled()) return -1;
     gc_log("image remount scan request failed title=%s err=%s",
            title_id ? title_id : "", scan_err[0] ? scan_err : "unknown");
   }
-  return wait_for_shadowmount_links(title_id, expected_mount, path,
-                                    err, err_size);
+  int rc_wait =
+    wait_for_shadowmount_links(title_id, expected_mount, path, err, err_size);
+  if(rc_wait != 0 && scan_err[0]) {
+    char combined[512];
+    snprintf(combined, sizeof(combined), "%s; %s", scan_err,
+             err[0] ? err : "unknown");
+    snprintf(err, err_size, "%s", combined);
+    gc_log("image remount failed title=%s scan_err=%s wait_err=%s",
+           title_id ? title_id : "", scan_err, err[0] ? err : "unknown");
+  }
+  return rc_wait;
 }
 
 static int
 force_compressed_path_bounce_remount(const char *title_id,
-                                     const char *original_path,
-                                     const char *nested_name,
-                                     int nested_type,
-                                     char *err, size_t err_size) {
+                                      const char *original_path,
+                                      const char *nested_name,
+                                      int nested_type, int keep_mounted,
+                                      char *err, size_t err_size) {
+  if(gc_shadowmount_api_available()) {
+    return force_compressed_path_bounce_remount_sm(title_id, original_path,
+                                                    nested_name, nested_type,
+                                                    keep_mounted, err, err_size);
+  }
   char temp_path[1024];
-  char hint_err[256] = {0};
-  char scan_err[256] = {0};
+  char hint_err[256] = { 0 };
+  char scan_err[256] = { 0 };
   int cancelled = 0;
 
   if(gc_cancel_requested(err, err_size)) return -1;
@@ -5234,7 +5897,7 @@ force_compressed_path_bounce_remount(const char *title_id,
   }
   if(!cancelled &&
      gc_sleep_cancelable_seconds(GC_MOUNT_SCAN_REQUEST_SECONDS,
-                                 err, err_size) != 0) {
+                                               err, err_size) != 0) {
     cancelled = 1;
   }
   if(rename(temp_path, original_path) != 0) {
@@ -5249,7 +5912,7 @@ force_compressed_path_bounce_remount(const char *title_id,
          title_id ? title_id : "", temp_path, original_path);
   hint_err[0] = 0;
   if(gc_shadowmount_remove_outer_sector_hint(temp_path, hint_err,
-                                            sizeof(hint_err)) != 0) {
+                                             sizeof(hint_err)) != 0) {
     gc_log("compressed temp remount hint cleanup failed title=%s temp=%s err=%s",
            title_id ? title_id : "", temp_path,
            hint_err[0] ? hint_err : "unknown");
@@ -5258,7 +5921,7 @@ force_compressed_path_bounce_remount(const char *title_id,
   if(gc_shadowmount_prepare_pfsc_hints_for_title(title_id, original_path,
                                                 nested_name, nested_type,
                                                 hint_err,
-                                                sizeof(hint_err)) != 0) {
+       sizeof(hint_err)) != 0) {
     gc_log("compressed final remount hint failed title=%s path=%s err=%s",
            title_id ? title_id : "", original_path,
            hint_err[0] ? hint_err : "unknown");
@@ -5270,17 +5933,23 @@ force_compressed_path_bounce_remount(const char *title_id,
   return wait_for_compressed_shadowmount(title_id, original_path, nested_name,
                                          nested_type,
                                          "Waiting for final remount",
-                                         err, err_size);
+                                         keep_mounted, err, err_size);
 }
 
 static int
 force_image_path_bounce_remount(const char *title_id,
-                                const char *original_path,
-                                int nested_type,
-                                char *err, size_t err_size) {
+                                 const char *original_path,
+                                 int nested_type,
+                                 int keep_mounted,
+                                 char *err, size_t err_size) {
+  if(gc_shadowmount_api_available()) {
+    return force_image_path_bounce_remount_sm(title_id, original_path,
+                                               nested_type, keep_mounted,
+                                               err, err_size);
+  }
   char temp_path[1024];
-  char hint_err[256] = {0};
-  char scan_err[256] = {0};
+  char hint_err[256] = { 0 };
+  char scan_err[256] = { 0 };
   int cancelled = 0;
 
   if(gc_cancel_requested(err, err_size)) return -1;
@@ -5306,7 +5975,7 @@ force_image_path_bounce_remount(const char *title_id,
   }
   if(!cancelled &&
      gc_sleep_cancelable_seconds(GC_MOUNT_SCAN_REQUEST_SECONDS,
-                                 err, err_size) != 0) {
+                                               err, err_size) != 0) {
     cancelled = 1;
   }
   if(rename(temp_path, original_path) != 0) {
@@ -5330,7 +5999,7 @@ force_image_path_bounce_remount(const char *title_id,
     return -1;
   }
   return wait_for_image_shadowmount(title_id, original_path, nested_type,
-                                    "Waiting for final remount",
+                                    "Waiting for final remount", keep_mounted,
                                     err, err_size);
 }
 
@@ -5342,7 +6011,7 @@ repair_force_path_bounce_remount(const char *title_id,
   if(!info) return 0;
   if(force_compressed_path_bounce_remount(title_id, original_path,
                                           info->nested_name,
-                                          info->nested_type,
+                                          info->nested_type, 0,
                                           err, err_size) != 0) {
     return -1;
   }
@@ -5355,7 +6024,7 @@ mount_switch_recovery_append(const char *op_id, const char *title_id,
                              const char *original_path,
                              const char *hidden_path,
                              const char *state) {
-  json_buf_t b = {0};
+  json_buf_t b = { 0 };
   int fd;
   int rc = -1;
 
@@ -5394,8 +6063,8 @@ mount_switch_restore_recovery_log(void) {
   int restored = 0;
   if(!f) return 0;
   while(fgets(line, sizeof(line), f)) {
-    char original_path[1024] = {0};
-    char hidden_path[1024] = {0};
+    char original_path[1024] = { 0 };
+    char hidden_path[1024] = { 0 };
     struct stat st;
     line[strcspn(line, "\r\n")] = 0;
     json_find_string_value(line, "originalPath", original_path,
@@ -5418,7 +6087,7 @@ mount_switch_restore_recovery_log(void) {
     }
     if(rename(hidden_path, original_path) != 0) {
       gc_log("mount switch recovery restore failed hidden=%s original=%s err=%s",
-             hidden_path, original_path, strerror(errno));
+        hidden_path, original_path, strerror(errno));
       continue;
     }
     restored++;
@@ -5427,7 +6096,7 @@ mount_switch_restore_recovery_log(void) {
   }
   fclose(f);
   if(restored > 0) {
-    char scan_err[256] = {0};
+    char scan_err[256] = { 0 };
     artifact_cache_invalidate();
     if(gc_shadowmount_request_scan(scan_err, sizeof(scan_err)) != 0) {
       gc_log("mount switch recovery scan request failed restored=%d err=%s",
@@ -5468,10 +6137,10 @@ static int
 mount_switch_source_can_be_hidden(const gc_game_t *game) {
   return game &&
       game->source_kind != GC_SOURCE_UNKNOWN &&
-      game->source_path[0] &&
-      !path_under_root(game->source_path, GC_SHADOW_IMAGE_BASE) &&
-      !path_is_system_app_path(game->source_path) &&
-      path_exists_for_source_kind(game->source_path, game->source_kind);
+         game->source_path[0] &&
+         !path_under_root(game->source_path, GC_SHADOW_IMAGE_BASE) &&
+         !path_is_system_app_path(game->source_path) &&
+         path_exists_for_source_kind(game->source_path, game->source_kind);
 }
 
 static int
@@ -5679,10 +6348,10 @@ mount_switch_restore_hidden(gc_operation_t *op, gc_hidden_instance_t *hidden,
 static int
 prepare_shadowmount_for_selected_source(const gc_game_t *game,
                                         char *err, size_t err_size) {
-  char hint_err[256] = {0};
+  char hint_err[256] = { 0 };
   if(!game) return -1;
   if(game->source_kind == GC_SOURCE_COMPRESSED) {
-    pfs_decompress_info_t dec = {0};
+    pfs_decompress_info_t dec = { 0 };
     if(pfs_decompress_detect_nested(game->source_path, &dec, err,
                                     err_size) != 0) {
       return -1;
@@ -5700,7 +6369,7 @@ prepare_shadowmount_for_selected_source(const gc_game_t *game,
     return 0;
   }
   if(game->source_kind == GC_SOURCE_IMAGE) {
-    pfs_app_info_t image = {0};
+    pfs_app_info_t image = { 0 };
     if(pfs_image_probe(game->source_path, &image, err, err_size) != 0) {
       return -1;
     }
@@ -5708,7 +6377,7 @@ prepare_shadowmount_for_selected_source(const gc_game_t *game,
                                                     game->source_path,
                                                     image.nested_type,
                                                     hint_err,
-                                                    sizeof(hint_err)) != 0) {
+         sizeof(hint_err)) != 0) {
       gc_log("mount switch image hint failed title=%s path=%s err=%s",
              game->title_id, game->source_path,
              hint_err[0] ? hint_err : "unknown");
@@ -6034,7 +6703,7 @@ move_remount_expectations(const gc_game_t *game, const char *target_path,
     return 0;
   }
   if(game->source_kind == GC_SOURCE_COMPRESSED) {
-    pfs_decompress_info_t dec = {0};
+    pfs_decompress_info_t dec = { 0 };
     if(pfs_decompress_detect_nested(target_path, &dec, err, err_size) != 0) {
       return -1;
     }
@@ -6046,7 +6715,7 @@ move_remount_expectations(const gc_game_t *game, const char *target_path,
                                             expected_mount_size);
   }
   if(game->source_kind == GC_SOURCE_IMAGE) {
-    pfs_app_info_t image = {0};
+    pfs_app_info_t image = { 0 };
     if(pfs_image_probe(target_path, &image, err, err_size) != 0) {
       return -1;
     }
@@ -6105,10 +6774,15 @@ write_title_link_file(const char *path, const char *value,
 
 static int
 mount_switch_clear_stale_links(const char *title_id,
-                               const char *expected_mount,
-                               const char *expected_image,
-                               gc_mount_link_backup_t *backup,
-                               char *err, size_t err_size) {
+                                const char *expected_mount,
+                                const char *expected_image,
+                                gc_mount_link_backup_t *backup,
+                                char *err, size_t err_size) {
+  if(gc_shadowmount_api_available()) {
+    return mount_switch_clear_stale_links_sm(title_id, expected_mount,
+                                             expected_image, backup,
+                                             err, err_size);
+  }
   int mount_matches;
   int image_matches;
 
@@ -6127,11 +6801,11 @@ mount_switch_clear_stale_links(const char *title_id,
                             backup->image_link_path,
                             sizeof(backup->image_link_path));
   backup->had_mount =
-      read_link_file(backup->mount_link_path, backup->mount_value,
-                     sizeof(backup->mount_value)) == 0;
+    read_link_file(backup->mount_link_path, backup->mount_value,
+                   sizeof(backup->mount_value)) == 0;
   backup->had_image =
-      read_link_file(backup->image_link_path, backup->image_value,
-                     sizeof(backup->image_value)) == 0;
+    read_link_file(backup->image_link_path, backup->image_value,
+                   sizeof(backup->image_value)) == 0;
 
   if(!backup->had_mount) return 0;
 
@@ -6252,8 +6926,8 @@ init_compressed_output_game_for_mount(const gc_operation_t *op,
                                       const gc_game_t *source_game,
                                       const pfs_app_info_t *info,
                                       gc_game_t *out) {
-  pfs_decompress_info_t dec = {0};
-  char err[256] = {0};
+  pfs_decompress_info_t dec = { 0 };
+  char err[256] = { 0 };
   if(!out) return;
   memset(out, 0, sizeof(*out));
   snprintf(out->title_id, sizeof(out->title_id), "%s",
@@ -6337,9 +7011,9 @@ mount_selected_instance_hidden_exclusive(gc_operation_t *op,
                                          size_t *hidden_count,
                                          int *mount_missed,
                                          char *err, size_t err_size) {
-  char expected_mount[1024] = {0};
-  char expected_image[1024] = {0};
-  char scan_err[256] = {0};
+  char expected_mount[1024] = { 0 };
+  char expected_image[1024] = { 0 };
+  char scan_err[256] = { 0 };
   gc_mount_link_backup_t link_backup;
 
   memset(&link_backup, 0, sizeof(link_backup));
@@ -6422,8 +7096,8 @@ static int
 update_ampr_remount_source(gc_operation_t *op, const gc_game_t *game,
                            char *expected_mount, size_t expected_mount_size,
                            char *err, size_t err_size) {
-  char expected_image[1024] = {0};
-  char scan_err[256] = {0};
+  char expected_image[1024] = { 0 };
+  char scan_err[256] = { 0 };
   gc_mount_link_backup_t link_backup;
 
   if(!op || !game || !game->source_path[0]) {
@@ -6456,7 +7130,7 @@ update_ampr_remount_source(gc_operation_t *op, const gc_game_t *game,
   }
 
   if(game->source_kind == GC_SOURCE_COMPRESSED) {
-    pfs_decompress_info_t dec = {0};
+    pfs_decompress_info_t dec = { 0 };
     if(pfs_decompress_detect_nested(game->source_path, &dec,
                                     err, err_size) != 0) {
       (void)mount_switch_restore_cleared_links(&link_backup, scan_err,
@@ -6464,7 +7138,7 @@ update_ampr_remount_source(gc_operation_t *op, const gc_game_t *game,
       return -1;
     }
     if(force_compressed_path_bounce_remount(op->title_id, game->source_path,
-                                            dec.nested_name, dec.nested_type,
+                                            dec.nested_name, dec.nested_type, 1,
                                             err, err_size) != 0) {
       (void)mount_switch_restore_cleared_links(&link_backup, scan_err,
                                                sizeof(scan_err));
@@ -6472,7 +7146,7 @@ update_ampr_remount_source(gc_operation_t *op, const gc_game_t *game,
     }
   } else if(game->source_kind == GC_SOURCE_IMAGE) {
     if(force_image_path_bounce_remount(op->title_id, game->source_path,
-                                       game->nested_type,
+                                       game->nested_type, 1,
                                        err, err_size) != 0) {
       (void)mount_switch_restore_cleared_links(&link_backup, scan_err,
                                                sizeof(scan_err));
@@ -6524,8 +7198,8 @@ update_ampr_verify_mounted_hash(const char *title_id,
   if(!sha256_hex_valid(mounted_sha) ||
      strcasecmp(mounted_sha, expected_sha) != 0) {
     snprintf(err, err_size,
-             "mounted AMPR hash mismatch after hot-swap: expected %.64s got %.64s",
-             expected_sha, mounted_sha[0] ? mounted_sha : "(unreadable)");
+      "mounted AMPR hash mismatch after hot-swap: expected %.64s got %.64s",
+      expected_sha, mounted_sha[0] ? mounted_sha : "(unreadable)");
     return -1;
   }
   gc_log("update-ampr mounted verify title=%s path=%s sha=%s",
@@ -6574,7 +7248,7 @@ mount_switch_restore_after_operation_ex(gc_operation_t *op,
                                         size_t hidden_count,
                                         int request_scan,
                                         char *err, size_t err_size) {
-  char scan_err[256] = {0};
+  char scan_err[256] = { 0 };
   if(hidden_count > 0) {
     append_operation_phase(op, "restoring");
     job_set_phase("restoring", 0, 0, "Restoring other instances");
@@ -6587,7 +7261,7 @@ mount_switch_restore_after_operation_ex(gc_operation_t *op,
   artifact_cache_invalidate();
   if(!request_scan) {
     gc_log("mount switch post-restore scan skipped after selected mount title=%s",
-           op ? op->title_id : "");
+      op ? op->title_id : "");
     return 0;
   }
   if(job_cancelled()) {
@@ -6656,7 +7330,7 @@ static int
 compress_delete_source_after_success(gc_operation_t *op, const gc_game_t *game,
                                      gc_hidden_instance_t *hidden,
                                      size_t hidden_count) {
-  char delete_err[256] = {0};
+  char delete_err[256] = { 0 };
   gc_checkpoint("compress delete source");
   job_set_current("Deleting original source");
   if(mount_switch_delete_hidden_source(op, hidden, hidden_count,
@@ -6664,7 +7338,7 @@ compress_delete_source_after_success(gc_operation_t *op, const gc_game_t *game,
                                        game->source_kind,
                                        delete_err,
                                        sizeof(delete_err)) != 0) {
-    char restore_err[256] = {0};
+    char restore_err[256] = { 0 };
     snprintf(op->error, sizeof(op->error), "%s", delete_err);
     gc_log("compress delete source failed title=%s err=%s", op->title_id,
            op->error);
@@ -6684,7 +7358,7 @@ compress_restore_duplicates_after_success(gc_operation_t *op,
                                           gc_hidden_instance_t *hidden,
                                           size_t hidden_count,
                                           int request_scan) {
-  char restore_err[256] = {0};
+  char restore_err[256] = { 0 };
   if(mount_switch_restore_after_operation_ex(op, hidden, hidden_count,
                                              request_scan, restore_err,
                                              sizeof(restore_err)) != 0) {
@@ -6763,7 +7437,7 @@ preserve_original_source_after_success(gc_operation_t *op,
          op->title_id, game->source_path, hidden_path, rename_from);
   append_operation_phase(op, "source-preserved");
 
-  char scan_err[256] = {0};
+  char scan_err[256] = { 0 };
   if(job_cancelled()) {
     gc_log("preserve original scan skipped after cancel title=%s",
            op->title_id);
@@ -6798,13 +7472,13 @@ static void operation_append_error_detail(gc_operation_t *op,
 
 static int
 run_move_op(gc_operation_t *op) {
-  gc_game_t game = {0};
-  gc_game_t moved_game = {0};
+  gc_game_t game = { 0 };
+  gc_game_t moved_game = { 0 };
   gc_hidden_instance_t hidden[GC_MAX_GAMES];
-  char err[256] = {0};
-  char restore_err[256] = {0};
-  char target_path[1024] = {0};
-  char temp_path[1024] = {0};
+  char err[256] = { 0 };
+  char restore_err[256] = { 0 };
+  char target_path[1024] = { 0 };
+  char temp_path[1024] = { 0 };
   struct stat st;
   uint64_t copied = 0;
   uint64_t free_bytes = 0;
@@ -6834,7 +7508,7 @@ run_move_op(gc_operation_t *op) {
     append_operation_phase(op, "measuring");
     job_set_phase("measuring", 0, 0, "Measuring selected source");
     game.source_size = source_size_bytes_exact_ex(
-        game.source_path, game.source_kind, 1, &cancelled);
+      game.source_path, game.source_kind, 1, &cancelled);
     if(cancelled) {
       snprintf(op->error, sizeof(op->error), "%s", "cancelled");
       return -1;
@@ -6889,8 +7563,8 @@ run_move_op(gc_operation_t *op) {
   if(space_for_path(op->target_root, &free_bytes, NULL) != 0 ||
      free_bytes < game.source_size) {
     uint64_t need = free_bytes < game.source_size
-        ? game.source_size - free_bytes
-        : game.source_size;
+                      ? game.source_size - free_bytes
+                      : game.source_size;
     snprintf(op->error, sizeof(op->error),
              "not enough free storage; free %llu more bytes",
              (unsigned long long)need);
@@ -6909,7 +7583,7 @@ run_move_op(gc_operation_t *op) {
     return -1;
   }
   remove_tree_gc(temp_path);
-  char legacy_temp_path[1024] = {0};
+  char legacy_temp_path[1024] = { 0 };
   if(legacy_suffix_temp_path(target_path, copy_only ? "copying" : "moving",
                              legacy_temp_path,
                              sizeof(legacy_temp_path)) == 0) {
@@ -6949,9 +7623,9 @@ run_move_op(gc_operation_t *op) {
   }
   if(copy_only && game.source_kind == GC_SOURCE_COMPRESSED) {
     (void)write_validation_marker_ex(
-        op->title_id, target_path, NULL, "compression-stats",
-        game.compression_source_size, game.apr_indexed,
-        game.ampr_hot_swap_optimized);
+      op->title_id, target_path, NULL, "compression-stats",
+      game.compression_source_size, game.apr_indexed,
+      game.ampr_hot_swap_optimized);
   }
 
   if(copy_only) {
@@ -7044,12 +7718,12 @@ run_move_op(gc_operation_t *op) {
 
 static int
 run_compress_op(gc_operation_t *op) {
-  gc_game_t game = {0};
-  char err[256] = {0};
-  pfs_app_info_t info = {0};
+  gc_game_t game = { 0 };
+  char err[256] = { 0 };
+  pfs_app_info_t info = { 0 };
   pfs_compress_plan_t *compress_plan = NULL;
-  pfs_repair_info_t repair = {0};
-  gc_game_t compressed_game = {0};
+  pfs_repair_info_t repair = { 0 };
+  gc_game_t compressed_game = { 0 };
   gc_hidden_instance_t hidden[GC_MAX_GAMES];
   size_t hidden_count = 0;
   int make_image = op->action == GC_ACTION_MAKE_IMAGE;
@@ -7080,13 +7754,13 @@ run_compress_op(gc_operation_t *op) {
     op->stream_budget_bytes = stream_budget_bytes;
   }
   int compressed_output_committed = 0;
-  char planned_nested_name[256] = {0};
+  char planned_nested_name[256] = { 0 };
   int planned_nested_type = PFS_NESTED_UNKNOWN;
-  char compress_output_path[1024] = {0};
-  char compress_write_path[1024] = {0};
-  char staged_compress_path[1024] = {0};
-  char output_parent[1024] = {0};
-  char space_probe_path[1024] = {0};
+  char compress_output_path[1024] = { 0 };
+  char compress_write_path[1024] = { 0 };
+  char staged_compress_path[1024] = { 0 };
+  char output_parent[1024] = { 0 };
+  char space_probe_path[1024] = { 0 };
   uint64_t target_free_bytes = 0;
   uint64_t stage_free_bytes = 0;
   int moving_to_target = 0;
@@ -7095,8 +7769,8 @@ run_compress_op(gc_operation_t *op) {
   struct stat st;
 
 #define COMPRESS_FAIL_RETURN() do { \
-    pfs_compress_plan_free(compress_plan); \
-    return -1; \
+    pfs_compress_plan_free(compress_plan);                                     \
+    return -1;                                                                 \
   } while(0)
 
   gc_checkpoint(make_image ? "make-image find game" : "compress find game");
@@ -7215,8 +7889,8 @@ run_compress_op(gc_operation_t *op) {
           &compress_plan, &info, err, sizeof(err));
     } else {
       prepare_rc = pfs_compress_prepare_source_to_ffpfsc_opts_output_ex(
-          game.source_path, 0, format, pfs_delete_policy, raw_only,
-          moving_to_target ? compress_write_path : NULL,
+        game.source_path, 0, format, pfs_delete_policy, raw_only,
+        moving_to_target ? compress_write_path : NULL,
           stream_delete ? &stream_opts : NULL,
           &compress_plan, &info, err, sizeof(err));
     }
@@ -7238,8 +7912,8 @@ run_compress_op(gc_operation_t *op) {
     game.size_pending = 0;
     gc_size_cache_store(game.source_path, info.scan_bytes);
     gc_log("compress scan title=%s storage=%s workers=%llu bytes=%llu files=%llu dirs=%llu entries=%llu elapsedMs=%llu path=%s",
-           op->title_id, storage_name_for_path(game.source_path),
-           (unsigned long long)info.scan_workers,
+      op->title_id, storage_name_for_path(game.source_path),
+      (unsigned long long)info.scan_workers,
            (unsigned long long)info.scan_bytes,
            (unsigned long long)info.scan_files,
            (unsigned long long)info.scan_dirs,
@@ -7266,7 +7940,7 @@ run_compress_op(gc_operation_t *op) {
     }
     if(!path_is_shadowmount_game_root(output_parent)) {
       snprintf(op->error, sizeof(op->error), "%s",
-               "compression target folder is not a ShadowMountPlus game folder");
+        "compression target folder is not a ShadowMountPlus game folder");
       gc_log("compress target folder rejected title=%s output=%s parent=%s",
              op->title_id, compress_output_path, output_parent);
       COMPRESS_FAIL_RETURN();
@@ -7341,20 +8015,20 @@ run_compress_op(gc_operation_t *op) {
       if(skip_space_check) {
         target_free_bytes = game.required_bytes;
         gc_log("compress target free probe bypassed title=%s targetRoot=%s err=%s",
-               op->title_id, op->target_root, strerror(saved_errno));
+          op->title_id, op->target_root, strerror(saved_errno));
       } else {
         snprintf(op->error, sizeof(op->error),
                  "could not check free storage on selected target storage: %s",
                  strerror(saved_errno));
         gc_log("compress target free probe failed title=%s targetRoot=%s err=%s",
-               op->title_id, op->target_root, strerror(saved_errno));
+          op->title_id, op->target_root, strerror(saved_errno));
         COMPRESS_FAIL_RETURN();
       }
     }
     if(target_free_bytes < game.required_bytes) {
       uint64_t need = target_free_bytes < game.required_bytes
-          ? game.required_bytes - target_free_bytes
-          : game.required_bytes;
+                        ? game.required_bytes - target_free_bytes
+                        : game.required_bytes;
       snprintf(op->error, sizeof(op->error),
                "not enough free storage on selected target storage; free %llu more bytes",
                (unsigned long long)need);
@@ -7372,8 +8046,8 @@ run_compress_op(gc_operation_t *op) {
                op->title_id, staged_compress_path, strerror(saved_errno));
       } else {
         snprintf(op->error, sizeof(op->error),
-                 "could not check internal staging space for USB compression: %s",
-                 strerror(saved_errno));
+          "could not check internal staging space for USB compression: %s",
+          strerror(saved_errno));
         gc_log("compress staging free probe failed title=%s stage=%s err=%s",
                op->title_id, staged_compress_path, strerror(saved_errno));
         COMPRESS_FAIL_RETURN();
@@ -7381,8 +8055,8 @@ run_compress_op(gc_operation_t *op) {
     }
     if(stage_usb_target && stage_free_bytes < game.required_bytes) {
       uint64_t need = stage_free_bytes < game.required_bytes
-          ? game.required_bytes - stage_free_bytes
-          : game.required_bytes;
+                        ? game.required_bytes - stage_free_bytes
+                        : game.required_bytes;
       snprintf(op->error, sizeof(op->error),
                "not enough internal staging space for USB compression; free %llu more bytes",
                (unsigned long long)need);
@@ -7462,7 +8136,7 @@ run_compress_op(gc_operation_t *op) {
   if(compress_plan) {
     compress_rc = make_image
         ? pfs_make_image_execute_prepared(compress_plan, &info, err, sizeof(err))
-        : pfs_compress_execute_prepared_to_ffpfsc(
+                             : pfs_compress_execute_prepared_to_ffpfsc(
             compress_plan, PFS_COMPRESS_DEFAULT_WORKERS, &info, err, sizeof(err));
     pfs_compress_plan_free(compress_plan);
     compress_plan = NULL;
@@ -7470,7 +8144,7 @@ run_compress_op(gc_operation_t *op) {
     compress_rc = pfs_compress_source_to_ffpfsc_opts_output_ex(
         game.source_path, 0, PFS_COMPRESS_DEFAULT_WORKERS,
         format, pfs_delete_policy, raw_only,
-        moving_to_target ? compress_write_path : NULL,
+      moving_to_target ? compress_write_path : NULL,
         stream_delete ? &stream_opts : NULL,
         &info, err, sizeof(err));
   }
@@ -7508,7 +8182,7 @@ run_compress_op(gc_operation_t *op) {
     operation_store_compression_stats(op, game.source_size, info.output_path);
   }
   gc_log("%s wrote title=%s output=%s nested=%s nestedSize=%llu storedSize=%llu",
-         op_log, op->title_id, info.output_path, info.nested_name,
+    op_log, op->title_id, info.output_path, info.nested_name,
          (unsigned long long)info.nested_size,
          (unsigned long long)info.stored_size);
   compressed_output_committed = 1;
@@ -7518,9 +8192,9 @@ run_compress_op(gc_operation_t *op) {
     gc_checkpoint("make-image mount output");
     err[0] = 0;
     if(mount_selected_instance_hidden_exclusive(
-           op, &compressed_game, hidden, GC_MAX_GAMES, &hidden_count,
-           &mount_missed, err, sizeof(err)) != 0) {
-      char restore_err[256] = {0};
+         op, &compressed_game, hidden, GC_MAX_GAMES, &hidden_count,
+         &mount_missed, err, sizeof(err)) != 0) {
+      char restore_err[256] = { 0 };
       if(hidden_count > 0 &&
          mount_switch_restore_after_operation(op, hidden, hidden_count,
                                               restore_err,
@@ -7535,7 +8209,7 @@ run_compress_op(gc_operation_t *op) {
       COMPRESS_FAIL_RETURN();
     }
     if(mount_missed) {
-      char restore_err[256] = {0};
+      char restore_err[256] = { 0 };
       if(mount_switch_restore_after_operation(op, hidden, hidden_count,
                                               restore_err,
                                               sizeof(restore_err)) != 0) {
@@ -7554,13 +8228,13 @@ run_compress_op(gc_operation_t *op) {
         COMPRESS_FAIL_RETURN();
       }
     } else if(preserve_hide) {
-      char preserve_err[256] = {0};
+      char preserve_err[256] = { 0 };
       gc_checkpoint("make-image preserve original");
       job_set_current("Preserving original source");
       if(preserve_original_source_after_success(op, &game, hidden, hidden_count,
                                                 preserve_err,
                                                 sizeof(preserve_err)) != 0) {
-        char restore_err[256] = {0};
+        char restore_err[256] = { 0 };
         snprintf(op->error, sizeof(op->error), "%s",
                  preserve_err[0] ? preserve_err :
                  "could not preserve original source");
@@ -7592,7 +8266,7 @@ run_compress_op(gc_operation_t *op) {
   if(mount_selected_instance_hidden_exclusive(
          op, &compressed_game, hidden, GC_MAX_GAMES, &hidden_count,
          &mount_missed, err, sizeof(err)) != 0) {
-    char restore_err[256] = {0};
+    char restore_err[256] = { 0 };
     if(hidden_count > 0 &&
        mount_switch_restore_after_operation(op, hidden, hidden_count,
                                             restore_err,
@@ -7610,14 +8284,14 @@ run_compress_op(gc_operation_t *op) {
     COMPRESS_FAIL_RETURN();
   }
   if(mount_missed) {
-    char restore_err[256] = {0};
-    char remount_err[256] = {0};
+    char restore_err[256] = { 0 };
+    char remount_err[256] = { 0 };
     gc_log("compress mount missed title=%s output=%s detail=%s; retrying bounce remount",
            op->title_id, info.output_path, err[0] ? err : "");
     if(force_compressed_path_bounce_remount(
-           op->title_id, info.output_path, compressed_game.nested_name,
-           compressed_game.nested_type, remount_err,
-           sizeof(remount_err)) != 0) {
+         op->title_id, info.output_path, compressed_game.nested_name,
+         compressed_game.nested_type, 0, remount_err,
+         sizeof(remount_err)) != 0) {
       if(mount_switch_restore_after_operation(op, hidden, hidden_count,
                                               restore_err,
                                               sizeof(restore_err)) != 0) {
@@ -7645,7 +8319,7 @@ run_compress_op(gc_operation_t *op) {
   append_operation_phase(op, "repairing");
   if(repair_with_wait(op->title_id, info.output_path, &repair, err,
                       sizeof(err)) != 0) {
-    char restore_err[256] = {0};
+    char restore_err[256] = { 0 };
     op->bad_blocks_found = repair.repaired_blocks;
     op->repaired_blocks = 0;
     operation_store_repair_counters(op, &repair);
@@ -7688,10 +8362,19 @@ run_compress_op(gc_operation_t *op) {
                                        op->result, game.source_size,
                                        op->apr_indexed,
                                        op->ampr_hot_swap_optimized);
+      /*
+       * The source changed even though the remount was skipped, so drop
+       * the icon + AMPR caches so the next refresh re-probes AMPR for
+       * the new image instead of showing stale/empty fields.
+       */
+      artifact_cache_invalidate();
+      gc_icon_cache_drop(op->title_id);
+      gc_ampr_cache_drop(game.source_path);
+      gc_ampr_cache_drop(info.output_path);
       return 0;
     }
     {
-      char restore_err[256] = {0};
+      char restore_err[256] = { 0 };
       if(mount_switch_restore_after_operation(op, hidden, hidden_count,
                                               restore_err,
                                               sizeof(restore_err)) != 0) {
@@ -7720,13 +8403,13 @@ run_compress_op(gc_operation_t *op) {
     snprintf(final_result, sizeof(final_result), "%s",
              repair.repaired_blocks > 0 ? "repaired" : "success");
   } else if(preserve_hide) {
-    char preserve_err[256] = {0};
+    char preserve_err[256] = { 0 };
     gc_checkpoint("compress preserve original");
     job_set_current("Preserving original source");
     if(preserve_original_source_after_success(op, &game, hidden, hidden_count,
                                               preserve_err,
                                               sizeof(preserve_err)) != 0) {
-      char restore_err[256] = {0};
+      char restore_err[256] = { 0 };
       snprintf(op->error, sizeof(op->error), "%s",
                preserve_err[0] ? preserve_err :
                "could not preserve original source");
@@ -7744,11 +8427,24 @@ run_compress_op(gc_operation_t *op) {
   }
   snprintf(op->result, sizeof(op->result), "%s", final_result);
   uint64_t final_compressed_size =
-      source_size_bytes_exact(info.output_path, GC_SOURCE_COMPRESSED);
+    source_size_bytes_exact(info.output_path, GC_SOURCE_COMPRESSED);
   operation_store_compression_stats(op, game.source_size, info.output_path);
   uint64_t saved_bytes = game.source_size > final_compressed_size
-      ? game.source_size - final_compressed_size
-      : 0;
+                           ? game.source_size - final_compressed_size
+                           : 0;
+  /*
+   * Compression replaced this title's source (folder/old image -> new
+   * .ffpfsc).  The in-memory icon cache is keyed by title_id, so without
+   * dropping it gc_shadowmount_ampr_mount_game_sm would skip the AMPR
+   * probe on the next refresh (icon already cached) and the ampr cache
+   * lookup for the new source path would miss, leaving ampr_present
+   * stale until an app restart.  Drop the icon + AMPR caches for this
+   * title so the next refresh re-probes the new image.
+   */
+  artifact_cache_invalidate();
+  gc_icon_cache_drop(op->title_id);
+  gc_ampr_cache_drop(game.source_path);
+  gc_ampr_cache_drop(info.output_path);
   gc_log("compress complete title=%s result=%s repaired=%llu saved=%llu",
          op->title_id, op->result,
          (unsigned long long)op->repaired_blocks,
@@ -7759,15 +8455,15 @@ run_compress_op(gc_operation_t *op) {
 
 static int
 run_extract_image_op(gc_operation_t *op) {
-  gc_game_t game = {0};
-  gc_game_t output_game = {0};
+  gc_game_t game = { 0 };
+  gc_game_t output_game = { 0 };
   gc_hidden_instance_t hidden[GC_MAX_GAMES];
-  char err[256] = {0};
-  char restore_err[256] = {0};
-  char target_path[1024] = {0};
-  char temp_path[1024] = {0};
+  char err[256] = { 0 };
+  char restore_err[256] = { 0 };
+  char target_path[1024] = { 0 };
+  char temp_path[1024] = { 0 };
   struct stat st;
-  pfs_app_info_t output_probe = {0};
+  pfs_app_info_t output_probe = { 0 };
   uint64_t free_bytes = 0;
   uint64_t copied = 0;
   size_t hidden_count = 0;
@@ -7820,8 +8516,8 @@ run_extract_image_op(gc_operation_t *op) {
   if(free_bytes_for_output(target_path, &free_bytes) != 0 ||
      free_bytes < game.source_size) {
     uint64_t need = free_bytes < game.source_size
-        ? game.source_size - free_bytes
-        : game.source_size;
+                      ? game.source_size - free_bytes
+                      : game.source_size;
     snprintf(op->error, sizeof(op->error),
              "not enough free storage; free %llu more bytes",
              (unsigned long long)need);
@@ -7895,8 +8591,8 @@ run_extract_image_op(gc_operation_t *op) {
   gc_checkpoint("extract mount output");
   err[0] = 0;
   if(mount_selected_instance_hidden_exclusive(
-         op, &output_game, hidden, GC_MAX_GAMES, &hidden_count, &mount_missed,
-         err, sizeof(err)) != 0) {
+       op, &output_game, hidden, GC_MAX_GAMES, &hidden_count, &mount_missed,
+       err, sizeof(err)) != 0) {
     if(mount_switch_restore_after_operation(op, hidden, hidden_count,
                                             restore_err,
                                             sizeof(restore_err)) != 0) {
@@ -7947,14 +8643,14 @@ static void operation_append_error_detail(gc_operation_t *op,
 
 static int
 run_uncompress_op(gc_operation_t *op) {
-  gc_game_t game = {0};
-  gc_game_t output_game = {0};
+  gc_game_t game = { 0 };
+  gc_game_t output_game = { 0 };
   gc_hidden_instance_t hidden[GC_MAX_GAMES];
-  char err[256] = {0};
-  char restore_err[256] = {0};
-  pfs_decompress_info_t info = {0};
-  gc_source_quarantine_t source_quarantine = {0};
-  char target_path[1024] = {0};
+  char err[256] = { 0 };
+  char restore_err[256] = { 0 };
+  pfs_decompress_info_t info = { 0 };
+  gc_source_quarantine_t source_quarantine = { 0 };
+  char target_path[1024] = { 0 };
   int as_image = !strcmp(op->format, "image");
   int delete_after = !strcmp(op->delete_policy, "after");
   int pfs_delete_policy = PFS_DELETE_KEEP;
@@ -8070,8 +8766,8 @@ run_uncompress_op(gc_operation_t *op) {
          op->title_id, info.output_path, info.nested_name,
          as_image ? "image" : "app");
   struct stat output_st;
-  pfs_app_info_t output_probe = {0};
-  char hint_err[256] = {0};
+  pfs_app_info_t output_probe = { 0 };
+  char hint_err[256] = { 0 };
   err[0] = 0;
   if(as_image) {
     if(stat(info.output_path, &output_st) != 0 ||
@@ -8148,8 +8844,8 @@ run_uncompress_op(gc_operation_t *op) {
   gc_checkpoint("uncompress mount output");
   err[0] = 0;
   if(mount_selected_instance_hidden_exclusive(
-         op, &output_game, hidden, GC_MAX_GAMES, &hidden_count, &mount_missed,
-         err, sizeof(err)) != 0) {
+       op, &output_game, hidden, GC_MAX_GAMES, &hidden_count, &mount_missed,
+       err, sizeof(err)) != 0) {
     if(mount_switch_restore_after_operation(op, hidden, hidden_count,
                                             restore_err,
                                             sizeof(restore_err)) != 0) {
@@ -8172,12 +8868,12 @@ run_uncompress_op(gc_operation_t *op) {
       snprintf(op->error, sizeof(op->error), "%s",
                restore_err[0] ? restore_err :
                "could not restore duplicate instances");
-	    gc_log("uncompress mount-missed restore failed title=%s err=%s",
-	           op->title_id, op->error);
-	    return -1;
-	  }
+      gc_log("uncompress mount-missed restore failed title=%s err=%s",
+             op->title_id, op->error);
+      return -1;
+    }
     return uncompress_complete_not_mounted(
-        op, &source_quarantine, &info, as_image,
+      op, &source_quarantine, &info, as_image,
         err[0] ? err : "ShadowMountPlus did not mount uncompressed output",
         err, sizeof(err));
   }
@@ -8205,19 +8901,21 @@ run_uncompress_op(gc_operation_t *op) {
 
 static int
 run_validate_repair_op(gc_operation_t *op) {
-  gc_game_t game = {0};
+  gc_game_t game = { 0 };
   gc_hidden_instance_t hidden[GC_MAX_GAMES];
-  char err[256] = {0};
-  char restore_err[256] = {0};
-  pfs_repair_info_t repair = {0};
+  char err[256] = { 0 };
+  char restore_err[256] = { 0 };
+  pfs_repair_info_t repair = { 0 };
   const char *repair_path = NULL;
-  char final_result[32] = {0};
+  char final_result[32] = { 0 };
   uint64_t source_size = 0;
   uint64_t free_bytes = 0;
   uint64_t outer_fixed_bytes = 0;
   size_t hidden_count = 0;
   int slack_rc = 0;
   int mount_missed = 0;
+
+  if(gc_shadowmount_api_available()) return run_validate_repair_op_sm(op);
 
   memset(hidden, 0, sizeof(hidden));
   gc_checkpoint("validate find game");
@@ -8379,13 +9077,13 @@ run_validate_repair_op(gc_operation_t *op) {
 
 static int
 run_validate_only_op(gc_operation_t *op) {
-  gc_game_t game = {0};
+  gc_game_t game = { 0 };
   gc_hidden_instance_t hidden[GC_MAX_GAMES];
-  char err[256] = {0};
-  char restore_err[256] = {0};
-  pfs_repair_info_t repair = {0};
+  char err[256] = { 0 };
+  char restore_err[256] = { 0 };
+  pfs_repair_info_t repair = { 0 };
   const char *repair_path = NULL;
-  char final_result[32] = {0};
+  char final_result[32] = { 0 };
   uint64_t source_size = 0;
   uint64_t free_bytes = 0;
   size_t hidden_count = 0;
@@ -8421,10 +9119,10 @@ run_validate_only_op(gc_operation_t *op) {
   append_operation_phase(op, "validating");
   job_set_phase("validating", 0, 0, "Preparing validation");
   gc_log("validate-only source title=%s path=%s size=%llu free=%llu validation=%s",
-         op->title_id, repair_path ? repair_path : "",
+    op->title_id, repair_path ? repair_path : "",
          (unsigned long long)source_size,
          (unsigned long long)free_bytes,
-         game.validation_status);
+    game.validation_status);
   if(mount_selected_instance_hidden_exclusive(
          op, &game, hidden, GC_MAX_GAMES, &hidden_count, &mount_missed,
          err, sizeof(err)) != 0) {
@@ -8483,17 +9181,17 @@ run_validate_only_op(gc_operation_t *op) {
   operation_store_repair_counters(op, &repair);
   snprintf(op->repair_summary, sizeof(op->repair_summary), "%s",
            repair.outdir);
-	  snprintf(final_result, sizeof(final_result), "%s",
-	           scan_rc == PFS_REPAIR_SCAN_REPAIR_NEEDED ||
+  snprintf(final_result, sizeof(final_result), "%s",
+           scan_rc == PFS_REPAIR_SCAN_REPAIR_NEEDED ||
 	               repair.repaired_blocks > 0 ? "bad-blocks-found" : "clean");
-	  snprintf(op->result, sizeof(op->result), "%s", final_result);
-	  if(repair.repaired_blocks > 0) {
-	    delete_validation_marker_for_path(op->title_id, repair_path);
-	  }
+  snprintf(op->result, sizeof(op->result), "%s", final_result);
+  if(repair.repaired_blocks > 0) {
+    delete_validation_marker_for_path(op->title_id, repair_path);
+  }
   gc_checkpoint("validate-only force remount");
   if(force_compressed_path_bounce_remount(op->title_id, repair_path,
                                           repair.nested_name,
-                                          repair.nested_type,
+                                          repair.nested_type, 0,
                                           err, sizeof(err)) != 0) {
     if(shadowmount_mount_missed(err)) {
       if(repair.repaired_blocks == 0) {
@@ -8501,14 +9199,14 @@ run_validate_only_op(gc_operation_t *op) {
         (void)write_validation_marker_ex(op->title_id, repair_path, &repair,
                                          op->result, 0, 0, 0);
       } else {
-	        snprintf(op->result, sizeof(op->result), "%s",
-	                 "bad-blocks-found-not-mounted");
-	        snprintf(final_result, sizeof(final_result), "%s", op->result);
-	        op->error[0] = 0;
-	        delete_validation_marker_for_path(op->title_id, repair_path);
+        snprintf(op->result, sizeof(op->result), "%s",
+                 "bad-blocks-found-not-mounted");
+        snprintf(final_result, sizeof(final_result), "%s", op->result);
+        op->error[0] = 0;
+        delete_validation_marker_for_path(op->title_id, repair_path);
 	        gc_log("validate-only complete but not mounted title=%s bad=%llu detail=%s",
-               op->title_id, (unsigned long long)op->bad_blocks_found,
-               err[0] ? err : "");
+          op->title_id, (unsigned long long)op->bad_blocks_found,
+          err[0] ? err : "");
       }
       if(mount_switch_restore_after_operation_ex(op, hidden, hidden_count, 0,
                                                  restore_err,
@@ -8539,9 +9237,9 @@ run_validate_only_op(gc_operation_t *op) {
   if(repair.repaired_blocks == 0) {
     (void)write_validation_marker_ex(op->title_id, repair_path, &repair,
                                      op->result, 0, 0, 0);
-	  } else {
-	    delete_validation_marker_for_path(op->title_id, repair_path);
-	  }
+  } else {
+    delete_validation_marker_for_path(op->title_id, repair_path);
+  }
   if(mount_switch_restore_after_operation_ex(op, hidden, hidden_count, 0,
                                              restore_err,
                                              sizeof(restore_err)) != 0) {
@@ -8576,7 +9274,7 @@ static void
 refresh_mount_restore_cleared_links_after_failure(gc_operation_t *op,
                                                   gc_mount_link_backup_t *backup,
                                                   char *restore_err,
-                                                  size_t restore_err_size) {
+  size_t restore_err_size) {
   restore_err[0] = 0;
   if(mount_switch_restore_cleared_links(backup, restore_err,
                                         restore_err_size) != 0) {
@@ -8604,18 +9302,20 @@ refresh_mount_request_restore_scan(gc_operation_t *op,
 
 static int
 run_refresh_mount_op(gc_operation_t *op) {
-  gc_game_t game = {0};
-  char err[256] = {0};
-  char restore_err[256] = {0};
-  char scan_err[256] = {0};
-  char expected_mount[1024] = {0};
-  char expected_image[1024] = {0};
+  gc_game_t game = { 0 };
+  char err[256] = { 0 };
+  char restore_err[256] = { 0 };
+  char scan_err[256] = { 0 };
+  char expected_mount[1024] = { 0 };
+  char expected_image[1024] = { 0 };
   gc_hidden_instance_t hidden[GC_MAX_GAMES];
   gc_mount_link_backup_t link_backup;
   size_t hidden_count = 0;
   int was_validated = 0;
   int mount_ready = 0;
   int mount_missed = 0;
+
+  if(gc_shadowmount_api_available()) return run_refresh_mount_op_sm(op);
 
   memset(&link_backup, 0, sizeof(link_backup));
   gc_checkpoint("refresh-mount find game");
@@ -8707,7 +9407,7 @@ run_refresh_mount_op(gc_operation_t *op) {
   append_operation_phase(op, "mounting");
   job_set_phase("mounting", 0, 0, "Mounting");
   if(gc_shadowmount_request_title_source_scan_cancelable(
-         game.title_id, game.source_path, scan_err, sizeof(scan_err)) != 0) {
+       game.title_id, game.source_path, scan_err, sizeof(scan_err)) != 0) {
     snprintf(op->error, sizeof(op->error), "%s",
              scan_err[0] ? scan_err : "could not request ShadowMount scan");
     gc_log("refresh-mount scan failed title=%s err=%s", op->title_id,
@@ -8722,7 +9422,7 @@ run_refresh_mount_op(gc_operation_t *op) {
   } else if(shadowmount_mount_missed(err)) {
     mount_missed = 1;
     gc_log("refresh-mount selected instance not mounted title=%s path=%s detail=%s",
-           op->title_id, game.source_path, err[0] ? err : "");
+      op->title_id, game.source_path, err[0] ? err : "");
   } else {
     snprintf(op->error, sizeof(op->error), "%s",
              err[0] ? err : "ShadowMountPlus mount failed");
@@ -8755,7 +9455,7 @@ run_refresh_mount_op(gc_operation_t *op) {
   scan_err[0] = 0;
   if(mount_ready) {
     gc_log("refresh-mount post-restore scan skipped after selected mount title=%s",
-           op->title_id);
+      op->title_id);
   } else if(job_cancelled()) {
     gc_log("refresh-mount post-restore scan skipped after cancel title=%s",
            op->title_id);
@@ -8773,6 +9473,7 @@ run_refresh_mount_op(gc_operation_t *op) {
                                        "validated", 0, 0,
                                        game.ampr_hot_swap_optimized);
     }
+    gc_games_cache_set_mounted(op->title_id, 1, "mounted");
     gc_log("refresh-mount complete title=%s path=%s", op->title_id,
            game.source_path);
     return 0;
@@ -8846,9 +9547,10 @@ read_speed_mount_root(const gc_game_t *game, char *out, size_t out_size,
 
 static int
 run_set_read_only_op(gc_operation_t *op) {
-  gc_game_t game = {0};
-  char err[256] = {0};
-  char scan_err[256] = {0};
+  if(gc_shadowmount_api_available()) return run_set_read_only_op_sm(op);
+  gc_game_t game = { 0 };
+  char err[256] = { 0 };
+  char scan_err[256] = { 0 };
   int already_present = 0;
 
   gc_checkpoint("set-read-only find game");
@@ -8892,7 +9594,7 @@ run_set_read_only_op(gc_operation_t *op) {
   append_operation_phase(op, "mounting");
   job_set_phase("mounting", 0, 0, "Requesting ShadowMount scan");
   if(gc_shadowmount_request_title_source_scan_cancelable(
-         game.title_id, game.source_path, scan_err, sizeof(scan_err)) != 0) {
+       game.title_id, game.source_path, scan_err, sizeof(scan_err)) != 0) {
     snprintf(op->error, sizeof(op->error), "%s",
              scan_err[0] ? scan_err : "could not request ShadowMount scan");
     gc_log("set-read-only scan failed title=%s err=%s",
@@ -8907,6 +9609,7 @@ run_set_read_only_op(gc_operation_t *op) {
 
 static int
 run_read_speed_test_op(gc_operation_t *op) {
+  if(gc_shadowmount_api_available()) return run_read_speed_test_op_sm(op);
   gc_game_t game = {0};
   gc_read_speed_ctx_t ctx;
   struct stat st;
@@ -9023,10 +9726,10 @@ run_read_speed_test_op(gc_operation_t *op) {
 
 static int
 run_delete_game_data_op(gc_operation_t *op) {
-  gc_game_t game = {0};
-  char err[256] = {0};
-  char scan_err[256] = {0};
-  char delete_path[1024] = {0};
+  gc_game_t game = { 0 };
+  char err[256] = { 0 };
+  char scan_err[256] = { 0 };
+  char delete_path[1024] = { 0 };
   const char *physical_delete_path = NULL;
 
   gc_checkpoint("delete find game");
@@ -9152,7 +9855,7 @@ static int
 ui_settings_theme_read(char *out, size_t out_size) {
   char *json = NULL;
   size_t json_size = 0;
-  char theme[16] = {0};
+  char theme[16] = { 0 };
   const char *normalized;
 
   if(!out || out_size == 0) return -1;
@@ -9173,7 +9876,7 @@ static int
 ui_settings_theme_write(const char *theme) {
   char tmp[1024];
   const char *normalized = ui_theme_normalize(theme);
-  json_buf_t b = {0};
+  json_buf_t b = { 0 };
   int fd;
   int n;
 
@@ -9217,8 +9920,8 @@ ui_settings_theme_write(const char *theme) {
 
 static int
 ui_settings_request(const http_request_t *req) {
-  char theme[16] = {0};
-  json_buf_t b = {0};
+  char theme[16] = { 0 };
+  json_buf_t b = { 0 };
 
   if(!strcmp(req->method, "POST")) {
     if(!websrv_get_query_arg(req, "theme", theme, sizeof(theme))) {
@@ -9247,9 +9950,78 @@ ui_settings_request(const http_request_t *req) {
 }
 
 static int
+ampr_pin_request(const http_request_t *req) {
+  char title_id[64];
+  char version[64];
+  if(!strcmp(req->method, "POST")) {
+    if(!websrv_get_query_arg(req, "titleId", title_id, sizeof(title_id)) ||
+       !valid_title_id(title_id)) {
+      return serve_error(req, 400, "bad title id");
+    }
+    version[0] = 0;
+    (void)websrv_get_query_arg(req, "version", version, sizeof(version));
+    if(version[0] && !ampr_version_safe(version)) {
+      return serve_error(req, 400, "bad version");
+    }
+    if(ampr_pin_version(title_id, version) != 0) {
+      return serve_error(req, 500, "pin failed");
+    }
+    artifact_cache_invalidate();
+    json_buf_t b = { 0 };
+    if(json_append(&b, "{\"ok\":true,\"pinned\":") != 0 ||
+       json_string(&b, version) != 0 || json_append(&b, "}") != 0) {
+      free(b.data);
+      return serve_error(req, 500, "out of memory");
+    }
+    return serve_owned(req, 200, b.data, b.len);
+  }
+  return serve_error(req, 405, "method not allowed");
+}
+
+static int
+ampr_custom_remove_request(const http_request_t *req) {
+  char version[64];
+  char dir[1024];
+  if(!websrv_get_query_arg(req, "version", version, sizeof(version)) ||
+     !ampr_version_safe(version)) {
+    return serve_error(req, 400, "bad version");
+  }
+  if(ampr_cache_dir_for_version(version, dir, sizeof(dir)) != 0) {
+    return serve_error(req, 400, "bad version path");
+  }
+  if(remove_tree_gc(dir) != 0) {
+    return serve_error(req, 500, "delete failed");
+  }
+  artifact_cache_invalidate();
+  json_buf_t b = { 0 };
+  if(json_append(&b, "{\"ok\":true}") != 0) {
+    free(b.data);
+    return serve_error(req, 500, "out of memory");
+  }
+  return serve_owned(req, 200, b.data, b.len);
+}
+
+static int ampr_versions_request(const http_request_t *req);
+static int ampr_custom_upload_request(const http_request_t *req);
+
+static int
+ampr_custom_request(const http_request_t *req) {
+  if(!strcmp(req->method, "GET")) {
+    return ampr_versions_request(req);
+  }
+  if(!strcmp(req->method, "POST")) {
+    return ampr_custom_upload_request(req);
+  }
+  if(!strcmp(req->method, "DELETE")) {
+    return ampr_custom_remove_request(req);
+  }
+  return serve_error(req, 405, "method not allowed");
+}
+
+static int
 ampr_versions_request(const http_request_t *req) {
   DIR *d = opendir(GC_AMPR_DIR);
-  json_buf_t b = {0};
+  json_buf_t b = { 0 };
   int first = 1;
   if(json_append(&b, "{\"ok\":true,\"versions\":[") != 0) {
     free(b.data);
@@ -9260,8 +10032,8 @@ ampr_versions_request(const http_request_t *req) {
     while((ent = readdir(d)) != NULL) {
       if(!ampr_version_safe(ent->d_name)) continue;
       char bin[1024];
-      char hash[65] = {0};
-      char err[128] = {0};
+      char hash[65] = { 0 };
+      char err[128] = { 0 };
       struct stat st;
       if(ampr_cache_binary_path(ent->d_name, bin, sizeof(bin)) != 0) continue;
       if(stat(bin, &st) != 0 || !S_ISREG(st.st_mode)) continue;
@@ -9296,7 +10068,7 @@ ampr_versions_request(const http_request_t *req) {
 }
 
 static int
-ampr_upload_request(const http_request_t *req) {
+ampr_custom_upload_request(const http_request_t *req) {
   char version[64];
   char expected_sha[65];
   char set_latest_arg[16] = "";
@@ -9306,7 +10078,7 @@ ampr_upload_request(const http_request_t *req) {
   char tmp[1024];
   char meta[1024];
   char latest_tmp[1024];
-  char actual_sha[65] = {0};
+  char actual_sha[65] = { 0 };
   unsigned char body_hash[PFS_VHASH_HASH_SIZE];
   int fd = -1;
   if(strcmp(req->method, "POST")) return serve_error(req, 405, "method not allowed");
@@ -9322,8 +10094,8 @@ ampr_upload_request(const http_request_t *req) {
                           sizeof(set_latest_arg))) {
     set_latest =
         strcmp(set_latest_arg, "0") &&
-        strcasecmp(set_latest_arg, "false") &&
-        strcasecmp(set_latest_arg, "no");
+                 strcasecmp(set_latest_arg, "false") &&
+                 strcasecmp(set_latest_arg, "no");
   }
   if(expected_sha[0] && !sha256_hex_valid(expected_sha)) {
     return serve_error(req, 400, "bad AMPR SHA-256");
@@ -9365,7 +10137,7 @@ ampr_upload_request(const http_request_t *req) {
   fsync_parent_dir_best_effort(dir);
   n = snprintf(meta, sizeof(meta), "%s/metadata.json", dir);
   if(n >= 0 && (size_t)n < sizeof(meta)) {
-    json_buf_t mb = {0};
+    json_buf_t mb = { 0 };
     if(json_append(&mb, "{\"version\":") == 0 &&
        json_string(&mb, version) == 0 &&
        json_append(&mb, ",\"sourceUrl\":") == 0 &&
@@ -9386,7 +10158,7 @@ ampr_upload_request(const http_request_t *req) {
   n = snprintf(latest_tmp, sizeof(latest_tmp), "%s/.latest.json.tmp",
                GC_AMPR_DIR);
   if(set_latest && n >= 0 && (size_t)n < sizeof(latest_tmp)) {
-    json_buf_t lb = {0};
+    json_buf_t lb = { 0 };
     if(json_append(&lb, "{\"version\":") == 0 &&
        json_string(&lb, version) == 0 &&
        json_append(&lb, ",\"sourceUrl\":") == 0 &&
@@ -9411,7 +10183,7 @@ ampr_upload_request(const http_request_t *req) {
     free(lb.data);
   }
   artifact_cache_invalidate();
-  json_buf_t b = {0};
+  json_buf_t b = { 0 };
   if(json_append(&b, "{\"ok\":true,\"version\":") != 0 ||
      json_string(&b, version) != 0 ||
      json_append(&b, ",\"path\":") != 0 ||
@@ -9500,13 +10272,13 @@ ampr_find_folder_target(const char *root, char *out, size_t out_size) {
 
 static int
 run_update_ampr_op(gc_operation_t *op) {
-  gc_game_t game = {0};
-  char err[256] = {0};
-  char actual_sha[65] = {0};
-  char target[1024] = {0};
-  char parent[1024] = {0};
-  char tmp[1024] = {0};
-  char expected_mount[1024] = {0};
+  gc_game_t game = { 0 };
+  char err[256] = { 0 };
+  char actual_sha[65] = { 0 };
+  char target[1024] = { 0 };
+  char parent[1024] = { 0 };
+  char tmp[1024] = { 0 };
+  char expected_mount[1024] = { 0 };
 
   gc_checkpoint("update-ampr find game");
   gc_log("update-ampr start op=%s title=%s version=%s sha=%s",
@@ -9584,7 +10356,7 @@ run_update_ampr_op(gc_operation_t *op) {
     }
     snprintf(op->output_path, sizeof(op->output_path), "%s", target);
   } else if(game.source_kind == GC_SOURCE_IMAGE) {
-    pfs_ampr_hotswap_info_t hs = {0};
+    pfs_ampr_hotswap_info_t hs = { 0 };
     if(game.nested_type != PFS_NESTED_EXFAT) {
       snprintf(op->ampr_result_mode, sizeof(op->ampr_result_mode), "%s",
                "failed");
@@ -9615,19 +10387,19 @@ run_update_ampr_op(gc_operation_t *op) {
            hs.old_first_cluster, hs.new_first_cluster,
            hs.allocated_clusters);
   } else if(game.source_kind == GC_SOURCE_COMPRESSED) {
-    pfs_ampr_hotswap_info_t hs = {0};
+    pfs_ampr_hotswap_info_t hs = { 0 };
     if(game.nested_type != PFS_NESTED_EXFAT &&
        game.nested_type != PFS_NESTED_PFS) {
       snprintf(op->ampr_result_mode, sizeof(op->ampr_result_mode), "%s",
                "failed");
       snprintf(op->error, sizeof(op->error), "%s",
-               "AMPR hot-swap supports compressed nested exFAT or PFS images only");
+        "AMPR hot-swap supports compressed nested exFAT or PFS images only");
       return -1;
     }
     job_set_phase("patching", 0, 0,
                   game.nested_type == PFS_NESTED_EXFAT
-                      ? "Patching compressed exFAT image"
-                      : "Patching compressed PFS image");
+                    ? "Patching compressed exFAT image"
+                    : "Patching compressed PFS image");
     int hs_rc = game.nested_type == PFS_NESTED_EXFAT
         ? pfs_ampr_hotswap_ffpfsc_exfat(game.source_path,
                                         op->ampr_cache_path,
@@ -9700,6 +10472,16 @@ run_update_ampr_op(gc_operation_t *op) {
            op->ampr_intent[0] ? op->ampr_intent : "manual");
   }
   artifact_cache_invalidate();
+  /*
+   * The APR-EMU binary inside this source image just changed, so drop the
+   * cached icon and AMPR probe for this title. This forces the next lazy
+   * games-cache refresh to re-mount only this one title (re-probe AMPR +
+   * re-cache the icon) instead of leaving a stale cached sha. Other titles
+   * keep their cached icons and are not re-mounted.
+   */
+  gc_icon_cache_drop(op->title_id);
+  gc_ampr_cache_drop(game.source_path);
+  gc_games_cache_set_mounted(op->title_id, 1, "mounted");
   gc_log("update-ampr complete title=%s target=%s version=%s sha=%s",
          op->title_id, target, op->ampr_version, op->ampr_sha256);
   return 0;
@@ -9707,11 +10489,12 @@ run_update_ampr_op(gc_operation_t *op) {
 
 static int
 run_build_ampr_index_op(gc_operation_t *op) {
-  gc_game_t game = {0};
+  if(gc_shadowmount_api_available()) return run_build_ampr_index_op_sm(op);
+  gc_game_t game = { 0 };
   pfs_app_info_t info;
   pfs_ampr_hotswap_info_t hs;
-  char err[256] = {0};
-  char expected_mount[1024] = {0};
+  char err[256] = { 0 };
+  char expected_mount[1024] = { 0 };
 
   gc_checkpoint("build-ampr-index find game");
   gc_log("build-ampr-index start op=%s title=%s", op->id, op->title_id);
@@ -9788,6 +10571,7 @@ run_build_ampr_index_op(gc_operation_t *op) {
              op->title_id, op->error);
       return -1;
     }
+    delete_validation_marker_for_path(op->title_id, game.source_path);
     snprintf(op->ampr_result_mode, sizeof(op->ampr_result_mode), "%s",
              hs.mode[0] ? hs.mode : "exfat-index-tail");
     op->compressed_size = hs.new_size;
@@ -9820,6 +10604,7 @@ run_build_ampr_index_op(gc_operation_t *op) {
     }
     delete_vhash_sidecar_if_present(game.source_path, "build-ampr-index",
                                     op->title_id);
+    delete_validation_marker_for_path(op->title_id, game.source_path);
     snprintf(op->ampr_result_mode, sizeof(op->ampr_result_mode), "%s",
              hs.mode[0] ? hs.mode : "ffpfsc-index-tail");
     op->compressed_size = hs.new_size;
@@ -9862,9 +10647,9 @@ operation_thread(void *arg) {
   gc_log("operation begin id=%s action=%s title=%s game=%s", op->id, verb,
          op->title_id, op->display_name);
   if(!job_begin(verb)) {
-    char notify_action[32] = {0};
-    char notify_game[256] = {0};
-    char notify_error[256] = {0};
+    char notify_action[32] = { 0 };
+    char notify_game[256] = { 0 };
+    char notify_error[256] = { 0 };
     pthread_mutex_lock(&g_gc_lock);
     snprintf(op->error, sizeof(op->error), "%s", "job already running");
     op->status = GC_OP_FAILED;
@@ -9900,24 +10685,24 @@ operation_thread(void *arg) {
   else if(op->action == GC_ACTION_REFRESH_MOUNT) rc = run_refresh_mount_op(op);
   else if(op->action == GC_ACTION_DELETE_GAME_DATA) {
     rc = run_delete_game_data_op(op);
-	  } else if(op->action == GC_ACTION_READ_SPEED_TEST) {
-	    rc = run_read_speed_test_op(op);
-	  } else if(op->action == GC_ACTION_BUILD_AMPR_INDEX) {
-	    rc = run_build_ampr_index_op(op);
-	  } else if(op->action == GC_ACTION_SET_READ_ONLY) {
-	    rc = run_set_read_only_op(op);
-	  } else if(op->action == GC_ACTION_UPDATE_AMPR) {
-	    rc = run_update_ampr_op(op);
-	  }
+  } else if(op->action == GC_ACTION_READ_SPEED_TEST) {
+    rc = run_read_speed_test_op(op);
+  } else if(op->action == GC_ACTION_BUILD_AMPR_INDEX) {
+    rc = run_build_ampr_index_op(op);
+  } else if(op->action == GC_ACTION_SET_READ_ONLY) {
+    rc = run_set_read_only_op(op);
+  } else if(op->action == GC_ACTION_UPDATE_AMPR) {
+    rc = run_update_ampr_op(op);
+  }
 
   int cancelled = job_cancelled();
   gc_checkpoint("operation job end");
   job_end(rc, rc == 0 ? NULL : (op->error[0] ? op->error : "operation failed"));
 
-  char notify_action[32] = {0};
-  char notify_game[256] = {0};
-  char notify_status[16] = {0};
-  char notify_error[256] = {0};
+  char notify_action[32] = { 0 };
+  char notify_game[256] = { 0 };
+  char notify_status[16] = { 0 };
+  char notify_error[256] = { 0 };
 
   pthread_mutex_lock(&g_gc_lock);
   op->ended_at = time(NULL);
@@ -9947,8 +10732,8 @@ operation_thread(void *arg) {
 
   gc_checkpoint("operation notification");
   gc_log("operation finished id=%s action=%s title=%s status=%s result=%s err=%s",
-         op->id, notify_action, op->title_id, notify_status, op->result,
-         notify_error);
+    op->id, notify_action, op->title_id, notify_status, op->result,
+    notify_error);
   gc_notify_operation_done(notify_action, notify_game, notify_status,
                            notify_error);
   gc_checkpoint("operation idle");
@@ -10001,7 +10786,7 @@ enqueue_start_response_locked(const http_request_t *req, gc_operation_t *op) {
   snprintf(id, sizeof(id), "%s", op->id);
   pthread_mutex_unlock(&g_gc_lock);
 
-  json_buf_t b = {0};
+  json_buf_t b = { 0 };
   if(json_append(&b, "{\"ok\":true,\"id\":") != 0 ||
      json_string(&b, id) != 0 ||
      json_append(&b, ",\"status\":") != 0 ||
@@ -10107,6 +10892,7 @@ enqueue_action(const http_request_t *req, gc_action_t action) {
                                                source_path_arg,
                                                sizeof(source_path_arg));
   if(arg_err) return serve_error(req, 400, arg_err);
+  atomic_store(&g_enqueue_in_progress, 1);
   memset(&game, 0, sizeof(game));
   snprintf(game.title_id, sizeof(game.title_id), "%s", title_id);
   snprintf(game.name, sizeof(game.name), "%s", title_id);
@@ -10144,7 +10930,7 @@ enqueue_action(const http_request_t *req, gc_action_t action) {
   }
   if(makes_image &&
      websrv_get_query_arg(req, "destination", destination_arg,
-                          sizeof(destination_arg))) {
+                                         sizeof(destination_arg))) {
     if(!strcasecmp(destination_arg, "keep") ||
        !strcasecmp(destination_arg, "inplace") ||
        !strcasecmp(destination_arg, "in-place")) {
@@ -10201,7 +10987,7 @@ enqueue_action(const http_request_t *req, gc_action_t action) {
   }
   if(makes_image &&
      websrv_get_query_arg(req, "preserveOriginal", preserve_arg,
-                          sizeof(preserve_arg))) {
+                                         sizeof(preserve_arg))) {
     if(!strcasecmp(preserve_arg, "hide")) {
       snprintf(preserve_original, sizeof(preserve_original), "%s", "hide");
       if(!requested_delete_policy[0]) {
@@ -10218,7 +11004,7 @@ enqueue_action(const http_request_t *req, gc_action_t action) {
   }
   if(preserve_original[0] && !strcmp(requested_delete_policy, "stream")) {
     return serve_error(req, 400,
-                       "preserveOriginal=hide is not compatible with destructive compression");
+      "preserveOriginal=hide is not compatible with destructive compression");
   }
   if(action == GC_ACTION_COMPRESS &&
      websrv_get_query_arg(req, "budgetBytes", budget_arg,
@@ -10240,7 +11026,7 @@ enqueue_action(const http_request_t *req, gc_action_t action) {
   }
   if(makes_image &&
      websrv_get_query_arg(req, "skipSpaceCheck", skip_space_arg,
-                          sizeof(skip_space_arg))) {
+                                         sizeof(skip_space_arg))) {
     if(!strcasecmp(skip_space_arg, "1") ||
        !strcasecmp(skip_space_arg, "true") ||
        !strcasecmp(skip_space_arg, "yes")) {
@@ -10256,8 +11042,8 @@ enqueue_action(const http_request_t *req, gc_action_t action) {
   if(makes_image &&
      websrv_get_query_arg(req, "usbId", usb_id, sizeof(usb_id))) {
     const gc_storage_target_def_t *def = storage_target_def_for_id(usb_id);
-    if(storage_target_root_for_id(usb_id, target_root,
-                                  sizeof(target_root), NULL) != 0 || !def) {
+      if(storage_target_root_for_id(usb_id, target_root,
+                                    sizeof(target_root), NULL) != 0 || !def) {
       return serve_error(req, 400, "bad storage target");
     }
     if(path_under_root(source_path_arg, def->root)) {
@@ -10384,7 +11170,7 @@ infer_uncompress_nested_from_shadow(const char *source_path,
   if(nested_type) *nested_type = PFS_NESTED_PFS;
   if(!source_path ||
      shadow_pfsc_mount_dir_for_outer(source_path, mount_dir,
-                                     sizeof(mount_dir)) != 0) {
+                                                     sizeof(mount_dir)) != 0) {
     return;
   }
   d = opendir(mount_dir);
@@ -10450,7 +11236,7 @@ static int
 uncompress_plan_request(const http_request_t *req) {
   char title_id[64];
   char source_path_arg[1024] = "";
-  char err[256] = {0};
+  char err[256] = { 0 };
   gc_game_t game;
   gc_operation_t op;
   char nested_name[256];
@@ -10485,7 +11271,7 @@ uncompress_plan_request(const http_request_t *req) {
     return serve_error(req, 400,
                        err[0] ? err : "could not inspect compressed image");
   }
-  json_buf_t b = {0};
+  json_buf_t b = { 0 };
   const char *type = nested_type_name(nested_type);
   const char *ext = nested_type == PFS_NESTED_EXFAT ? ".exfat" : ".ffpfs";
   if(json_append(&b, "{\"ok\":true,\"titleId\":") != 0 ||
@@ -10604,7 +11390,7 @@ enqueue_delete_game_data_action(const http_request_t *req) {
   pthread_mutex_lock(&g_gc_lock);
   int response = 0;
   gc_operation_t *op = alloc_queued_operation_locked(
-      req, title_id, GC_ACTION_DELETE_GAME_DATA, title_id, &response);
+    req, title_id, GC_ACTION_DELETE_GAME_DATA, title_id, &response);
   if(!op) return response;
   snprintf(op->source_path, sizeof(op->source_path), "%s", source_path_arg);
   snprintf(op->output_path, sizeof(op->output_path), "%s", source_path_arg);
@@ -10636,7 +11422,7 @@ enqueue_read_speed_test_action(const http_request_t *req) {
   pthread_mutex_lock(&g_gc_lock);
   int response = 0;
   gc_operation_t *op = alloc_queued_operation_locked(
-      req, title_id, GC_ACTION_READ_SPEED_TEST, title_id, &response);
+    req, title_id, GC_ACTION_READ_SPEED_TEST, title_id, &response);
   if(!op) return response;
   snprintf(op->source_path, sizeof(op->source_path), "%s", source_path_arg);
   snprintf(op->source_kind, sizeof(op->source_kind), "%s",
@@ -10685,7 +11471,7 @@ enqueue_build_ampr_index_action(const http_request_t *req) {
   }
   if(!ampr_present) {
     return serve_error(req, 400,
-                       "libSceAmpr.sprx or libSceAmpr.prx was not found for this game");
+      "libSceAmpr.sprx or libSceAmpr.prx was not found for this game");
   }
 
   if(title_operation_busy(title_id)) {
@@ -10695,7 +11481,7 @@ enqueue_build_ampr_index_action(const http_request_t *req) {
   pthread_mutex_lock(&g_gc_lock);
   int response = 0;
   gc_operation_t *op = alloc_queued_operation_locked(
-      req, title_id, GC_ACTION_BUILD_AMPR_INDEX, title_id, &response);
+    req, title_id, GC_ACTION_BUILD_AMPR_INDEX, title_id, &response);
   if(!op) return response;
   snprintf(op->source_path, sizeof(op->source_path), "%s", source_path_arg);
   if(source_kind == GC_SOURCE_FOLDER) {
@@ -10720,8 +11506,8 @@ enqueue_update_ampr_action(const http_request_t *req) {
   char intent_arg[16] = "";
   const char *intent = "manual";
   char cache_path[1024] = "";
-  char actual_sha[65] = {0};
-  char err[256] = {0};
+  char actual_sha[65] = { 0 };
+  char err[256] = { 0 };
   gc_game_t game;
   if(strcmp(req->method, "POST")) {
     return serve_error(req, 405, "method not allowed");
@@ -10754,8 +11540,8 @@ enqueue_update_ampr_action(const http_request_t *req) {
     intent = ampr_normalized_intent(NULL, version);
   }
   if(!strcmp(intent, "latest")) {
-    char latest_version[64] = {0};
-    char latest_sha[65] = {0};
+    char latest_version[64] = { 0 };
+    char latest_sha[65] = { 0 };
     if(!ampr_latest_cached(latest_version, sizeof(latest_version),
                            latest_sha) ||
        strcmp(latest_version, version) ||
@@ -10772,7 +11558,7 @@ enqueue_update_ampr_action(const http_request_t *req) {
   pthread_mutex_lock(&g_gc_lock);
   int response = 0;
   gc_operation_t *op = alloc_queued_operation_locked(
-      req, title_id, GC_ACTION_UPDATE_AMPR, game.name, &response);
+    req, title_id, GC_ACTION_UPDATE_AMPR, game.name, &response);
   if(!op) return response;
   snprintf(op->source_path, sizeof(op->source_path), "%s", game.source_path);
   snprintf(op->source_kind, sizeof(op->source_kind), "%s",
@@ -10791,9 +11577,9 @@ enqueue_restore_ampr_original_action(const http_request_t *req) {
   char title_id[64];
   char source_path_arg[1024] = "";
   char original_path[1024] = "";
-  char original_sha[65] = {0};
-  char actual_sha[65] = {0};
-  char err[256] = {0};
+  char original_sha[65] = { 0 };
+  char actual_sha[65] = { 0 };
+  char err[256] = { 0 };
   uint64_t original_size = 0;
   gc_game_t game;
   if(strcmp(req->method, "POST")) {
@@ -10824,13 +11610,13 @@ enqueue_restore_ampr_original_action(const http_request_t *req) {
   snprintf(game.name, sizeof(game.name), "%s", title_id);
   snprintf(game.source_path, sizeof(game.source_path), "%s", source_path_arg);
   game.source_kind =
-      source_kind_from_name(source_kind_name_from_path(source_path_arg));
+    source_kind_from_name(source_kind_name_from_path(source_path_arg));
   (void)lookup_game_by_source_path(source_path_arg, &game);
 
   pthread_mutex_lock(&g_gc_lock);
   int response = 0;
   gc_operation_t *op = alloc_queued_operation_locked(
-      req, title_id, GC_ACTION_UPDATE_AMPR, game.name, &response);
+    req, title_id, GC_ACTION_UPDATE_AMPR, game.name, &response);
   if(!op) return response;
   snprintf(op->source_path, sizeof(op->source_path), "%s", game.source_path);
   snprintf(op->source_kind, sizeof(op->source_kind), "%s",
@@ -10850,9 +11636,9 @@ enqueue_extract_image_action(const http_request_t *req) {
   char title_id[64];
   char source_path_arg[1024] = "";
   gc_game_t game;
-  gc_operation_t probe_op = {0};
-  char err[256] = {0};
-  char target_path[1024] = {0};
+  gc_operation_t probe_op = { 0 };
+  char err[256] = { 0 };
+  char target_path[1024] = { 0 };
 
   if(strcmp(req->method, "POST")) {
     return serve_error(req, 405, "method not allowed");
@@ -10903,7 +11689,7 @@ enqueue_set_read_only_action(const http_request_t *req) {
   char title_id[64];
   char source_path_arg[1024] = "";
   gc_game_t game;
-  gc_operation_t probe_op = {0};
+  gc_operation_t probe_op = { 0 };
 
   if(strcmp(req->method, "POST")) {
     return serve_error(req, 405, "method not allowed");
@@ -11030,13 +11816,13 @@ append_game_summary(json_buf_t *b, int *first, const gc_game_t *game,
       : stream_min_free_bytes(game->source_size);
   uint64_t stream_extra = game->size_estimated ? 0 : stream_extra_needed(game);
   int can_move_to_external = game->source_kind != GC_SOURCE_UNKNOWN &&
-      can_move_to_external_storage(game->source_path);
+                             can_move_to_external_storage(game->source_path);
   int apr_indexed = game->apr_indexed ||
       (active && active->apr_indexed) ||
-      (pending && pending->apr_indexed);
+                    (pending && pending->apr_indexed);
   int ampr_hot_swap_optimized = game->ampr_hot_swap_optimized ||
-      (active && active->ampr_hot_swap_optimized) ||
-      (pending && pending->ampr_hot_swap_optimized);
+                                (active && active->ampr_hot_swap_optimized) ||
+                                (pending && pending->ampr_hot_swap_optimized);
   if(json_append(b, "{\"titleId\":") != 0 ||
      json_string(b, game->title_id) != 0 ||
      json_append(b, ",\"instanceId\":") != 0 ||
@@ -11068,62 +11854,64 @@ append_game_summary(json_buf_t *b, int *first, const gc_game_t *game,
      json_string(b, game->ampr_latest_version) != 0 ||
      json_append(b, ",\"amprLatestSha256\":") != 0 ||
      json_string(b, game->ampr_latest_sha256) != 0 ||
+     json_append(b, ",\"amprPinnedVersion\":") != 0 ||
+     json_string(b, game->ampr_pinned_version) != 0 ||
      json_append(b, ",\"amprOriginalSha256\":") != 0 ||
      json_string(b, game->ampr_original_sha256) != 0 ||
      json_appendf(b,
-                  ",\"sourceSize\":%llu,\"freeBytes\":%llu,"
-                  "\"requiredBytes\":%llu,\"extraBytes\":%llu,"
-                  "\"streamMinFreeBytes\":%llu,\"streamExtraBytes\":%llu,"
-                  "\"compressionSourceSize\":%llu,"
-                  "\"compressedSize\":%llu,"
-                  "\"savedBytes\":%llu,"
-                  "\"aprIndexed\":%s,"
-                  "\"amprHotSwapOptimized\":%s,"
-                  "\"amprPresent\":%s,"
-                  "\"amprUpdateNeeded\":%s,"
-                  "\"amprUpdateSupported\":%s,"
-                  "\"amprOriginalAvailable\":%s,"
-                  "\"amprOriginalSize\":%llu,"
-                  "\"sizePending\":%s,"
-                  "\"sizeStatus\":\"%s\","
-                  "\"sizeEstimated\":%s,"
-                  "\"sizeMeasuredAt\":%llu,"
-                  "\"sizeRefreshing\":%s,"
-                  "\"canStreamDelete\":%s,\"isMounted\":%s,"
-                  "\"hasIcon\":%s,"
-                  "\"iconSize\":%llu,\"iconMtime\":%llu,"
-                  "\"outputExists\":%s,\"canMoveToUsb\":%s,"
-                  "\"canMoveToInternal\":%s",
-                  (unsigned long long)game->source_size,
-                  (unsigned long long)game->free_bytes,
-                  (unsigned long long)game->required_bytes,
+       ",\"sourceSize\":%llu,\"freeBytes\":%llu,"
+       "\"requiredBytes\":%llu,\"extraBytes\":%llu,"
+       "\"streamMinFreeBytes\":%llu,\"streamExtraBytes\":%llu,"
+       "\"compressionSourceSize\":%llu,"
+       "\"compressedSize\":%llu,"
+       "\"savedBytes\":%llu,"
+       "\"aprIndexed\":%s,"
+       "\"amprHotSwapOptimized\":%s,"
+       "\"amprPresent\":%s,"
+       "\"amprUpdateNeeded\":%s,"
+       "\"amprUpdateSupported\":%s,"
+       "\"amprOriginalAvailable\":%s,"
+       "\"amprOriginalSize\":%llu,"
+       "\"sizePending\":%s,"
+       "\"sizeStatus\":\"%s\","
+       "\"sizeEstimated\":%s,"
+       "\"sizeMeasuredAt\":%llu,"
+       "\"sizeRefreshing\":%s,"
+       "\"canStreamDelete\":%s,\"isMounted\":%s,"
+       "\"hasIcon\":%s,"
+       "\"iconSize\":%llu,\"iconMtime\":%llu,"
+       "\"outputExists\":%s,\"canMoveToUsb\":%s,"
+       "\"canMoveToInternal\":%s",
+       (unsigned long long)game->source_size,
+       (unsigned long long)game->free_bytes,
+       (unsigned long long)game->required_bytes,
                   (unsigned long long)game->extra_needed,
                   (unsigned long long)stream_min,
-                  (unsigned long long)stream_extra,
-                  (unsigned long long)game->compression_source_size,
-                  (unsigned long long)game->compressed_size,
+       (unsigned long long)stream_extra,
+       (unsigned long long)game->compression_source_size,
+       (unsigned long long)game->compressed_size,
                   (unsigned long long)game->saved_bytes,
                   apr_indexed ? "true" : "false",
-                  ampr_hot_swap_optimized ? "true" : "false",
-                  game->ampr_present ? "true" : "false",
-                  game->ampr_update_needed ? "true" : "false",
-                  game->ampr_update_supported ? "true" : "false",
-                  game->ampr_original_available ? "true" : "false",
-                  (unsigned long long)game->ampr_original_size,
-                  game->size_pending ? "true" : "false",
-                  gc_size_status_name(game->size_status),
-                  game->size_estimated ? "true" : "false",
-                  (unsigned long long)game->size_measured_at,
-                  game->size_refreshing ? "true" : "false",
-                  game->can_stream_delete ? "true" : "false",
+       ampr_hot_swap_optimized ? "true" : "false",
+       game->ampr_present ? "true" : "false",
+       game->ampr_update_needed ? "true" : "false",
+       game->ampr_update_supported ? "true" : "false",
+       game->ampr_original_available ? "true" : "false",
+       (unsigned long long)game->ampr_original_size,
+       game->size_pending ? "true" : "false",
+       gc_size_status_name(game->size_status),
+       game->size_estimated ? "true" : "false",
+       (unsigned long long)game->size_measured_at,
+       game->size_refreshing ? "true" : "false",
+       game->can_stream_delete ? "true" : "false",
                   game->is_mounted ? "true" : "false",
                   game->has_icon ? "true" : "false",
-                  (unsigned long long)game->icon_size,
-                  (unsigned long long)game->icon_mtime,
-                  game->output_exists ? "true" : "false",
-                  can_move_to_external ? "true" : "false",
-                  game->source_kind != GC_SOURCE_UNKNOWN &&
-                      !path_under_root(game->source_path, "/data")
+       (unsigned long long)game->icon_size,
+       (unsigned long long)game->icon_mtime,
+       game->output_exists ? "true" : "false",
+       can_move_to_external ? "true" : "false",
+       game->source_kind != GC_SOURCE_UNKNOWN &&
+           !path_under_root(game->source_path, "/data")
                       ? "true" : "false") != 0) {
     return -1;
   }
@@ -11158,14 +11946,14 @@ operation_fallback_game(const gc_operation_t *op, gc_game_t *game) {
   snprintf(game->name, sizeof(game->name), "%s",
            op->display_name[0] ? op->display_name : op->title_id);
   game->source_kind = source_kind_from_name(op->source_kind);
-	  if(game->source_kind == GC_SOURCE_UNKNOWN &&
-	     (op->action == GC_ACTION_UNCOMPRESS ||
-	      op->action == GC_ACTION_EXTRACT_IMAGE ||
-	      op->action == GC_ACTION_VALIDATE_REPAIR ||
-	      op->action == GC_ACTION_VALIDATE_ONLY)) {
+  if(game->source_kind == GC_SOURCE_UNKNOWN &&
+     (op->action == GC_ACTION_UNCOMPRESS ||
+      op->action == GC_ACTION_EXTRACT_IMAGE ||
+      op->action == GC_ACTION_VALIDATE_REPAIR ||
+      op->action == GC_ACTION_VALIDATE_ONLY)) {
     game->source_kind = op->action == GC_ACTION_EXTRACT_IMAGE
-        ? GC_SOURCE_IMAGE
-        : GC_SOURCE_COMPRESSED;
+                          ? GC_SOURCE_IMAGE
+                          : GC_SOURCE_COMPRESSED;
   }
   snprintf(game->source_path, sizeof(game->source_path), "%s",
            op->source_path[0] ? op->source_path : op->output_path);
@@ -11179,7 +11967,7 @@ operation_fallback_game(const gc_operation_t *op, gc_game_t *game) {
   populate_game_size_ex(game, 0, 0);
   game->can_stream_delete =
       game->source_kind == GC_SOURCE_FOLDER ||
-      game->source_kind == GC_SOURCE_COMPRESSED;
+                            game->source_kind == GC_SOURCE_COMPRESSED;
   load_game_name(game);
   load_game_icon(game);
   load_validation_state(game);
@@ -11264,8 +12052,8 @@ append_persisted_history(json_buf_t *b, int *first,
 
   char line[16384];
   while(fgets(line, sizeof(line), f)) {
-    char id[64] = {0};
-    char key[GC_HISTORY_KEY_SIZE] = {0};
+    char id[64] = { 0 };
+    char key[GC_HISTORY_KEY_SIZE] = { 0 };
     uint64_t created_at;
     char *copy;
     int slot = -1;
@@ -11337,13 +12125,31 @@ games_request(const http_request_t *req) {
   int first = 1;
   int failed = 0;
   if(!games) return serve_error(req, 500, "out of memory");
-  discover_games(games, GC_MAX_GAMES, &count, 0);
+  if (!gc_shadowmount_api_available()) {
+    discover_games(games, GC_MAX_GAMES, &count, 0);
+  } else {
+    /*
+     * /api/gc/games always returns the persistent games list cache (built at
+     * startup and updated on each mount). The list is never re-discovered on
+     * every poll: in sm 1.7 mounting is dynamic, so re-scanning would flicker
+     * every title to "not mounted" as soon as the single temporary mount is
+     * released. The cache is lazily rebuilt only when it is marked dirty
+     * (after an operation/mount-switch) and no operation is currently running,
+     * and only one rebuild runs at a time so concurrent /api/gc/games polls
+     * do not each trigger a full discover+prewarm. If the startup warmup is
+     * still running (refreshing and cache not yet ready), wait for it to
+     * complete so the first poll returns the full list instead of an empty one.
+     */
+    gc_games_cache_refresh_if_needed();
+    gc_games_cache_wait_for_ready();
+    count = gc_games_cache_snapshot(games, GC_MAX_GAMES);
+  }
   queue_folder_game_size_rechecks(games, count);
   for(size_t i = 0; i < count; i++) {
     size_cache_apply_display_to_game(&games[i]);
   }
 
-  json_buf_t b = {0};
+  json_buf_t b = { 0 };
   if(json_append(&b, "{\"ok\":true,\"games\":[") != 0) {
     free(b.data);
     free(games);
@@ -11409,7 +12215,7 @@ size_priority_request(const http_request_t *req) {
   if(strcmp(req->method, "POST")) {
     return serve_error(req, 405, "method not allowed");
   }
-  char path[1024] = {0};
+  char path[1024] = { 0 };
   if(!websrv_get_query_arg(req, "path", path, sizeof(path)) &&
      !websrv_get_query_arg(req, "sourcePath", path, sizeof(path))) {
     return serve_error(req, 400, "path required");
@@ -11444,7 +12250,7 @@ size_priority_request(const http_request_t *req) {
                                    &refreshed_status) == 0;
   if(refreshed_status != GC_SIZE_STATUS_UNKNOWN) status = refreshed_status;
 
-  json_buf_t b = {0};
+  json_buf_t b = { 0 };
   if(json_append(&b, "{\"ok\":true,\"path\":") != 0 ||
      json_string(&b, path) != 0 ||
      json_appendf(&b,
@@ -11471,7 +12277,7 @@ usb_request(const http_request_t *req) {
   size_t count = 0;
   discover_usb_targets(targets, GC_STORAGE_TARGET_COUNT, &count);
 
-  json_buf_t b = {0};
+  json_buf_t b = { 0 };
   if(json_append(&b, "{\"ok\":true,\"usb\":[") != 0) {
     free(b.data);
     return -1;
@@ -11511,7 +12317,7 @@ usb_request(const http_request_t *req) {
 static int
 history_request(const http_request_t *req) {
   (void)req;
-  json_buf_t b = {0};
+  json_buf_t b = { 0 };
   char memory_keys[GC_MAX_OPS][GC_HISTORY_KEY_SIZE];
   size_t memory_key_count = 0;
   int first = 1;
@@ -11603,8 +12409,8 @@ job_speed_metric_bytes(const char *verb, const char *phase, long copied,
     source = "unpacked-output";
   } else if(!strcmp(v, "extract-image")) {
     source = "extracted-output";
-	  } else if(!strcmp(v, "read-speed-test")) {
-	    source = "read-test";
+  } else if(!strcmp(v, "read-speed-test")) {
+    source = "read-test";
 	  } else if(!strcmp(v, "move-to-usb") ||
             !strcmp(v, "move-to-internal") ||
             !strcmp(v, "copy-to-usb") ||
@@ -11626,7 +12432,7 @@ job_speed_metric_bytes(const char *verb, const char *phase, long copied,
 
 static int
 job_request(const http_request_t *req) {
-  json_buf_t b = {0};
+  json_buf_t b = { 0 };
   int busy = atomic_load(&g_job.busy);
   long total = atomic_load(&g_job.total_bytes);
   long copied = atomic_load(&g_job.copied_bytes);
@@ -11643,16 +12449,16 @@ job_request(const http_request_t *req) {
   long hash_checked = atomic_load(&g_job.hash_checked_blocks);
   long hash_matched = atomic_load(&g_job.hash_matched_blocks);
   long hash_mismatched = atomic_load(&g_job.hash_mismatched_blocks);
-	  long software_compared = atomic_load(&g_job.software_compared_blocks);
-	  long writer_wait_us = atomic_load(&g_job.writer_wait_us);
-	  long worker_wait_us = atomic_load(&g_job.worker_wait_us);
+  long software_compared = atomic_load(&g_job.software_compared_blocks);
+  long writer_wait_us = atomic_load(&g_job.writer_wait_us);
+  long worker_wait_us = atomic_load(&g_job.worker_wait_us);
   long scan_bytes = atomic_load(&g_job.scan_bytes);
   long scan_files = atomic_load(&g_job.scan_files);
   long scan_dirs = atomic_load(&g_job.scan_dirs);
   long scan_entries = atomic_load(&g_job.scan_entries);
   long scan_elapsed_ms = atomic_load(&g_job.scan_elapsed_ms);
   long scan_workers = atomic_load(&g_job.scan_workers);
-	  long repair_read_bytes = atomic_load(&g_job.repair_read_bytes);
+  long repair_read_bytes = atomic_load(&g_job.repair_read_bytes);
   long repair_written_bytes = atomic_load(&g_job.repair_written_bytes);
   long repair_copy_bytes = atomic_load(&g_job.repair_copy_bytes);
   long stream_min_free = atomic_load(&g_job.stream_min_free_bytes);
@@ -11663,12 +12469,12 @@ job_request(const http_request_t *req) {
   long stream_forward_files = atomic_load(&g_job.stream_forward_files);
   long stream_reverse_files = atomic_load(&g_job.stream_reverse_files);
   int destructive_stream_active =
-      atomic_load(&g_job.destructive_stream_active) != 0;
+    atomic_load(&g_job.destructive_stream_active) != 0;
   int cancel_disabled = atomic_load(&g_job.cancel_disabled) != 0;
   int cancel_requested = atomic_load(&g_job.cancel) != 0;
   int rollback_requested = atomic_load(&g_job.rollback_requested) != 0;
-  char current[512], phase[32], verb[16], err[256], active_id[32] = {0};
-  char cancel_disabled_reason[128] = {0};
+  char current[512], phase[32], verb[16], err[256], active_id[32] = { 0 };
+  char cancel_disabled_reason[128] = { 0 };
   time_t started_at = 0;
   time_t phase_started_at = 0;
   long elapsed_seconds = 0;
@@ -11712,8 +12518,8 @@ job_request(const http_request_t *req) {
   pthread_mutex_unlock(&g_gc_lock);
 
   speed_metric_bytes = job_speed_metric_bytes(
-      verb, phase, copied, compressed_output, repair_read_bytes,
-      repair_written_bytes, repair_copy_bytes, &speed_source);
+    verb, phase, copied, compressed_output, repair_read_bytes,
+    repair_written_bytes, repair_copy_bytes, &speed_source);
   if(elapsed_seconds > 0 && speed_metric_bytes > 0) {
     speed_bytes_per_second = speed_metric_bytes / elapsed_seconds;
   }
@@ -11733,16 +12539,16 @@ job_request(const http_request_t *req) {
     hash_checked = 0;
     hash_matched = 0;
     hash_mismatched = 0;
-	    software_compared = 0;
-	    writer_wait_us = 0;
-	    worker_wait_us = 0;
+    software_compared = 0;
+    writer_wait_us = 0;
+    worker_wait_us = 0;
     scan_bytes = 0;
     scan_files = 0;
     scan_dirs = 0;
     scan_entries = 0;
     scan_elapsed_ms = 0;
     scan_workers = 0;
-	    repair_read_bytes = 0;
+    repair_read_bytes = 0;
     repair_written_bytes = 0;
     repair_copy_bytes = 0;
     stream_min_free = 0;
@@ -11784,40 +12590,40 @@ job_request(const http_request_t *req) {
      json_append(&b, ",\"error\":") != 0 ||
      json_string(&b, err) != 0 ||
      json_appendf(&b,
-	                  ",\"totalBytes\":%ld,\"copiedBytes\":%ld,"
-	                  "\"compressedOutputBytes\":%ld,"
-	                  "\"totalBlocks\":%ld,\"doneBlocks\":%ld,"
-	                  "\"rawBlocks\":%ld,\"compressedBlocks\":%ld,"
-	                  "\"skippedZlibBlocks\":%ld,"
-	                  "\"phaseStep\":%ld,\"phaseCount\":%ld,"
-                  "\"repairBlocks\":%ld,"
-                  "\"badBlocksFound\":%ld,"
-                  "\"repairedBlocks\":%ld,"
-                  "\"hashCheckedBlocks\":%ld,"
-                  "\"hashMatchedBlocks\":%ld,"
-                  "\"hashMismatchedBlocks\":%ld,"
-	                  "\"softwareComparedBlocks\":%ld,"
-	                  "\"writerWaitUs\":%ld,"
-	                  "\"workerWaitUs\":%ld,"
-                    "\"scanBytes\":%ld,"
-                    "\"scanFiles\":%ld,"
-                    "\"scanDirs\":%ld,"
-                    "\"scanEntries\":%ld,"
-                    "\"scanElapsedMs\":%ld,"
-                    "\"scanWorkers\":%ld,"
-		                  "\"repairReadBytes\":%ld,"
-	                  "\"repairWrittenBytes\":%ld,"
-	                  "\"repairCopyBytes\":%ld,"
-	                  "\"streamMinFreeBytes\":%ld,"
-	                  "\"streamBudgetBytes\":%ld,"
-	                  "\"streamCurrentCreditBytes\":%ld,"
-	                  "\"streamDeletedBytes\":%ld,"
-	                  "\"streamReverseTempBytes\":%ld,"
-	                  "\"streamForwardFiles\":%ld,"
-	                  "\"streamReverseFiles\":%ld,"
-		                  "\"destructiveStreamActive\":%s,"
-		                  "\"cancelDisabled\":%s,"
-		                  "\"cancelDisabledReason\":",
+       ",\"totalBytes\":%ld,\"copiedBytes\":%ld,"
+       "\"compressedOutputBytes\":%ld,"
+       "\"totalBlocks\":%ld,\"doneBlocks\":%ld,"
+       "\"rawBlocks\":%ld,\"compressedBlocks\":%ld,"
+       "\"skippedZlibBlocks\":%ld,"
+       "\"phaseStep\":%ld,\"phaseCount\":%ld,"
+       "\"repairBlocks\":%ld,"
+       "\"badBlocksFound\":%ld,"
+       "\"repairedBlocks\":%ld,"
+       "\"hashCheckedBlocks\":%ld,"
+       "\"hashMatchedBlocks\":%ld,"
+       "\"hashMismatchedBlocks\":%ld,"
+       "\"softwareComparedBlocks\":%ld,"
+       "\"writerWaitUs\":%ld,"
+       "\"workerWaitUs\":%ld,"
+       "\"scanBytes\":%ld,"
+       "\"scanFiles\":%ld,"
+       "\"scanDirs\":%ld,"
+       "\"scanEntries\":%ld,"
+       "\"scanElapsedMs\":%ld,"
+       "\"scanWorkers\":%ld,"
+       "\"repairReadBytes\":%ld,"
+       "\"repairWrittenBytes\":%ld,"
+       "\"repairCopyBytes\":%ld,"
+       "\"streamMinFreeBytes\":%ld,"
+       "\"streamBudgetBytes\":%ld,"
+       "\"streamCurrentCreditBytes\":%ld,"
+       "\"streamDeletedBytes\":%ld,"
+       "\"streamReverseTempBytes\":%ld,"
+       "\"streamForwardFiles\":%ld,"
+       "\"streamReverseFiles\":%ld,"
+       "\"destructiveStreamActive\":%s,"
+       "\"cancelDisabled\":%s,"
+       "\"cancelDisabledReason\":",
 		                  total, copied, compressed_output,
 		                  total_blocks, done_blocks, raw_blocks,
                   compressed_blocks, skipped_zlib_blocks,
@@ -11834,19 +12640,19 @@ job_request(const http_request_t *req) {
 	                  stream_deleted, stream_reverse_temp,
 	                  stream_forward_files, stream_reverse_files,
 	                  destructive_stream_active ? "true" : "false",
-	                  cancel_disabled ? "true" : "false") != 0 ||
+       cancel_disabled ? "true" : "false") != 0 ||
      json_string(&b, cancel_disabled_reason) != 0 ||
      json_appendf(&b,
-		                  ",\"cancelRequested\":%s,"
-			                  "\"rollbackRequested\":%s,"
-			                  "\"startedAt\":%ld,"
-			                  "\"elapsedSeconds\":%ld,"
-			                  "\"phaseElapsedSeconds\":%ld,"
-			                  "\"speedMetricBytes\":%ld,"
-			                  "\"speedBytesPerSec\":%ld,"
-		                  "\"compressBytesPerSecond\":%ld,"
-		                  "\"speedSource\":",
-		                  cancel_requested ? "true" : "false",
+                  ",\"cancelRequested\":%s,"
+                  "\"rollbackRequested\":%s,"
+                  "\"startedAt\":%ld,"
+                  "\"elapsedSeconds\":%ld,"
+                  "\"phaseElapsedSeconds\":%ld,"
+                  "\"speedMetricBytes\":%ld,"
+                  "\"speedBytesPerSec\":%ld,"
+                  "\"compressBytesPerSecond\":%ld,"
+                  "\"speedSource\":",
+                  cancel_requested ? "true" : "false",
 			                  rollback_requested ? "true" : "false",
 			                  (long)started_at, elapsed_seconds,
 			                  phase_elapsed_seconds,
@@ -11863,17 +12669,17 @@ job_request(const http_request_t *req) {
 int
 gc_api_handoff_state_request(const http_request_t *req) {
   (void)req;
-  json_buf_t b = {0};
+  json_buf_t b = { 0 };
   int job_busy = atomic_load(&g_job.busy);
   int pending_count = 0;
   int busy = 0;
   int resumable = 0;
   const char *reason = "idle";
-  char active_id[32] = {0};
-  char action[32] = {0};
-  char phase[32] = {0};
-  char job_phase[32] = {0};
-  char current[256] = {0};
+  char active_id[32] = { 0 };
+  char action[32] = { 0 };
+  char phase[32] = { 0 };
+  char job_phase[32] = { 0 };
+  char current[256] = { 0 };
 
   pthread_mutex_lock(&g_job.lock);
   snprintf(job_phase, sizeof(job_phase), "%s", g_job.phase);
@@ -11936,8 +12742,8 @@ cancel_active_request(const http_request_t *req) {
   int active_stream_compress = 0;
   int cancel_disabled = atomic_load(&g_job.cancel_disabled) != 0;
   int destructive_stream_active =
-      atomic_load(&g_job.destructive_stream_active) != 0;
-  char cancel_disabled_reason[128] = {0};
+    atomic_load(&g_job.destructive_stream_active) != 0;
+  char cancel_disabled_reason[128] = { 0 };
   if(cancel_disabled) {
     pthread_mutex_lock(&g_job.lock);
     snprintf(cancel_disabled_reason, sizeof(cancel_disabled_reason), "%s",
@@ -11985,11 +12791,38 @@ cancel_queued_request(const http_request_t *req) {
 
 int
 gc_api_icon_request(const http_request_t *req) {
+  if(gc_shadowmount_api_available()) return gc_api_icon_request_sm(req);
   char title_id[64];
   if(!websrv_get_query_arg(req, "titleId", title_id, sizeof(title_id)) ||
      !valid_title_id(title_id)) {
     return websrv_send_error_json(req->fd, 400, "bad titleId");
   }
+
+  char size_arg[32];
+  int want_thumb =
+    websrv_get_query_arg(req, "size", size_arg, sizeof(size_arg)) &&
+    !strcasecmp(size_arg, "thumb");
+
+  /*
+   * Try the in-memory icon cache first. Both the full-size PNG and a
+   * 96x96 thumbnail are cached during the AMPR mount probe or on the
+   * first successful disk read below. icon0.png at
+   * /user/app/<title_id>/ may be a symlink into the shadow mount and
+   * is only resolvable while the game is mounted, so serving from
+   * the cache avoids a re-mount.
+   */
+  {
+    unsigned char *cached = NULL;
+    size_t cached_size = 0;
+    if(gc_icon_cache_lookup(title_id, want_thumb, &cached, &cached_size) &&
+       cached && cached_size > 0) {
+      int rc = websrv_send_cached(req->fd, 200, "image/png", cached,
+                                  cached_size, GC_ICON_CACHE_MAX_AGE);
+      free(cached);
+      return rc;
+    }
+  }
+
   char path[1024];
   snprintf(path, sizeof(path), "%s/%s/icon0.png", GC_APP_BASE, title_id);
   int fd = open(path, O_RDONLY);
@@ -12004,29 +12837,11 @@ gc_api_icon_request(const http_request_t *req) {
     return websrv_send_error_json(req->fd, 404, "icon not found");
   }
 
-  char size_arg[32];
-  int want_thumb =
-      websrv_get_query_arg(req, "size", size_arg, sizeof(size_arg)) &&
-      !strcasecmp(size_arg, "thumb");
-  if(want_thumb) {
-    char thumb_path[1024];
-    if(gc_icon_thumb_path(title_id, path, &st, thumb_path,
-                          sizeof(thumb_path)) == 0) {
-      int thumb_fd = open(thumb_path, O_RDONLY);
-      if(thumb_fd >= 0) {
-        struct stat thumb_st;
-        if(fstat(thumb_fd, &thumb_st) == 0 && thumb_st.st_size > 0 &&
-           thumb_st.st_size <= 2 * 1024 * 1024) {
-          close(fd);
-          fd = thumb_fd;
-          st = thumb_st;
-        } else {
-          close(thumb_fd);
-        }
-      }
-    }
-  }
-
+  /*
+   * Read the full-size icon into memory so we can cache both the
+   * full-size and the thumbnail version, regardless of which was
+   * originally requested.
+   */
   char *data = malloc((size_t)st.st_size);
   if(!data) {
     close(fd);
@@ -12045,9 +12860,106 @@ gc_api_icon_request(const http_request_t *req) {
     got += (size_t)n;
   }
   close(fd);
-  int rc = websrv_send(req->fd, 200, "image/png", data, got);
+
+  /* Generate thumbnail from the full-size PNG bytes. */
+  unsigned char *thumb_buf = NULL;
+  int thumb_len = 0;
+  if(got > 0 && got <= INT_MAX) {
+    gc_icon_thumb_from_memory((const unsigned char *)data, (int)got, &thumb_buf,
+                              &thumb_len);
+  }
+
+  /* Cache both full-size and thumbnail in memory. */
+  if(got > 0) {
+    gc_icon_cache_store(title_id, (const unsigned char *)data, got, thumb_buf,
+                        (thumb_buf && thumb_len > 0) ? (size_t)thumb_len : 0);
+  }
+
+  /* Serve the requested version: thumbnail if requested and available,
+   * otherwise the full-size icon. */
+  int rc;
+  if(want_thumb && thumb_buf && thumb_len > 0) {
+    rc = websrv_send_cached(req->fd, 200, "image/png", thumb_buf,
+                            (size_t)thumb_len, GC_ICON_CACHE_MAX_AGE);
+  } else {
+    rc = websrv_send_cached(req->fd, 200, "image/png", data, got,
+                            GC_ICON_CACHE_MAX_AGE);
+  }
+  free(thumb_buf);
   free(data);
   return rc;
+}
+
+/*
+ * Startup warmup body: restart ShadowMount (so the dynamic-mount API is
+ * up) then build the persistent games list cache, which pre-warms the
+ * per-game icon + AMPR caches. Both steps are slow (process launch +
+ * per-game mount/probe/unmount) and run in the background so the web
+ * server can start listening immediately. The ShadowMount restart is
+ * done first because the cache refresh's prewarm relies on the
+ * ShadowMountPlus mount API; games_request() waits (via
+ * g_games_cache_cond) until this whole sequence finishes, so the first
+ * /api/gc/games poll returns the full list instead of an empty one.
+ *
+ * When the ShadowMountPlus API is available, discover_games() resolves
+ * each compressed/image game and gc_shadowmount_ampr_mount_game()
+ * briefly mounts each one via the API, caches its icon0.png (full +
+ * thumbnail) and AMPR probe result, then unmounts to free the
+ * single-mount device. Because in sm 1.7 mounting is dynamic, the
+ * refresh then caches every discovered title as mounted/available
+ * regardless of the transient mount.lnk hint (which only reflects the
+ * single active mount). This lets /api/gc/icon serve icons without
+ * re-mounting and makes the first games-list request fast. When the
+ * API is unavailable the list is still cached (using the actual mount
+ * hint). The refresh coordinates with concurrent /api/gc/games polls
+ * through g_games_cache_refreshing (acquired inside
+ * gc_games_cache_refresh_if_needed) so the cache is built exactly once.
+ */
+static void
+gc_run_startup_warmup(void) {
+  char restart_detail[512] = { 0 };
+  (void)gc_shadowmount_restart_running(restart_detail, sizeof(restart_detail));
+  gc_log("shadowmount restart detail=%s",
+         restart_detail[0] ? restart_detail : "started");
+  gc_games_cache_refresh_if_needed();
+  if(gc_shadowmount_api_available()) {
+    gc_log("startup: prewarm complete via games cache refresh");
+  } else {
+    gc_log("startup: ShadowMount API unavailable, games cache built without "
+           "prewarm");
+  }
+}
+
+static void *
+gc_startup_warmup_thread(void *arg) {
+  (void)arg;
+  gc_run_startup_warmup();
+  return NULL;
+}
+
+/*
+ * Kick off ShadowMount restart + games-list cache warmup on a detached
+ * background thread so the web server can begin listening first. Falls
+ * back to running the warmup synchronously in the caller if the thread
+ * cannot be created.
+ */
+static void
+gc_start_background_warmup(void) {
+  gc_log("startup: scheduling shadowmount restart + games cache warmup in "
+         "background");
+  pthread_t tid;
+  pthread_attr_t attr;
+  if(pthread_attr_init(&attr) == 0) {
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_attr_setstacksize(&attr, GC_WORKER_THREAD_STACK_SIZE);
+    if(pthread_create(&tid, &attr, gc_startup_warmup_thread, NULL) == 0) {
+      pthread_attr_destroy(&attr);
+      return;
+    }
+    pthread_attr_destroy(&attr);
+  }
+  gc_log("startup: background warmup thread creation failed, running inline");
+  gc_run_startup_warmup();
 }
 
 void
@@ -12055,11 +12967,20 @@ gc_api_recover_on_startup(void) {
   cleanup_force_remount_temps_on_startup();
   cleanup_delete_pending_temps_on_startup();
   mount_switch_restore_recovery_log();
+  /*
+   * The slow ShadowMount restart and games-list cache warmup (icon +
+   * AMPR prewarm) run in a background thread so the web server can
+   * start listening immediately. /api/gc/games blocks on
+   * g_games_cache_cond until the warmup completes, so the first poll
+   * returns the full list rather than an empty one.
+   */
+  gc_start_background_warmup();
 }
 
 int
 gc_api_request(const http_request_t *req, const char *url) {
   (void)url;
+  atomic_store(&g_enqueue_in_progress, 0);
   if(!strcmp(req->path, "/api/gc/games")) return games_request(req);
   if(!strcmp(req->path, "/api/gc/size-priority")) {
     return size_priority_request(req);
@@ -12071,7 +12992,8 @@ gc_api_request(const http_request_t *req, const char *url) {
   if(!strcmp(req->path, "/api/gc/history")) return history_request(req);
   if(!strcmp(req->path, "/api/gc/ui-settings")) return ui_settings_request(req);
   if(!strcmp(req->path, "/api/gc/ampr/versions")) return ampr_versions_request(req);
-  if(!strcmp(req->path, "/api/gc/ampr/upload")) return ampr_upload_request(req);
+  if(!strcmp(req->path, "/api/gc/ampr/pin")) return ampr_pin_request(req);
+  if(!strcmp(req->path, "/api/gc/ampr/custom")) return ampr_custom_request(req);
   if(!strcmp(req->path, "/api/gc/job")) return job_request(req);
   if(!strcmp(req->path, "/api/gc/bad-blocks")) return bad_blocks_request(req);
   if(!strcmp(req->path, "/api/gc/job/cancel")) return cancel_active_request(req);
@@ -12115,17 +13037,25 @@ gc_api_request(const http_request_t *req, const char *url) {
   if(!strcmp(req->path, "/api/gc/delete-game-data")) {
     return enqueue_delete_game_data_action(req);
   }
-	  if(!strcmp(req->path, "/api/gc/read-speed-test")) {
-	    return enqueue_read_speed_test_action(req);
-	  }
-	  if(!strcmp(req->path, "/api/gc/build-ampr-index")) {
-	    return enqueue_build_ampr_index_action(req);
-	  }
-	  if(!strcmp(req->path, "/api/gc/update-ampr")) {
-	    return enqueue_update_ampr_action(req);
-	  }
-	  if(!strcmp(req->path, "/api/gc/restore-ampr-original")) {
-	    return enqueue_restore_ampr_original_action(req);
-	  }
-	  return serve_error(req, 404, "not found");
-	}
+  if(!strcmp(req->path, "/api/gc/read-speed-test")) {
+    return enqueue_read_speed_test_action(req);
+  }
+  if(!strcmp(req->path, "/api/gc/build-ampr-index")) {
+    return enqueue_build_ampr_index_action(req);
+  }
+  if(!strcmp(req->path, "/api/gc/update-ampr")) {
+    return enqueue_update_ampr_action(req);
+  }
+  if(!strcmp(req->path, "/api/gc/restore-ampr-original")) {
+    return enqueue_restore_ampr_original_action(req);
+  }
+  return serve_error(req, 404, "not found");
+}
+
+/*
+ * ShadowMountPlus API-specific implementations. This file is an included
+ * fragment (NOT a separate translation unit) so it has access to every
+ * static helper, type, and global defined above. Each _sm function holds
+ * the body that runs only when gc_shadowmount_api_available() is true.
+ */
+#include "gc_api_sm.c"

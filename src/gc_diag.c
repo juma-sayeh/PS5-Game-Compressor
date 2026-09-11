@@ -106,6 +106,47 @@ gc_diag_install_signal_handlers(void) {
 
 void
 gc_log(const char *fmt, ...) {
+#ifdef GC_LOG_TRACE
+  char body[1024];
+  char line[1400];
+  va_list ap;
+  int saved_errno = errno;
+
+  va_start(ap, fmt);
+  int body_n = vsnprintf(body, sizeof(body), fmt ? fmt : "", ap);
+  va_end(ap);
+  if(body_n < 0) {
+    snprintf(body, sizeof(body), "log format failed");
+  } else if((size_t)body_n >= sizeof(body)) {
+    body[sizeof(body) - 1] = 0;
+  }
+
+  pthread_mutex_lock(&g_diag_lock);
+  int line_n = snprintf(line, sizeof(line), "%ld pid=%ld checkpoint=%s %s\n",
+                        (long)time(NULL), (long)getpid(), g_checkpoint, body);
+  if(line_n < 0) {
+    pthread_mutex_unlock(&g_diag_lock);
+    errno = saved_errno;
+    return;
+  }
+  if((size_t)line_n >= sizeof(line)) line_n = (int)sizeof(line) - 1;
+
+  fputs(line, stdout);
+  fflush(stdout);
+
+  ensure_diag_dir();
+  FILE *file = fopen(GC_LOG_PATH, "a");
+  if(file) {
+    fwrite(line, 1, (size_t)line_n, file);
+    fclose(file);
+  }
+  pthread_mutex_unlock(&g_diag_lock);
+  errno = saved_errno;
+#endif
+}
+
+void
+gc_trace(const char *fmt, ...) {
   char body[1024];
   char line[1400];
   va_list ap;

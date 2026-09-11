@@ -315,7 +315,6 @@ html[dir="rtl"] .bar span {
     margin-left: 0;
   }
 
-  html[dir="rtl"] #ampr-version-modal #ampr-version-cancel,
   html[dir="rtl"] #ampr-version-modal #ampr-version-apply {
     min-width: 0;
   }

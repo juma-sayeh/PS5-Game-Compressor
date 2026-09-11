@@ -5,6 +5,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Game Compressor</title>
+  <link rel="shortcut icon" href="/favicon.ico" type="image/x-icon">
   <link rel="stylesheet" href="/game-compressor-rtl.css">
   <script src="/game-compressor-i18n.js"></script>
   <script src="/game-compressor-locale-de.js"></script>
@@ -191,7 +192,8 @@
 
     .icon-btn {
       display: grid;
-      place-items: center;
+      align-items: center;
+      justify-content: center;
       width: 44px;
       height: 44px;
       border-radius: 14px;
@@ -405,6 +407,13 @@
 	      text-transform: none;
 	    }
 
+	    .row-tag.ampr-pinned {
+	      color: #6b4ba1;
+	      border-color: rgba(107, 75, 161, .26);
+	      background: #f0ebff;
+	      text-transform: none;
+	    }
+
     .chip {
       display: inline-flex;
       align-items: center;
@@ -427,7 +436,7 @@
       position: absolute;
       right: 12px;
       bottom: 12px;
-      height: 22px;
+      height: 18px;
       max-width: calc(100% - 24px);
       padding: 0 8px;
       font-size: 10px;
@@ -440,6 +449,10 @@
       text-transform: none;
     }
 
+    .chip.ltr-token {
+      text-transform: uppercase;
+    }
+
     .chip.size-estimate {
       min-width: 72px;
     }
@@ -448,6 +461,10 @@
       color: #14895b;
       border-color: rgba(20, 137, 91, .20);
       background: #eaf8f1;
+    }
+
+    .chip.apr-indexed {
+      text-transform: none;
     }
 
     .chip.warn {
@@ -470,6 +487,13 @@
       text-transform: none;
     }
 
+    .chip.ampr-latest {
+      color: #b94708;
+      border-color: rgba(217, 91, 18, .22);
+      background: #fff1df;
+      text-transform: lowercase;
+    }
+
     .chip.selected,
     .chip.validating,
     .chip.reading,
@@ -477,7 +501,7 @@
       color: #155f8c;
       border-color: rgba(43, 134, 189, .28);
       background: #e7f4fb;
-      text-transform: none;
+      text-transform: lowercase;
     }
 
     .chip.ampr-updating {
@@ -485,6 +509,7 @@
       border-color: transparent;
       background: linear-gradient(135deg, #df4f12, #f59f1b);
       box-shadow: 0 10px 22px rgba(223, 79, 18, .22);
+      text-transform: none;
     }
 
     .chip.run {
@@ -515,6 +540,7 @@
 	      color: #386176;
 	      border-color: rgba(56, 97, 118, .22);
 	      background: #e9f4f8;
+	      text-transform: none;
 	    }
 
     .chip.repacking {
@@ -574,7 +600,8 @@
     }
 
     body.theme-dark .chip.ampr,
-    body.theme-dark .chip.ampr-updating {
+    body.theme-dark .chip.ampr-updating,
+    body.theme-dark .chip.ampr-latest {
       color: #ffd0a3;
       border-color: rgba(245, 158, 91, .24);
       background: rgba(154, 73, 27, .24);
@@ -591,6 +618,12 @@
       color: #bfe8ff;
       border-color: rgba(98, 176, 221, .30);
       background: rgba(43, 134, 189, .18);
+    }
+
+    body.theme-dark .row-tag.ampr-pinned {
+      color: #d4c3ff;
+      border-color: rgba(212, 195, 255, .24);
+      background: rgba(87, 65, 136, .24);
     }
 
     body.theme-dark .chip.selected,
@@ -2043,7 +2076,8 @@
       border-bottom-color: rgba(245, 245, 240, .12);
     }
 
-    body.theme-dark #ampr-version-modal .modal-actions {
+    body.theme-dark #ampr-version-modal .modal-actions,
+    body.theme-dark #ampr-custom-modal .modal-actions {
       border-top-color: rgba(245, 245, 240, .12);
       background: rgba(24, 27, 27, .96);
       box-shadow: 0 -12px 28px rgba(0, 0, 0, .34),
@@ -2222,14 +2256,16 @@
       margin-bottom: 0;
     }
 
-    #ampr-version-modal .modal-body {
+    #ampr-version-modal .modal-body,
+    #ampr-custom-modal .modal-body {
       display: flex;
       flex-direction: column;
       overflow: hidden;
       padding-bottom: 0;
     }
 
-    #ampr-version-modal .ampr-version-list {
+    #ampr-version-modal .ampr-version-list,
+    #ampr-custom-modal .ampr-version-list {
       flex: 1 1 auto;
       min-height: 160px;
       overflow: auto;
@@ -2237,9 +2273,43 @@
       padding-right: 4px;
     }
 
-    #ampr-version-modal #ampr-version-status {
+    #ampr-version-modal #ampr-version-status,
+    #ampr-custom-modal #ampr-custom-status {
       flex: 0 0 auto;
       padding-bottom: 10px;
+    }
+
+    .ampr-pinned-note {
+      margin-top: 6px;
+      padding: 8px 10px;
+      border-radius: 12px;
+      border: 1px solid rgba(107, 75, 161, .26);
+      background: rgba(107, 75, 161, .10);
+      color: #6b4ba1;
+      font-size: 12px;
+      font-weight: 680;
+      line-height: 1.35;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      text-transform: none;
+    }
+
+    body.theme-dark .ampr-pinned-note {
+      color: #d4c3ff;
+      border-color: rgba(212, 195, 255, .24);
+      background: rgba(87, 65, 136, .24);
+    }
+
+    .ampr-pinned-note svg {
+      width: 14px;
+      height: 14px;
+      stroke: currentColor;
+      stroke-width: 2;
+      fill: none;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      flex: 0 0 auto;
     }
 
     .format-grid.is-three-up .format-row {
@@ -2403,7 +2473,8 @@
       padding-top: 8px;
     }
 
-    #ampr-version-modal .modal-actions {
+    #ampr-version-modal .modal-actions,
+    #ampr-custom-modal .modal-actions {
       position: sticky;
       bottom: 0;
       z-index: 2;
@@ -2416,12 +2487,75 @@
       box-shadow: 0 -12px 26px rgba(37, 51, 81, .08);
     }
 
-    #ampr-custom-upload {
+    #ampr-version-modal .modal-actions {
+      flex-wrap: wrap;
+      justify-content: center;
+      align-items: center;
+      gap: 0 10px;
+    }
+
+    #ampr-version-modal .modal-actions > button {
+      flex: 0 0 calc((100% - 20px) / 3);
+      min-width: 0;
+    }
+
+    #ampr-version-modal .ampr-action-break {
+      flex-basis: 100%;
+      height: 10px;
+    }
+
+    #ampr-custom-modal #ampr-custom-upload {
       margin-right: auto;
     }
 
     #ampr-custom-file {
       display: none;
+    }
+
+    .ampr-row-actions {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      flex: 0 0 auto;
+    }
+
+    .ampr-delete-btn {
+      height: 34px;
+      min-width: 34px;
+      padding: 0 10px;
+      border-radius: 12px;
+      border: 1px solid rgba(216, 76, 91, .30);
+      background: rgba(216, 76, 91, .10);
+      color: var(--danger);
+      cursor: pointer;
+      font-weight: 680;
+      font-size: 12px;
+      transition: transform .16s ease, background .16s ease, border-color .16s ease;
+    }
+
+    .ampr-delete-btn:hover {
+      transform: translateY(-1px);
+      background: rgba(216, 76, 91, .20);
+      border-color: rgba(216, 76, 91, .46);
+    }
+
+    .ampr-delete-btn:disabled {
+      cursor: default;
+      opacity: .5;
+      transform: none;
+    }
+
+    .chip.ampr-pinned {
+      color: #7c4ba1;
+      border-color: rgba(107, 75, 161, .26);
+      background: #f0ebff;
+      text-transform: none;
+    }
+
+    body.theme-dark .chip.ampr-pinned {
+      color: #d4c3ff;
+      border-color: rgba(212, 195, 255, .24);
+      background: rgba(87, 65, 136, .24);
     }
 
     .danger-text {
@@ -2703,17 +2837,20 @@
       }
 
       #ampr-version-modal .modal-actions {
-        flex-wrap: wrap;
+        gap: 10px;
       }
 
-      #ampr-version-modal #ampr-custom-upload {
+      #ampr-version-modal .modal-actions > button {
+        flex: 1 1 100%;
+      }
+
+      #ampr-version-modal .ampr-action-break {
+        display: none;
+      }
+
+      #ampr-custom-modal #ampr-custom-upload {
         width: 100%;
         margin-right: 0;
-      }
-
-      #ampr-version-modal #ampr-version-cancel,
-      #ampr-version-modal #ampr-version-apply {
-        flex: 1 1 0;
       }
 
       .path-line {
@@ -2956,13 +3093,37 @@
         <div class="ampr-version-list" id="ampr-version-list"></div>
         <div class="history-meta" id="ampr-version-status"></div>
         <div class="modal-actions">
-          <input type="file" id="ampr-custom-file" accept=".sprx,.prx,application/octet-stream">
-          <button class="small-action" type="button" id="ampr-custom-upload"
-            data-i18n="ampr.uploadCustom">Upload Custom File</button>
-          <button class="small-action" type="button" id="ampr-version-cancel"
-            data-i18n="common.cancel">Cancel</button>
+          <button class="small-action" type="button" id="ampr-version-restore" hidden
+            data-i18n="operation.action.restoreAmpr">Restore Original APR-EMU</button>
+          <button class="small-action" type="button" id="ampr-version-build"
+            data-i18n="operation.action.buildAprIndex">Build AMPR Index</button>
+          <button class="small-action" type="button" id="ampr-manage-custom"
+            data-i18n="ampr.manageCustom">Manage Custom APR</button>
+          <span class="ampr-action-break" id="ampr-version-break" aria-hidden="true" hidden></span>
+          <button class="small-action" type="button" id="ampr-version-pin"
+            data-i18n="ampr.pinVersion">Pin Version</button>
           <button class="small-action is-primary" type="button" id="ampr-version-apply"
             data-i18n="common.applyVersion">Apply Version</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop hidden" id="ampr-custom-modal">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="ampr-custom-title">
+      <div class="modal-head">
+        <div class="modal-title" id="ampr-custom-title" data-i18n="ampr.manageCustomTitle">Manage Custom APR</div>
+        <button class="icon-btn" id="ampr-custom-close" aria-label="Close"
+          data-i18n-aria-label="common.close"></button>
+      </div>
+      <div class="modal-body">
+        <div class="format-section-title" data-i18n="ampr.customVersions">Cached Custom APR-EMU Files</div>
+        <div class="ampr-version-list" id="ampr-custom-list"></div>
+        <div class="history-meta" id="ampr-custom-status"></div>
+        <div class="modal-actions">
+          <input type="file" id="ampr-custom-file" accept=".sprx,.prx,application/octet-stream">
+          <button class="small-action is-primary" type="button" id="ampr-custom-upload"
+            data-i18n="ampr.uploadCustom">Upload Custom File</button>
         </div>
       </div>
     </div>
@@ -3252,6 +3413,13 @@
       amprPickerBusyText: '',
       amprPickerBusyTextKey: '',
       amprPickerError: '',
+      amprCustomGame: null,
+      amprCustomVersions: [],
+      amprCustomLoading: false,
+      amprCustomBusy: false,
+      amprCustomBusyText: '',
+      amprCustomBusyTextKey: '',
+      amprCustomError: '',
       notice: null,
       noticedHistory: false,
       seenOperationKeys: {},
@@ -3418,6 +3586,7 @@
       renderAppChrome();
       render(true);
       if (state.amprPickerGame) renderAmprVersionModal();
+      if (state.amprCustomGame) renderAmprCustomModal();
       if (state.compressGame) updateCompressModalSelection();
       if (state.uncompressGame) updateUncompressModalSelection();
       if (state.deleteGame) updateDeleteModal();
@@ -3499,6 +3668,7 @@
         sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/>',
         moon: '<path d="M20.5 14.5A8.5 8.5 0 0 1 9.5 3.5 7 7 0 1 0 20.5 14.5Z"/>',
         power: '<path d="M12 2v10"/><path d="M18.4 6.6a9 9 0 1 1-12.8 0"/>',
+        pin: '<path d="M12 17v5"/><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 16.24V16a1 1 0 0 1 1-1h12a1 1 0 0 1 1 1v.24a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1Z"/>',
         close: '<path d="M18 6 6 18"/><path d="m6 6 12 12"/>'
       };
       return '<svg viewBox="0 0 24 24" aria-hidden="true">' + (paths[name] || '') + '</svg>';
@@ -3918,7 +4088,7 @@
       const res = await fetch(entry.url, { cache: 'no-store' });
       if (!res.ok) throw new Error(t('ampr.error.download'));
       const bytes = await res.arrayBuffer();
-      let url = '/api/gc/ampr/upload?version=' + encodeURIComponent(entry.version) +
+      let url = '/api/gc/ampr/custom?version=' + encodeURIComponent(entry.version) +
         '&sourceUrl=' + encodeURIComponent(entry.url) +
         '&setLatest=' + encodeURIComponent(options && options.setLatest === false ? '0' : '1');
       if (entry.sha256) url += '&sha256=' + encodeURIComponent(entry.sha256);
@@ -3998,7 +4168,7 @@
         throw new Error(t('ampr.error.customHash'));
       }
       const version = amprCustomVersionForSha(sha256);
-      const url = '/api/gc/ampr/upload?version=' + encodeURIComponent(version) +
+      const url = '/api/gc/ampr/custom?version=' + encodeURIComponent(version) +
         '&sourceUrl=' + encodeURIComponent(amprCustomSourceUrl(file)) +
         '&sha256=' + encodeURIComponent(sha256) +
         '&setLatest=0';
@@ -4018,7 +4188,7 @@
     }
 
     async function updateAmprForGame(g) {
-      if (!g || !g.sourcePath || state.amprBusy || jobIsBusy()) return;
+      if (!g || !g.sourcePath || state.amprBusy) return;
       state.amprBusy = true;
       refreshPrimaryArea(g);
       try {
@@ -4041,7 +4211,7 @@
     }
 
     async function restoreOriginalAmprForGame(g) {
-      if (!g || !g.sourcePath || state.amprBusy || jobIsBusy()) return;
+      if (!g || !g.sourcePath || state.amprBusy) return;
       state.amprBusy = true;
       refreshPrimaryArea(g);
       try {
@@ -4087,7 +4257,7 @@
         manifestError = err.message || t('ampr.error.manifestFetch');
       }
       try {
-        const cached = await api('/api/gc/ampr/versions');
+        const cached = await api('/api/gc/ampr/custom');
         (cached.versions || []).forEach((entry) => {
           mergeAmprVersionEntry(map, Object.assign({}, entry, { cached: true }));
         });
@@ -4136,15 +4306,19 @@
       const list = $('ampr-version-list');
       const status = $('ampr-version-status');
       const apply = $('ampr-version-apply');
-      const cancel = $('ampr-version-cancel');
       const close = $('ampr-version-close');
-      const custom = $('ampr-custom-upload');
+      const manageCustom = $('ampr-manage-custom');
+      const pin = $('ampr-version-pin');
+      const restore = $('ampr-version-restore');
+      const build = $('ampr-version-build');
       if (!list || !status || !apply) return;
       if (g) {
         $('ampr-version-title').textContent = t('ampr.versionTitleGame', {
           game: isolateAuto(g.name || g.titleId)
         });
       }
+      const pinnedVersion = g && amprSafeVersion(g.amprPinnedVersion)
+        ? g.amprPinnedVersion : '';
       if (state.amprPickerLoading) {
         list.innerHTML = '<div class="empty">' + escapeHtml(t('ampr.loadingVersions')) + '</div>';
       } else if (state.amprPickerError) {
@@ -4155,6 +4329,7 @@
         list.innerHTML = state.amprPickerVersions.map((entry) => {
           const selected = entry.version === state.amprPickerSelected;
           const current = amprEntryIsCurrent(g, entry);
+          const pinned = pinnedVersion && entry.version === pinnedVersion;
           const chips = [];
           if (current) chips.push(t('common.current'));
           if (entry.isLatest) chips.push(t('common.latest'));
@@ -4169,6 +4344,8 @@
               : t('ampr.shaAfterDownload'),
             entry.cached ? t('ampr.storedOnPs5') : t('ampr.downloadsBeforeApplying')
           ].join(' - ');
+          const pinnedBadge = pinned
+            ? '<span class="chip ampr-pinned">' + escapeHtml(smallLabel(t('ampr.pinned'))) + '</span>' : '';
           return '<button class="format-row' +
             (selected ? ' is-selected' : '') +
             '" type="button" data-ampr-version="' + escapeHtml(entry.version) + '">' +
@@ -4176,24 +4353,49 @@
             '<div class="history-title">' + escapeHtml(t('status.aprVersion', { version: isolateLtr(entry.version) })) + '</div>' +
             '<div class="history-meta">' + escapeHtml(meta) + '</div>' +
             '</div>' +
-            '<span class="chip ' + (selected ? 'selected' : (current ? 'ok' : (entry.isLatest ? 'ampr' : ''))) + '">' +
+            '<div class="ampr-row-actions">' + pinnedBadge +
+            '<span class="chip ' + (selected ? 'selected' : (current ? 'ok' : (entry.isLatest ? 'ampr-latest' : ''))) + '">' +
             escapeHtml(selected ? t('common.selected') : chips[0]) + '</span>' +
+            '</div>' +
             '</button>';
         }).join('');
       }
       const selectedEntry = amprSelectedEntry();
       const selectedCurrent = amprEntryIsCurrent(g, selectedEntry);
+      const selectedPinned = selectedEntry && pinnedVersion === selectedEntry.version;
       apply.disabled = state.amprPickerLoading || state.amprPickerBusy ||
-        !selectedEntry || selectedCurrent || jobIsBusy();
+        !selectedEntry || selectedCurrent;
       apply.textContent = state.amprPickerBusy
         ? t('ampr.applying')
         : (selectedCurrent ? t('common.installed') : t('common.applyVersion'));
-      if (custom) {
-        custom.disabled = state.amprPickerLoading || state.amprPickerBusy ||
-          !g || jobIsBusy();
-        custom.textContent = state.amprPickerBusy ? t('common.working') : t('ampr.uploadCustom');
+      if (manageCustom) {
+        manageCustom.disabled = state.amprPickerLoading || state.amprPickerBusy ||
+          !g;
+        manageCustom.textContent = t('ampr.manageCustom');
       }
-      if (cancel) cancel.disabled = state.amprPickerBusy;
+      const canRestore = !!g && amprCanRestoreOriginal(g);
+      const canBuild = !!g && g.amprPresent === true &&
+        !gameAprIndexedFromLastState(g);
+      const gameBusy = !!(g && (g.activeOp || g.pendingOp)) || state.amprBusy;
+      if (restore) {
+        restore.hidden = !canRestore;
+        restore.disabled = !canRestore || state.amprPickerLoading ||
+          state.amprPickerBusy || gameBusy;
+        restore.textContent = t('operation.action.restoreAmpr');
+      }
+      if (build) {
+        build.hidden = !canBuild;
+        build.disabled = !canBuild || state.amprPickerLoading ||
+          state.amprPickerBusy || gameBusy;
+        build.textContent = t('operation.action.buildAprIndex');
+      }
+      const breakEl = $('ampr-version-break');
+      if (breakEl) breakEl.hidden = !(canRestore || canBuild);
+      if (pin) {
+        pin.disabled = state.amprPickerLoading || state.amprPickerBusy ||
+          !selectedEntry;
+        pin.textContent = selectedPinned ? t('ampr.unpin') : t('ampr.pinVersion');
+      }
       if (close) close.disabled = state.amprPickerBusy;
       if (state.amprPickerBusy) {
         status.textContent = state.amprPickerBusyTextKey
@@ -4201,14 +4403,26 @@
           : (state.amprPickerBusyText || t('ampr.preparing'));
       } else if (state.amprPickerError) {
         status.textContent = '';
-      } else if (selectedEntry) {
-        status.textContent = selectedCurrent
-          ? t('ampr.selectedInstalled')
-          : (selectedEntry.cached
-            ? t('ampr.selectedCached')
-            : t('ampr.selectedDownload'));
       } else {
-        status.textContent = '';
+        const mainStatus = selectedEntry
+          ? (selectedCurrent
+            ? t('ampr.selectedInstalled')
+            : (selectedEntry.cached
+              ? t('ampr.selectedCached')
+              : t('ampr.selectedDownload')))
+          : '';
+        const pinnedLabel = pinnedVersion
+          ? (amprVersionDisplay(pinnedVersion) || pinnedVersion)
+          : '';
+        const pinnedNote = pinnedVersion
+          ? '<div class="ampr-pinned-note">' + icon('pin') +
+            '<span>' + escapeHtml(t('ampr.pinnedStatus', {
+              version: isolateLtr(pinnedLabel)
+            })) + '</span></div>'
+          : '';
+        status.innerHTML = (mainStatus
+          ? '<div>' + escapeHtml(mainStatus) + '</div>'
+          : '') + pinnedNote;
       }
       list.querySelectorAll('[data-ampr-version]').forEach((button) => {
         button.addEventListener('click', () => {
@@ -4263,32 +4477,56 @@
     }
 
     async function uploadCustomAmprFile(file) {
-      let g = state.amprPickerGame;
-      if (!g || !file || state.amprPickerBusy || jobIsBusy()) return;
+      const g = state.amprCustomGame || state.amprPickerGame || selectedGame();
+      if (!g || !file || state.amprCustomBusy || jobIsBusy()) return;
+      if (isPs5Browser()) {
+        showPs5CustomAmprUploadMessage();
+        return;
+      }
+      state.amprCustomBusy = true;
+      state.amprBusy = true;
+      state.amprCustomBusyText = '';
+      state.amprCustomBusyTextKey = 'ampr.hashingUpload';
+      state.amprCustomError = '';
+      renderAmprCustomModal();
+      refreshPrimaryArea(g);
+      try {
+        await cacheCustomAmprFile(file);
+        const result = await loadAmprCustomVersions(g);
+        state.amprCustomVersions = result.versions || [];
+        state.amprCustomError = result.fetchError || '';
+      } catch (err) {
+        state.amprCustomError = err.message || t('ampr.error.customUpload');
+        alert(formatByteText(state.amprCustomError));
+      } finally {
+        state.amprCustomBusy = false;
+        state.amprBusy = false;
+        state.amprCustomBusyText = '';
+        state.amprCustomBusyTextKey = '';
+        renderAmprCustomModal();
+        refreshPrimaryArea(selectedGame());
+      }
+    }
+
+    async function amprPinVersion(g, version) {
+      if (!g || !g.titleId || state.amprPickerBusy) return;
+      const pinnedVersion = amprSafeVersion(g.amprPinnedVersion)
+        ? g.amprPinnedVersion : '';
+      const target = (version && version === pinnedVersion) ? '' : version;
       state.amprPickerBusy = true;
       state.amprBusy = true;
       state.amprPickerBusyText = '';
-      state.amprPickerBusyTextKey = 'ampr.hashingUpload';
-      state.amprPickerError = '';
+      state.amprPickerBusyTextKey = target ? 'ampr.pinning' : 'ampr.unpinning';
       renderAmprVersionModal();
       refreshPrimaryArea(g);
       try {
-        const entry = await cacheCustomAmprFile(file);
-        state.amprPickerVersions = [
-          entry,
-          ...state.amprPickerVersions.filter((item) => item.version !== entry.version)
-        ];
-        state.amprPickerSelected = entry.version;
-        if (amprEntryIsCurrent(g, entry)) return;
-        state.amprPickerBusyTextKey = 'ampr.applyingCustom';
-        renderAmprVersionModal();
-        hideModal('ampr-version-modal');
-        await enqueueAmprUpdate(g, entry.version, entry.sha256, 'custom');
-        state.amprPickerGame = null;
-        state.amprPickerVersions = [];
-        state.amprPickerSelected = '';
+        await api('/api/gc/ampr/pin?titleId=' + encodeURIComponent(g.titleId) +
+          '&version=' + encodeURIComponent(target), { method: 'POST' });
+        await refreshAll();
+        const updated = selectedGame() || g;
+        state.amprPickerGame = updated;
       } catch (err) {
-        state.amprPickerError = err.message || t('ampr.error.customUpload');
+        state.amprPickerError = err.message || t('ampr.error.pin');
         alert(formatByteText(state.amprPickerError));
       } finally {
         state.amprPickerBusy = false;
@@ -4300,10 +4538,162 @@
       }
     }
 
+    async function loadAmprCustomVersions(g) {
+      let versions = [];
+      let fetchError = '';
+      try {
+        const cached = await api('/api/gc/ampr/custom');
+        versions = (cached.versions || []).filter((entry) =>
+          amprSafeVersion(entry.version) &&
+          String(entry.version || '').indexOf('custom-') === 0
+        );
+      } catch (err) {
+        fetchError = err.message || t('ampr.error.versionList');
+      }
+      if (g && amprSafeVersion(g.amprLatestVersion) && g.amprLatestSha256) {
+        /* latest is a managed release, not a custom upload */
+      }
+      return { versions, fetchError };
+    }
+
+    function renderAmprCustomModal() {
+      const g = state.amprCustomGame;
+      const list = $('ampr-custom-list');
+      const status = $('ampr-custom-status');
+      const upload = $('ampr-custom-upload');
+      const close = $('ampr-custom-close');
+      if (!list || !status || !upload) return;
+      if (g) {
+        $('ampr-custom-title').textContent = t('ampr.manageCustomTitleGame', {
+          game: isolateAuto(g.name || g.titleId)
+        });
+      }
+      if (state.amprCustomLoading) {
+        list.innerHTML = '<div class="empty">' + escapeHtml(t('ampr.loadingVersions')) + '</div>';
+      } else if (state.amprCustomError) {
+        list.innerHTML = '<div class="empty">' + escapeHtml(state.amprCustomError) + '</div>';
+      } else if (!state.amprCustomVersions.length) {
+        list.innerHTML = '<div class="empty">' + escapeHtml(t('ampr.noCustomVersions')) + '</div>';
+      } else {
+        list.innerHTML = state.amprCustomVersions.map((entry) => {
+          const sizeText = amprSafeSize(entry.size)
+            ? t('ampr.size', { size: isolateLtr(shortSize(entry.size)) })
+            : '';
+          const shaText = entry.sha256
+            ? t('ampr.sha', { sha: isolateLtr(entry.sha256.slice(0, 12)) })
+            : '';
+          const meta = [sizeText, shaText].filter(Boolean).join(' - ');
+          return '<div class="format-row" data-ampr-custom-version="' + escapeHtml(entry.version) + '">' +
+            '<div>' +
+            '<div class="history-title">' + escapeHtml(t('status.aprVersion', { version: isolateLtr(entry.version) })) + '</div>' +
+            (meta ? '<div class="history-meta">' + escapeHtml(meta) + '</div>' : '') +
+            '</div>' +
+            '<div class="ampr-row-actions">' +
+            '<button class="ampr-delete-btn" type="button" data-ampr-delete="' + escapeHtml(entry.version) + '" ' +
+            'data-i18n="common.delete" title="' + escapeHtml(t('common.delete')) + '">' +
+            escapeHtml(t('common.delete')) + '</button>' +
+            '</div>' +
+            '</div>';
+        }).join('');
+      }
+      const busy = state.amprCustomBusy || jobIsBusy();
+      upload.disabled = state.amprCustomLoading || busy || !g;
+      upload.textContent = state.amprCustomBusy
+        ? t(state.amprCustomBusyTextKey || 'ampr.hashingUpload')
+        : t('ampr.uploadCustom');
+      if (close) close.disabled = state.amprCustomBusy;
+      if (state.amprCustomBusy) {
+        status.textContent = state.amprCustomBusyTextKey
+          ? t(state.amprCustomBusyTextKey)
+          : (state.amprCustomBusyText || t('ampr.preparing'));
+      } else if (state.amprCustomError) {
+        status.textContent = '';
+      } else if (!state.amprCustomVersions.length && !state.amprCustomLoading) {
+        status.textContent = t('ampr.customUploadHint');
+      } else {
+        status.textContent = '';
+      }
+      list.querySelectorAll('[data-ampr-delete]').forEach((button) => {
+        button.addEventListener('click', (event) => {
+          event.stopPropagation();
+          if (state.amprCustomBusy) return;
+          const version = button.getAttribute('data-ampr-delete') || '';
+          if (version) deleteAmprCustomVersion(version);
+        });
+      });
+    }
+
+    async function showAmprCustomModal(g) {
+      if (!g || !g.titleId) return;
+      state.amprCustomGame = g;
+      state.amprCustomVersions = [];
+      state.amprCustomLoading = true;
+      state.amprCustomBusy = false;
+      state.amprCustomBusyText = '';
+      state.amprCustomBusyTextKey = '';
+      state.amprCustomError = '';
+      renderAmprCustomModal();
+      showModal('ampr-custom-modal');
+      try {
+        const result = await loadAmprCustomVersions(g);
+        state.amprCustomVersions = result.versions || [];
+        state.amprCustomError = result.fetchError || '';
+      } catch (err) {
+        state.amprCustomVersions = [];
+        state.amprCustomError = err.message || t('ampr.error.versionList');
+      } finally {
+        state.amprCustomLoading = false;
+        renderAmprCustomModal();
+      }
+    }
+
+    function closeAmprCustomModal() {
+      if (state.amprCustomBusy) return;
+      hideModal('ampr-custom-modal');
+      state.amprCustomGame = null;
+      state.amprCustomVersions = [];
+      state.amprCustomLoading = false;
+      state.amprCustomBusyText = '';
+      state.amprCustomBusyTextKey = '';
+      state.amprCustomError = '';
+    }
+
+    async function deleteAmprCustomVersion(version) {
+      const g = state.amprCustomGame || selectedGame();
+      if (!g || !amprSafeVersion(version) || state.amprCustomBusy || jobIsBusy()) return;
+      if (!window.confirm(t('ampr.confirmDelete'))) return;
+      state.amprCustomBusy = true;
+      state.amprBusy = true;
+      state.amprCustomBusyText = '';
+      state.amprCustomBusyTextKey = 'ampr.deleting';
+      renderAmprCustomModal();
+      refreshPrimaryArea(g);
+      try {
+        await api('/api/gc/ampr/custom?version=' + encodeURIComponent(version),
+          { method: 'DELETE' });
+        const result = await loadAmprCustomVersions(g);
+        state.amprCustomVersions = result.versions || [];
+        state.amprCustomError = result.fetchError || '';
+        startPollBurst(4000);
+        await refreshAll();
+        state.amprCustomGame = selectedGame() || g;
+      } catch (err) {
+        state.amprCustomError = err.message || t('ampr.error.delete');
+        alert(formatByteText(state.amprCustomError));
+      } finally {
+        state.amprCustomBusy = false;
+        state.amprBusy = false;
+        state.amprCustomBusyText = '';
+        state.amprCustomBusyTextKey = '';
+        renderAmprCustomModal();
+        refreshPrimaryArea(selectedGame());
+      }
+    }
+
     async function applySelectedAmprVersion() {
       let g = state.amprPickerGame;
       let entry = amprSelectedEntry();
-      if (!g || !entry || state.amprPickerBusy || jobIsBusy()) return;
+      if (!g || !entry || state.amprPickerBusy) return;
       if (amprEntryIsCurrent(g, entry)) return;
       state.amprPickerBusy = true;
       state.amprBusy = true;
@@ -4694,8 +5084,9 @@
 
     function detailStatusChip(g) {
       if (!g) return '';
-      if (g.activeOp || g.pendingOp ||
-        g.sourceKind === 'compressed' || g.sourceKind === 'unknown') {
+      if (g.activeOp || g.pendingOp) return statusChip(g);
+      if (g.amprUpdateNeeded === true) return '';
+      if (g.sourceKind === 'compressed' || g.sourceKind === 'unknown') {
         return statusChip(g);
       }
       return '';
@@ -4708,11 +5099,11 @@
 	    }
 
 	    function aprIndexedChip(item) {
-      return item && item.aprIndexed ? '<span class="chip ok">' + escapeHtml(t('status.aprIndexed')) + '</span>' : '';
+      return item && item.aprIndexed ? '<span class="chip ampr">' + escapeHtml(smallLabel(t('status.aprIndexed'))) + '</span>' : '';
 	    }
 
 	    function amprUpdateChip(g) {
-      return g && g.amprUpdateNeeded === true ? '<span class="chip ampr">' + escapeHtml(t('status.aprUpdateNeeded')) + '</span>' : '';
+      return g && g.amprUpdateNeeded === true ? '<span class="chip ampr">' + escapeHtml(smallLabel(t('status.aprUpdate'))) + '</span>' : '';
 	    }
 
 	    function amprCurrentVersion(g) {
@@ -4730,7 +5121,19 @@
 	    function amprVersionChip(g) {
 	      const version = amprCurrentVersion(g);
 	      const label = amprVersionDisplay(version);
-	      return label ? '<span class="chip ampr-version">' + escapeHtml(label) + '</span>' : '';
+	      if (!label) return '';
+	      const pinned = g && amprSafeVersion(g.amprPinnedVersion)
+	        ? g.amprPinnedVersion : '';
+	      if (pinned && String(pinned) === String(version)) return '';
+	      return '<span class="chip ampr-version">' + escapeHtml(smallLabel(label)) + '</span>';
+	    }
+
+	    function amprPinnedChip(g) {
+	      const version = g && amprSafeVersion(g.amprPinnedVersion)
+	        ? g.amprPinnedVersion : '';
+	      if (!version) return '';
+	      return '<span class="chip ampr-pinned">' +
+	        escapeHtml(smallLabel(t('status.aprPinned', { version: isolateLtr(version) }))) + '</span>';
 	    }
 
 	    function amprCanRestoreOriginal(g) {
@@ -4782,7 +5185,7 @@
 	    }
 
 	    function aprIndexedChipForGame(g) {
-      return gameAprIndexedFromLastState(g) ? '<span class="chip ok">' + escapeHtml(t('status.aprIndexed')) + '</span>' : '';
+      return gameAprIndexedFromLastState(g) ? '<span class="chip ok apr-indexed">' + escapeHtml(smallLabel(t('status.aprIndexed'))) + '</span>' : '';
 	    }
 
 	    function instanceRoleChip(g) {
@@ -4802,7 +5205,7 @@
 	    }
 
 	    function rowTagLabel(tag) {
-	      return /^APR\b/.test(String(tag || '')) ? tag : smallLabel(tag);
+	      return smallLabel(tag);
 	    }
 
 	    function rowTagClass(tag) {
@@ -4819,13 +5222,16 @@
         ? t('status.currentOutput')
         : t('status.originalSource'));
 	      const amprVersion = amprCurrentVersion(g);
-	      if (amprVersion) tags.push(amprVersionDisplay(amprVersion));
-      if (g && g.amprUpdateNeeded === true) tags.push(t('status.aprUpdate'));
+	      const pinnedVersion = g && amprSafeVersion(g.amprPinnedVersion) ? g.amprPinnedVersion : '';
+	      if (pinnedVersion) tags.push({ label: t('status.aprPinned', { version: isolateLtr(pinnedVersion) }), cls: 'row-tag ampr-pinned' });
+	      else if (amprVersion) tags.push(amprVersionDisplay(amprVersion));
       if (count > 1) tags.push(t('status.locations', { count }));
 	      if (!tags.length) return '';
-	      return '<div class="row-tags">' + tags.map((tag) => (
-	        '<span class="' + rowTagClass(tag) + '">' + escapeHtml(rowTagLabel(tag)) + '</span>'
-	      )).join('') + '</div>';
+	      return '<div class="row-tags">' + tags.map((tag) => {
+	        const label = typeof tag === 'string' ? tag : tag.label;
+	        const cls = typeof tag === 'string' ? rowTagClass(tag) : tag.cls;
+	        return '<span class="' + cls + '">' + escapeHtml(rowTagLabel(label)) + '</span>';
+	      }).join('') + '</div>';
 	    }
 
     function opCanRepairBlocks(op) {
@@ -5689,9 +6095,11 @@
     }
 
     function ensureIconLoaded(path) {
-      if (!path || state.iconCache[path] || state.iconRequests[path] || state.iconFailures[path]) return;
-      state.iconRequests[path] = true;
-      fetch(path, { cache: 'force-cache' })
+      if (!path) return Promise.resolve();
+      if (state.iconCache[path]) return Promise.resolve();
+      if (state.iconRequests[path]) return state.iconRequests[path];
+      if (state.iconFailures[path]) return Promise.resolve();
+      const p = fetch(path, { cache: 'force-cache' })
         .then((res) => {
           if (!res.ok) throw new Error('icon fetch failed');
           return res.blob();
@@ -5707,6 +6115,16 @@
         .finally(() => {
           delete state.iconRequests[path];
         });
+      state.iconRequests[path] = p;
+      return p;
+    }
+
+    function preloadFullIcons(games) {
+      if (!Array.isArray(games)) return Promise.resolve();
+      return Promise.all(games.map((g) => {
+        if (!g || !g.hasIcon) return Promise.resolve();
+        return ensureIconLoaded(iconPath(g, ''));
+      }));
     }
 
     function gameIcon(g, hero) {
@@ -5774,6 +6192,7 @@
         g.amprPresent, g.amprUpdateNeeded, g.amprPath, g.amprVersion,
         g.amprSha256,
         g.amprLatestVersion, g.amprLatestSha256, g.amprUpdateSupported,
+        g.amprPinnedVersion,
         g.amprOriginalAvailable, g.amprOriginalSha256, g.amprOriginalSize,
         g.sizePending, g.sizeStatus, g.sizeEstimated,
         g.sizeMeasuredAt, g.sizeRefreshing,
@@ -5976,7 +6395,8 @@
     function smallLabel(s) {
       const value = String(s || '');
       const locale = i18n ? String(i18n.getLocale() || 'en') : 'en';
-      return locale.split('-')[0] === 'en' ? value.toLowerCase() : value;
+      if (locale.split('-')[0] !== 'en') return value;
+      return value.toLowerCase().replace(/apr(-emu)?/g, (token) => token.toUpperCase());
     }
 
     function baseActionFor(g) {
@@ -6363,7 +6783,6 @@
       if (!g || !g.sourcePath || g.activeOp || g.pendingOp || g.sourceKind === 'unknown') return [];
       const actions = [];
       const sourceKind = String(g.sourceKind || '').toLowerCase();
-      const canBuildAmprIndex = g.amprPresent === true;
       const primaryAction = actionFor(g);
       const normalAction = baseActionFor(g);
       if (primaryAction === 'update-ampr' && normalAction) {
@@ -6372,27 +6791,15 @@
       if (g.amprPresent === true) {
         actions.push({ id: 'choose-ampr-version', label: t('operation.action.chooseAmpr') });
       }
-      if (amprCanRestoreOriginal(g)) {
-        actions.push({ id: 'restore-ampr-original', label: t('operation.action.restoreAmpr') });
-      }
       if (sourceKind === 'folder') {
         actions.push({ id: 'make-image', label: t('operation.action.makeImage') });
-        if (canBuildAmprIndex) {
-          actions.push({ id: 'build-ampr-index', label: t('operation.action.buildAprIndex') });
-        }
       }
       if (sourceKind === 'compressed' || actionFor(g) === 'validate-repair') {
         actions.push({ id: 'validate-only', label: t('operation.action.validateOnly') });
-        if (canBuildAmprIndex) {
-          actions.push({ id: 'build-ampr-index', label: t('operation.action.buildAprIndex') });
-        }
         actions.push({ id: 'uncompress', label: t('operation.action.uncompress') });
       }
       if (sourceKind === 'image') {
         actions.push({ id: 'set-read-only', label: t('operation.action.setReadOnly') });
-        if (canBuildAmprIndex) {
-          actions.push({ id: 'build-ampr-index', label: t('operation.action.buildAprIndex') });
-        }
         if (g.isMounted === true) {
           actions.push({ id: 'extract-image', label: t('operation.action.extractFolder') });
         }
@@ -6442,8 +6849,8 @@
           : visualShowsPercent(visual, progress)
             ? progress.percent
             : null;
-        const fillPercent = scanProgress
-          ? (scanProgress.countable ? scanProgress.percent : 0)
+        const fillPercent = (scanProgress && scanProgress.countable)
+          ? scanProgress.percent
           : progressFillPercent(progress, visual);
         const cancelAttrs = cancelDisabled
           ? ' disabled title="' + escapeHtml(cancelDisabledReason || t('operation.cancelUnavailable')) + '"'
@@ -6778,6 +7185,7 @@
         detailStatusChip(g) +
 	        amprUpdateChip(g) +
 	        amprVersionChip(g) +
+	        amprPinnedChip(g) +
 	        aprIndexedChipForGame(g) +
 	        sizeChip(g) +
 	        savedChip(g) +
@@ -7005,8 +7413,8 @@
 	        scanLine.remove();
 	      }
 	      if (fill) {
-        fill.style.width = (scanProgress
-          ? (scanProgress.countable ? scanProgress.percent : 0)
+        fill.style.width = ((scanProgress && scanProgress.countable)
+          ? scanProgress.percent
           : progressFillPercent(progress, visual)).toFixed(1) + '%';
       }
       if (elapsed) {
@@ -7101,6 +7509,7 @@
           api('/api/gc/history'),
           api('/api/gc/job').catch(() => null)
         ]);
+        await preloadFullIcons(games.games || []);
         state.gamesLoading = false;
         state.gamesLoaded = true;
 	        state.gamesError = '';
@@ -8280,6 +8689,7 @@
       $('history-close').innerHTML = icon('close');
       $('usb-close').innerHTML = icon('close');
       $('ampr-version-close').innerHTML = icon('close');
+      $('ampr-custom-close').innerHTML = icon('close');
       $('format-close').innerHTML = icon('close');
       $('uncompress-close').innerHTML = icon('close');
       $('delete-close').innerHTML = icon('close');
@@ -8319,10 +8729,35 @@
       $('terminate-top').addEventListener('click', terminateProgram);
       $('usb-close').addEventListener('click', closeUsbModal);
       $('ampr-version-close').addEventListener('click', closeAmprVersionModal);
-      $('ampr-version-cancel').addEventListener('click', closeAmprVersionModal);
       $('ampr-version-apply').addEventListener('click', applySelectedAmprVersion);
+      $('ampr-version-pin').addEventListener('click', () => {
+        const g = state.amprPickerGame || selectedGame();
+        const entry = amprSelectedEntry();
+        if (!g || !entry) return;
+        amprPinVersion(g, entry.version);
+      });
+      $('ampr-manage-custom').addEventListener('click', () => {
+        const g = state.amprPickerGame || selectedGame();
+        if (!g) return;
+        showAmprCustomModal(g);
+      });
+      $('ampr-version-restore').addEventListener('click', () => {
+        const g = state.amprPickerGame || selectedGame();
+        if (!g) return;
+        if (g.activeOp || g.pendingOp || state.amprBusy) return;
+        closeAmprVersionModal();
+        restoreOriginalAmprForGame(g);
+      });
+      $('ampr-version-build').addEventListener('click', () => {
+        const g = state.amprPickerGame || selectedGame();
+        if (!g || g.amprPresent !== true || gameAprIndexedFromLastState(g)) return;
+        if (g.activeOp || g.pendingOp || state.amprBusy) return;
+        closeAmprVersionModal();
+        startAction(g, false, 'build-ampr-index');
+      });
+      $('ampr-custom-close').addEventListener('click', closeAmprCustomModal);
       $('ampr-custom-upload').addEventListener('click', () => {
-        if (state.amprPickerBusy || state.amprPickerLoading || jobIsBusy()) return;
+        if (state.amprCustomBusy || state.amprCustomLoading || jobIsBusy()) return;
         if (isPs5Browser()) {
           showPs5CustomAmprUploadMessage();
           return;
@@ -8415,6 +8850,7 @@
           if (event.target !== modal) return;
           if (modal.id === 'usb-modal') closeUsbModal();
           else if (modal.id === 'ampr-version-modal') closeAmprVersionModal();
+          else if (modal.id === 'ampr-custom-modal') closeAmprCustomModal();
           else if (modal.id === 'format-modal') closeCompressFormatModal();
           else if (modal.id === 'uncompress-modal') closeUncompressModal();
           else if (modal.id === 'delete-modal') closeDeleteModal();
@@ -8444,6 +8880,8 @@
         if (event.key === 'Escape') {
           if (languageMenuIsOpen()) closeLanguageMenu(true);
           closeSecondaryMenu();
+          closeAmprVersionModal();
+          closeAmprCustomModal();
           closeUncompressModal();
           closeDeleteModal();
         }

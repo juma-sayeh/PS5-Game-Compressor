@@ -5,5 +5,6 @@ void gc_diag_init(void);
 void gc_diag_install_signal_handlers(void);
 void gc_checkpoint(const char *checkpoint);
 void gc_log(const char *fmt, ...);
+void gc_trace(const char *fmt, ...);
 
 #endif

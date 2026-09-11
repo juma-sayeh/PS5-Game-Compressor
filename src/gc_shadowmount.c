@@ -3,6 +3,9 @@
  */
 
 #include "gc_shadowmount.h"
+#include "gc_shadowmount_api.h"
+#include "gc_diag.h"
+#include "pfs_compress.h"
 
 #include <ctype.h>
 #include <dirent.h>
@@ -32,16 +35,9 @@
 #define SHADOWMOUNT_MANUAL_LIST SHADOWMOUNT_DIR "/manual.lst"
 #define SHADOWMOUNT_MANUAL_LIST_TMP \
   SHADOWMOUNT_DIR "/manual.lst.game-compressor.tmp"
+#define SHADOWMOUNT_PAYLOAD_DIR "/data/pldmgr/payloads"
 #define SHADOWMOUNT_PAYLOAD_MANAGER_ELF \
-  "/data/pldmgr/payloads/ShadowMountPlus/shadowmountplus.elf"
-#define SHADOWMOUNT_PAYLOAD_MANAGER_ELF_LEGACY \
-  "/data/pldmgr/payloads/shadowmountplus/shadowmountplus.elf"
-#define SHADOWMOUNT_PAYLOAD_MANAGER_DIR \
-  "/data/pldmgr/payloads/ShadowMountPlus"
-#define SHADOWMOUNT_PAYLOAD_MANAGER_DIR_LEGACY \
-  "/data/pldmgr/payloads/shadowmountplus"
-#define SHADOWMOUNT_AUTOLOADER_ELF \
-  "/data/ps5_autoloader/shadowmountplus.elf"
+  SHADOWMOUNT_PAYLOAD_DIR "/ShadowMountPlus/shadowmountplus.elf"
 #define SHADOWMOUNT_AUTOLOADER_DIR "/data/ps5_autoloader"
 #define PAYLOAD_MANAGER_PORT 8084
 #define LOCAL_HTTP_TIMEOUT_SECONDS 5
@@ -856,7 +852,7 @@ gc_shadowmount_write_pfsc_hints(const char *outer_path,
                                 const char *nested_name,
                                 int nested_type,
                                 char *err,
-                                size_t err_size) {
+                                 size_t err_size) {
   if(err && err_size) err[0] = 0;
   if(upsert_sector_hint(outer_path, SHADOWMOUNT_PFSC_SECTOR,
                         err, err_size) != 0) {
@@ -978,7 +974,7 @@ gc_shadowmount_remove_pfsc_hints(const char *outer_path,
 int
 gc_shadowmount_remove_outer_sector_hint(const char *outer_path,
                                         char *err,
-                                        size_t err_size) {
+                                          size_t err_size) {
   if(err && err_size) err[0] = 0;
   if(!outer_path || !outer_path[0]) return 0;
   return remove_sector_hint(outer_path, err, err_size);
@@ -1078,12 +1074,175 @@ done:
 }
 
 static int
+sm_api_wait_for_game_unmounted(const char *title_id, int max_attempts,
+                                const char *context) {
+  if(!title_id || !shadowmount_title_id_valid(title_id)) return 1;
+  for(int attempt = 0; attempt < max_attempts; attempt++) {
+    char poll_err[256] = {0};
+    gc_sm_game_t g;
+    memset(&g, 0, sizeof(g));
+    if(gc_shadowmount_api_get_game_info(title_id, &g,
+                                        poll_err,
+                                        sizeof(poll_err)) != 0) {
+      return 1;
+    }
+    if(!g.mounted) {
+      return 1;
+    }
+    usleep(500000);
+  }
+  gc_log("shadowmount title-source scan: title still mounted after %s poll title=%s",
+         context ? context : "unmount", title_id);
+  return 0;
+}
+
+static int
+sm_api_wait_for_game_mounted(const char *title_id, int max_attempts,
+                              const char *context) {
+  if(!title_id || !shadowmount_title_id_valid(title_id)) return 0;
+  for(int attempt = 0; attempt < max_attempts; attempt++) {
+    char poll_err[256] = {0};
+    char mounted_title[GC_SM_TITLE_ID_LEN];
+    mounted_title[0] = 0;
+    /*
+     * Confirm via the games list that our title is now the mounted
+     * game (the image appeared in the list and is mounted), rather
+     * than trusting the single mount call's response alone.
+     */
+    if(gc_shadowmount_api_find_mounted_game(mounted_title,
+                                            sizeof(mounted_title),
+                                            poll_err,
+                                            sizeof(poll_err)) == 1 &&
+       mounted_title[0] && strcmp(mounted_title, title_id) == 0) {
+      return 1;
+    }
+    usleep(500000);
+  }
+  gc_log("shadowmount title-source scan: title not mounted after %s poll title=%s",
+         context ? context : "mount", title_id);
+  return 0;
+}
+
+static int
+sm_api_wait_for_scan_not_queued(const char *context) {
+  for(int attempt = 0; attempt < 120; attempt++) {
+    char poll_err[256] = {0};
+    gc_sm_storage_job_t job;
+    memset(&job, 0, sizeof(job));
+    if(gc_shadowmount_api_get_storage_job_status(0, 0, &job, poll_err,
+                                                 sizeof(poll_err)) == 0) {
+      if(!job.scan_queued) {
+        return 1;
+      }
+    }
+    usleep(500000);
+  }
+  gc_log("shadowmount %s scan: scan still queued after %d polls",
+         context ? context : "scan", 120);
+  return 0;
+}
+
+static int
+sm_api_wait_for_image_ready(const char *title_id, const char *source_path,
+                            int max_attempts, const char *context) {
+  struct stat st;
+  int have_st = 0;
+  if(!title_id || !shadowmount_title_id_valid(title_id)) return 0;
+  if(!source_path || !source_path[0]) return 1;
+  if(stat(source_path, &st) == 0) have_st = 1;
+  for(int attempt = 0; attempt < max_attempts; attempt++) {
+    char poll_err[256] = {0};
+    gc_sm_image_t img;
+    memset(&img, 0, sizeof(img));
+    /*
+     * Check the image status via the API: the image must be registered
+     * (found), complete and available, and SM's recorded mtime must
+     * match the file's actual mtime — i.e. the async scan has re-read
+     * the patched image so the mount will use fresh metadata.
+     */
+    if(gc_shadowmount_api_find_image(source_path, &img,
+                                     poll_err, sizeof(poll_err)) == 1 &&
+       img.complete && img.source_available &&
+       (!have_st || img.mtime_sec == (long long)st.st_mtime)) {
+      return 1;
+    }
+    usleep(500000);
+  }
+  gc_log("shadowmount title-source scan: image not ready after %s poll title=%s path=%s",
+         context ? context : "scan", title_id,
+         source_path ? source_path : "<none>");
+  return 0;
+}
+
+static int
+request_source_scan_via_api(const char *title_id, const char *source_path,
+                            char *err, size_t err_size) {
+  char api_err[256] = {0};
+  gc_sm_storage_space_t storage;
+  memset(&storage, 0, sizeof(storage));
+  if(gc_shadowmount_api_get_storage_space(&storage,
+                                          api_err,
+                                          sizeof(api_err)) != 0) {
+    gc_log("shadowmount source scan: storage query failed err=%s",
+           api_err[0] ? api_err : "unknown");
+    return -1;
+  }
+  for(int i = 0; i < storage.count; i++) {
+    const gc_sm_storage_mount_t *m = &storage.mounts[i];
+    int match = 0;
+    if(m->source[0] &&
+      strcasecmp(m->source, source_path) == 0) {
+      match = 1;
+    }
+    if(!match && title_id &&
+      shadowmount_title_id_valid(title_id) &&
+      m->mount_point[0] &&
+      strstr(m->mount_point, title_id) != NULL) {
+      match = 1;
+    }
+    if(match) {
+      if(title_id && shadowmount_title_id_valid(title_id)) {
+        char unmount_err[256] = {0};
+        if(gc_shadowmount_api_unmount_game(title_id, unmount_err,
+                                           sizeof(unmount_err)) != 0) {
+          gc_log("shadowmount source scan: unmount failed title=%s err=%s", title_id,
+                 unmount_err[0] ? unmount_err : "unknown");
+        }
+      }
+      break;
+    }
+  }
+  api_err[0] = 0;
+  if (gc_shadowmount_api_remove_manual_source(source_path, NULL,
+                                                api_err,
+                                                sizeof(api_err))) {
+    return -1;
+  }
+  api_err[0] = 0;
+  if(gc_shadowmount_api_add_manual_source(source_path, NULL,
+                                          api_err,
+                                          sizeof(api_err)) != 0) {
+    return -1;
+  }
+  api_err[0] = 0;
+  if(gc_shadowmount_api_scan(api_err, sizeof(api_err)) != 0) {
+    return -1;
+  }
+  sm_api_wait_for_scan_not_queued("source-scan");
+  return 0;
+}
+
+static int
 request_source_scan_locked(const char *title_id, const char *source_path,
                            char *err, size_t err_size) {
   if(err && err_size) err[0] = 0;
   if(!source_path || source_path[0] != '/') {
     set_err(err, err_size, "bad ShadowMount source path");
     return -1;
+  }
+  if(gc_shadowmount_api_available()) {
+    return request_source_scan_via_api(title_id, source_path,
+                                       err, err_size);
   }
   if(mkdir_if_needed(SHADOWMOUNT_DIR) != 0) {
     set_errno_err(err, err_size, "create /data/shadowmount");
@@ -1102,15 +1261,156 @@ gc_shadowmount_request_source_scan(const char *source_path,
   return request_source_scan_locked(NULL, source_path, err, err_size);
 }
 
+static int
+request_title_source_scan_via_api(const char *title_id,
+                                   const char *source_path,
+                                   char *err, size_t err_size) {
+  const char *mount_mode = NULL;
+  if(source_path && source_path[0]) {
+    size_t slen = strlen(source_path);
+    if(slen >= 7 && strcasecmp(source_path + slen - 7, ".ffpfsc") == 0) {
+      mount_mode = "ro";
+    }
+  }
+
+  /*
+   * Folder sources are directly accessible on disk and don't need
+   * to be mounted via the ShadowMount API.  The API mount resolves
+   * by title_id, and SM's internal game database only registers
+   * image files (.ffpfsc/.exfat/.ffpfs), not folders — so the API
+   * call would fail with HTTP 404 "No such file or directory".
+   *
+   * Skip the mount when the source path does not exist on disk
+   * either (for example a compression output that has not been
+   * created yet): SM cannot mount a missing file by title_id, and
+   * the request would always return HTTP 404 "No such file or
+   * directory".
+   */
+  if(source_path && source_path[0]) {
+    struct stat source_st;
+    if(stat(source_path, &source_st) == 0) {
+      if(S_ISDIR(source_st.st_mode)) {
+        return 0;
+      }
+    } else {
+      return 0;
+    }
+  }
+
+  /*
+   * 1. Unmount the title if currently mounted.  Even when the SM
+   *    API unmount returns success, the kernel PFS driver may still
+   *    hold a stale vnode on the old inode.  Poll the games list
+   *    until SM confirms the title is no longer mounted before
+   *    attempting a fresh mount, otherwise POST /games/mount
+   *    returns HTTP 500 EIO.
+   */
+  {
+    char unmount_err[256] = {0};
+    gc_shadowmount_api_unmount_game(title_id, unmount_err,
+                                    sizeof(unmount_err));
+  }
+  sm_api_wait_for_game_unmounted(title_id, 10, "unmount");
+
+  /*
+   * 2. Remove and re-add the manual source so SM drops any cached
+   *    metadata for the patched file and re-registers it.
+   *
+   * SM's game database may still point at the title's previous
+   * source path (e.g. a folder that was hidden by the mount-switch
+   * competitor-hiding step).  Remove that stale path from the
+   * manual sources list so SM stops resolving the title to a
+   * now-missing folder, otherwise POST /games/mount fails with
+   * HTTP 404 "No such file or directory".
+   */
+  if(source_path && source_path[0] == '/') {
+    char api_err[256] = {0};
+    gc_sm_game_t sm_game;
+    memset(&sm_game, 0, sizeof(sm_game));
+    if(gc_shadowmount_api_get_game_info(title_id, &sm_game,
+                                        api_err, sizeof(api_err)) == 0) {
+      char rm_err[256] = {0};
+      gc_shadowmount_api_remove_manual_source(sm_game.path, NULL,
+                                               rm_err, sizeof(rm_err));
+    }
+    api_err[0] = 0;
+    gc_shadowmount_api_add_manual_source(source_path, NULL,
+                                          api_err, sizeof(api_err));
+  }
+
+  /*
+   * 3. Re-scan so SM re-registers the title against the newly added
+   *    image source before we ask it to mount by title_id.
+   *    Scanning right after the manual add (and before the mount)
+   *    lets SM pick up the new image file first.
+   */
+  {
+    char scan_err[256] = {0};
+    if(gc_shadowmount_api_scan(scan_err, sizeof(scan_err)) != 0) {
+      snprintf(err, err_size, "%s",
+               scan_err[0] ? scan_err :
+               "ShadowMount API scan failed before mount");
+      gc_log("shadowmount title-source scan: pre-mount scan failed title=%s err=%s",
+             title_id, scan_err[0] ? scan_err : "unknown");
+      return -1;
+    }
+    sm_api_wait_for_image_ready(title_id, source_path, 120, "pre-mount");
+  }
+
+  /*
+   * 4. Mount the title, then poll the games list until SM confirms
+   *    the title is mounted.
+   */
+  if(gc_shadowmount_api_mount_game_mode(title_id, mount_mode,
+                                         err, err_size) != 0) {
+    return -1;
+  }
+  sm_api_wait_for_game_mounted(title_id, 10, "mount");
+
+  /*
+   * 5. Call scan AFTER the mount so SM refreshes its cached
+   *    metadata (block offsets, sizes) for the patched image.
+   */
+  {
+    char scan_err[256] = {0};
+    if(gc_shadowmount_api_scan(scan_err, sizeof(scan_err)) != 0) {
+      gc_log("shadowmount title-source scan: post-mount scan failed title=%s err=%s",
+             title_id, scan_err[0] ? scan_err : "unknown");
+    }
+    sm_api_wait_for_scan_not_queued("post-mount");
+  }
+
+  return 0;
+}
+
 int
 gc_shadowmount_request_title_source_scan(const char *title_id,
-                                         const char *source_path,
-                                         char *err, size_t err_size) {
+                                           const char *source_path,
+                                           char *err, size_t err_size) {
   if(!shadowmount_title_id_valid(title_id)) {
     set_err(err, err_size, "bad ShadowMount title id");
     return -1;
   }
+
+  if(gc_shadowmount_api_available()) {
+    return request_title_source_scan_via_api(title_id, source_path,
+                                             err, err_size);
+  }
   return request_source_scan_locked(title_id, source_path, err, err_size);
+}
+
+int
+gc_shadowmount_unmount_title(const char *title_id,
+                             char *err, size_t err_size) {
+  if(!shadowmount_title_id_valid(title_id)) {
+    set_err(err, err_size, "bad ShadowMount title id");
+    return -1;
+  }
+  if(err && err_size) err[0] = 0;
+  if(gc_shadowmount_api_available()) {
+    return gc_shadowmount_api_unmount_game(title_id, err, err_size);
+  }
+  return gc_shadowmount_request_scan(err, err_size);
 }
 
 int
@@ -1119,6 +1419,13 @@ gc_shadowmount_request_scan(char *err, size_t err_size) {
   struct timeval tv[2];
   struct stat st;
   if(err && err_size) err[0] = 0;
+  if(gc_shadowmount_api_available()) {
+    if(gc_shadowmount_api_scan(err, err_size) != 0) {
+      return -1;
+    }
+    sm_api_wait_for_scan_not_queued("scan");
+    return 0;
+  }
   if(mkdir_if_needed(SHADOWMOUNT_DIR) != 0) {
     set_errno_err(err, err_size, "create /data/shadowmount");
     return -1;
@@ -1183,62 +1490,72 @@ name_contains_shadowmount(const char *name) {
 
 static int
 find_shadowmount_fallback_elf(char *path, size_t path_size,
-                              char *detail, size_t detail_size) {
-  const struct {
-    const char *path;
-    int allow_first_valid;
-  } dirs[] = {
-      { SHADOWMOUNT_PAYLOAD_MANAGER_DIR, 1 },
-      { SHADOWMOUNT_PAYLOAD_MANAGER_DIR_LEGACY, 1 },
-      { SHADOWMOUNT_AUTOLOADER_DIR, 0 },
+                                char *detail, size_t detail_size) {
+  static const char *const scan_roots[] = {
+    SHADOWMOUNT_PAYLOAD_DIR,
+    SHADOWMOUNT_AUTOLOADER_DIR,
   };
-  char first_valid[PATH_MAX];
-  char candidate[PATH_MAX];
-  char candidate_detail[256];
+  char best_path[PATH_MAX];
+  time_t best_mtime = 0;
   size_t i;
-  first_valid[0] = 0;
+  best_path[0] = 0;
   if(path && path_size) path[0] = 0;
   if(detail && detail_size) detail[0] = 0;
-  for(i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
-    DIR *d = opendir(dirs[i].path);
+  for(i = 0; i < sizeof(scan_roots) / sizeof(scan_roots[0]); i++) {
+    DIR *d = opendir(scan_roots[i]);
     struct dirent *ent;
     if(!d) {
       if(detail && detail_size && !detail[0]) {
-        snprintf(detail, detail_size, "open %s: %s", dirs[i].path,
+        snprintf(detail, detail_size, "open %s: %s", scan_roots[i],
                  strerror(errno));
       }
       continue;
     }
     while((ent = readdir(d))) {
-      if(ent->d_name[0] == '.' || !ends_with_ci_local(ent->d_name, ".elf")) {
-        continue;
-      }
-      if(snprintf(candidate, sizeof(candidate), "%s/%s", dirs[i].path,
-                  ent->d_name) >= (int)sizeof(candidate)) {
-        continue;
-      }
-      candidate_detail[0] = 0;
-      if(!path_is_regular_elf(candidate, candidate_detail,
-                              sizeof(candidate_detail))) {
-        if(detail && detail_size && !detail[0]) {
-          snprintf(detail, detail_size, "%s",
-                   candidate_detail[0] ? candidate_detail : candidate);
+      char entry_path[PATH_MAX];
+      struct stat st;
+      if(ent->d_name[0] == '.') continue;
+      if(snprintf(entry_path, sizeof(entry_path), "%s/%s",
+                  scan_roots[i], ent->d_name) >= (int)sizeof(entry_path)) continue;
+      if(stat(entry_path, &st) != 0) continue;
+      if(S_ISDIR(st.st_mode)) {
+        DIR *sd = opendir(entry_path);
+        struct dirent *sent;
+        if(!sd) continue;
+        while((sent = readdir(sd))) {
+          char candidate[PATH_MAX];
+          struct stat sst;
+          if(sent->d_name[0] == '.' ||
+             !ends_with_ci_local(sent->d_name, ".elf")) continue;
+          if(snprintf(candidate, sizeof(candidate), "%s/%s",
+                      entry_path, sent->d_name) >= (int)sizeof(candidate)) continue;
+          if(stat(candidate, &sst) != 0 || !S_ISREG(sst.st_mode)) continue;
+          if(!name_contains_shadowmount(sent->d_name)) continue;
+          gc_log("shadowmount fallback: candidate=%s mtime=%ld",
+                 candidate, (long)sst.st_mtime);
+          if(sst.st_mtime > best_mtime) {
+            best_mtime = sst.st_mtime;
+            snprintf(best_path, sizeof(best_path), "%s", candidate);
+          }
         }
-        continue;
-      }
-      if(dirs[i].allow_first_valid && !first_valid[0]) {
-        snprintf(first_valid, sizeof(first_valid), "%s", candidate);
-      }
-      if(name_contains_shadowmount(ent->d_name)) {
-        closedir(d);
-        snprintf(path, path_size, "%s", candidate);
-        return 0;
+        closedir(sd);
+      } else if(S_ISREG(st.st_mode) &&
+                ends_with_ci_local(ent->d_name, ".elf") &&
+                name_contains_shadowmount(ent->d_name)) {
+        gc_log("shadowmount fallback: candidate=%s mtime=%ld",
+               entry_path, (long)st.st_mtime);
+        if(st.st_mtime > best_mtime) {
+          best_mtime = st.st_mtime;
+          snprintf(best_path, sizeof(best_path), "%s", entry_path);
+        }
       }
     }
     closedir(d);
   }
-  if(first_valid[0]) {
-    snprintf(path, path_size, "%s", first_valid);
+  gc_log("shadowmount fallback: best_path=%s mtime=%ld",
+         best_path[0] ? best_path : "<none>", (long)best_mtime);
+  if(best_path[0]) {
+    snprintf(path, path_size, "%s", best_path);
     return 0;
   }
   if(detail && detail_size && !detail[0]) {
@@ -1333,35 +1650,24 @@ payload_manager_launch(const char *elf_path, char *detail, size_t detail_size) {
   return 0;
 }
 
-int
-gc_shadowmount_restart_running(char *detail, size_t detail_size) {
+static int g_sm_ready_logged = 0;
+
+static int
+gc_shadowmount_restart_running_impl(char *detail, size_t detail_size) {
   char path[PATH_MAX];
-  char original_detail[512];
   char path_detail[256];
-  int use_payload_manager = 0;
-  const char *fallbacks[] = {
-      SHADOWMOUNT_PAYLOAD_MANAGER_ELF,
-      SHADOWMOUNT_PAYLOAD_MANAGER_ELF_LEGACY,
-      SHADOWMOUNT_AUTOLOADER_ELF,
-  };
-  size_t i;
-  int rc;
   if(detail && detail_size) detail[0] = 0;
   if(find_running_shadowmount_path(path, sizeof(path), detail, detail_size) != 0) {
+    char original_detail[512];
     snprintf(original_detail, sizeof(original_detail), "%s",
              detail && detail[0] ? detail : "running ShadowMount process not identified");
+    gc_log("shadowmount restart: process not found, trying fallback");
     path_detail[0] = 0;
     path[0] = 0;
-    for(i = 0; i < sizeof(fallbacks) / sizeof(fallbacks[0]); i++) {
-      if(path_is_regular_elf(fallbacks[i], path_detail, sizeof(path_detail))) {
-        snprintf(path, sizeof(path), "%s", fallbacks[i]);
-        use_payload_manager = 1;
-        break;
-      }
-    }
-    if(!path[0] &&
-       find_shadowmount_fallback_elf(path, sizeof(path), path_detail,
+    if(find_shadowmount_fallback_elf(path, sizeof(path), path_detail,
                                      sizeof(path_detail)) != 0) {
+      gc_log("shadowmount restart: fallback failed: %s",
+             path_detail[0] ? path_detail : "unknown");
       if(detail && detail_size) {
         snprintf(detail, detail_size, "%s; fallback unavailable: %s",
                  original_detail,
@@ -1369,17 +1675,18 @@ gc_shadowmount_restart_running(char *detail, size_t detail_size) {
       }
       return -1;
     }
-    if(path[0]) use_payload_manager = 1;
+    gc_log("shadowmount restart: fallback found path=%s", path);
+  } else {
+    gc_log("shadowmount restart: process found path=%s", path);
   }
-  if(use_payload_manager) {
+
+  gc_log("shadowmount restart: launching path=%s", path);
+  if(strncmp(path, SHADOWMOUNT_PAYLOAD_DIR,
+             sizeof(SHADOWMOUNT_PAYLOAD_DIR) - 1) == 0) {
     return payload_manager_launch(path, detail, detail_size);
   }
-  rc = sceKernelLoadStartModule(path, 0, NULL, 0, NULL, NULL);
+  int rc = sceKernelLoadStartModule(path, 0, NULL, 0, NULL, NULL);
   if(rc <= 0) {
-    if(strstr(path, "/data/pldmgr/payloads/") &&
-       payload_manager_launch(path, detail, detail_size) == 0) {
-      return 0;
-    }
     if(detail && detail_size) {
       snprintf(detail, detail_size, "launch ShadowMount executable failed rc=0x%08x path=%s",
                (unsigned)rc, path);
@@ -1391,4 +1698,25 @@ gc_shadowmount_restart_running(char *detail, size_t detail_size) {
              (unsigned)rc, path);
   }
   return 0;
+}
+
+int
+gc_shadowmount_restart_running(char *detail, size_t detail_size) {
+  if(detail && detail_size) detail[0] = 0;
+
+  const int rc = gc_shadowmount_restart_running_impl(detail, detail_size);
+  if (!g_sm_ready_logged) {
+    gc_sm_version_t sm_ver;
+
+    if(gc_shadowmount_api_probe(&sm_ver, NULL, 0) == 0) {
+      gc_log("ShadowMount API ready version=%s api=%d caps=%d",
+             sm_ver.shadowmount_version, sm_ver.api_version,
+             sm_ver.capability_count);
+    } else {
+      gc_log("ShadowMount API legacy mode");
+    }
+    g_sm_ready_logged = 1;
+  }
+
+  return rc;
 }

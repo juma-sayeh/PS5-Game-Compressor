@@ -70,13 +70,13 @@ websrv_write_all(int fd, const void *data, size_t size) {
 
 static int
 websrv_send_headers(int fd, int status, const char *mime, size_t size,
-                    const char *extra) {
+                    const char *cache_control, const char *extra) {
   char header[1024];
   int n = snprintf(header, sizeof(header),
                    "HTTP/1.1 %d %s\r\n"
                    "Connection: close\r\n"
                    "Access-Control-Allow-Origin: *\r\n"
-                   "Cache-Control: no-store, no-cache, must-revalidate, max-age=0\r\n"
+                   "Cache-Control: %s\r\n"
                    "Pragma: no-cache\r\n"
                    "Expires: 0\r\n"
                    "Content-Type: %s\r\n"
@@ -84,6 +84,8 @@ websrv_send_headers(int fd, int status, const char *mime, size_t size,
                    "%s"
                    "\r\n",
                    status, status_text(status),
+                   cache_control ? cache_control :
+                     "no-store, no-cache, must-revalidate, max-age=0",
                    mime ? mime : "application/octet-stream",
                    (unsigned long)size,
                    extra ? extra : "");
@@ -94,7 +96,18 @@ websrv_send_headers(int fd, int status, const char *mime, size_t size,
 int
 websrv_send(int fd, int status, const char *mime, const void *data,
             size_t size) {
-  if(websrv_send_headers(fd, status, mime, size, NULL) != 0) return -1;
+  if(websrv_send_headers(fd, status, mime, size, NULL, NULL) != 0) return -1;
+  if(size == 0) return 0;
+  return websrv_write_all(fd, data, size);
+}
+
+int
+websrv_send_cached(int fd, int status, const char *mime, const void *data,
+                   size_t size, int max_age_seconds) {
+  char cc[64];
+  if(max_age_seconds < 0) max_age_seconds = 0;
+  snprintf(cc, sizeof(cc), "public, max-age=%d, immutable", max_age_seconds);
+  if(websrv_send_headers(fd, status, mime, size, cc, NULL) != 0) return -1;
   if(size == 0) return 0;
   return websrv_write_all(fd, data, size);
 }
@@ -286,6 +299,7 @@ dispatch_request(const http_request_t *req) {
 		       !strcmp(req->path, "/api/gc/compress") ||
 		       !strcmp(req->path, "/api/gc/make-image") ||
 		       !strcmp(req->path, "/api/gc/uncompress") ||
+		       !strcmp(req->path, "/api/gc/size-priority") ||
 	       !strcmp(req->path, "/api/gc/extract-image") ||
 	       !strcmp(req->path, "/api/gc/set-read-only") ||
 	       !strcmp(req->path, "/api/gc/validate-repair") ||
@@ -297,11 +311,19 @@ dispatch_request(const http_request_t *req) {
 	       !strcmp(req->path, "/api/gc/copy-to-internal") ||
 	       !strcmp(req->path, "/api/gc/delete-game-data") ||
 	       !strcmp(req->path, "/api/gc/read-speed-test") ||
-	       !strcmp(req->path, "/api/gc/build-ampr-index") ||
-	       !strcmp(req->path, "/api/gc/ui-settings") ||
-	       !strcmp(req->path, "/api/gc/ampr/upload") ||
-	       !strcmp(req->path, "/api/gc/update-ampr") ||
-	       !strcmp(req->path, "/api/gc/restore-ampr-original")) {
+       !strcmp(req->path, "/api/gc/build-ampr-index") ||
+       !strcmp(req->path, "/api/gc/ui-settings") ||
+       !strcmp(req->path, "/api/gc/ampr/custom") ||
+       !strcmp(req->path, "/api/gc/ampr/pin") ||
+       !strcmp(req->path, "/api/gc/update-ampr") ||
+       !strcmp(req->path, "/api/gc/restore-ampr-original")) {
+      return gc_api_request(req, req->path);
+    }
+    return websrv_send_error_json(req->fd, 404, "not found");
+  }
+
+  if(!strcmp(req->method, "DELETE")) {
+    if(!strcmp(req->path, "/api/gc/ampr/custom")) {
       return gc_api_request(req, req->path);
     }
     return websrv_send_error_json(req->fd, 404, "not found");

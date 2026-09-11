@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.0.5 - 2026-08-29
+
+Compared `release1.0.5` against `v1.0.4`.
+
+Full release notes: [RELEASE_NOTES_1.0.5.md](RELEASE_NOTES_1.0.5.md).
+
+### Added
+
+- Added ShadowMountPlus API support (v1.17+ version).
+- Added per-title APR-EMU version pinning from the *APR-EMU Version* picker.
+  When the pinned version matches the installed one, the *Apr Update* primary
+  action and *APR update needed* chip are suppressed. The picker renders a
+  *Pinned* badge on the pinned version and a status note naming it.
+- Added a *Manage Custom APR* modal that manages `libSceAmpr.sprx` files. It
+  replaces the old *Upload Custom File* button in the version picker.
+
+## Fixed
+
+- Fixed some UI issues.
+
 ## 1.0.4 - 2026-08-21
 
 Compared `release1.0.4` against `v1.0.3`.

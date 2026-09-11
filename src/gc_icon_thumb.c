@@ -208,3 +208,49 @@ gc_icon_thumb_path(const char *title_id,
   cleanup_old_title_thumbs(title_id, out_path);
   return 0;
 }
+
+int
+gc_icon_thumb_from_memory(const unsigned char *source, int source_size,
+                           unsigned char **out, int *out_size) {
+  if(!source || source_size <= 0 || !out || !out_size) return -1;
+  *out = NULL;
+  *out_size = 0;
+
+  int width = 0, height = 0, channels = 0;
+  unsigned char *decoded = stbi_load_from_memory(source, source_size,
+                                                 &width, &height, &channels, 4);
+  if(!decoded || width <= 0 || height <= 0 || width > 4096 || height > 4096) {
+    if(decoded) stbi_image_free(decoded);
+    return -1;
+  }
+
+  const int thumb = GC_ICON_THUMB_SIZE;
+  unsigned char *resized = (unsigned char *)malloc((size_t)thumb *
+                                                    (size_t)thumb * 4U);
+  if(!resized) {
+    stbi_image_free(decoded);
+    return -1;
+  }
+
+  unsigned char *resize_result =
+      stbir_resize_uint8_srgb(decoded, width, height, width * 4,
+                               resized, thumb, thumb, thumb * 4,
+                               STBIR_RGBA);
+  stbi_image_free(decoded);
+  if(!resize_result) {
+    free(resized);
+    return -1;
+  }
+
+  int png_len = 0;
+  unsigned char *png = stbi_write_png_to_mem(resized, thumb * 4, thumb, thumb,
+                                              4, &png_len);
+  free(resized);
+  if(!png || png_len <= 0) {
+    return -1;
+  }
+
+  *out = png;
+  *out_size = png_len;
+  return 0;
+}

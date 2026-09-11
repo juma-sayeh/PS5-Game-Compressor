@@ -26,6 +26,7 @@ C_SRCS += src/gc_notify.c
 C_SRCS += src/gc_power_guard.c
 C_SRCS += src/gc_app_installer.c
 C_SRCS += src/gc_shadowmount.c
+C_SRCS += src/gc_shadowmount_api.c
 C_SRCS += src/gc_size_cache.c
 C_SRCS += src/gc_icon_thumb.c
 C_SRCS += src/ampr_index.c
