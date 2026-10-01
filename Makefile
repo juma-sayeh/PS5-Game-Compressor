@@ -9,8 +9,7 @@ endif
 include $(PS5_PAYLOAD_SDK)/toolchain/prospero.mk
 
 PYTHON ?= python3
-LLVM_BINDIR ?= $(shell dirname "$$(command -v clang 2>/dev/null || command -v llvm-strip 2>/dev/null || echo clang)" 2>/dev/null || echo .)
-LLVM_CONFIG ?= $(CURDIR)/build-tools/llvm-config
+LLVM_BINDIR ?= $(shell dirname "$$(command -v clang-18 2>/dev/null || command -v clang 2>/dev/null || command -v llvm-strip-18 2>/dev/null || command -v llvm-strip 2>/dev/null || echo clang)" 2>/dev/null || echo .)
 export LLVM_BINDIR
 export LLVM_CONFIG
 
@@ -58,8 +57,11 @@ PFSC_ENCODER ?= runtime
 PFSC_ZLIB_LEVEL ?= 7
 PFSC_THRESHOLD_GAIN ?= 5
 PFSC_FORCE_RAW_EXEC ?= 1
-ZLIB_INCLUDE ?= /Users/jumasayeh/Developer/etaHEN/Source\ Code/include
-ZLIB_LIB ?= /Users/jumasayeh/Developer/etaHEN/Source\ Code/lib/libz.a
+ZLIB_INCLUDE := third_party/zlib
+ZLIB_LIB := build/zlib/libz.a
+ZLIB_SRCS := adler32.c compress.c crc32.c deflate.c infback.c inffast.c inflate.c inftrees.c trees.c uncompr.c zutil.c
+ZLIB_HEADERS := $(wildcard third_party/zlib/*.h)
+ZLIB_OBJS := $(patsubst %.c,build/zlib/%.o,$(ZLIB_SRCS))
 
 ifneq ($(filter $(PFSC_ENCODER),runtime zlib miniz),)
 CFLAGS_COMMON += -DGC_PFSC_ZLIB_LEVEL=$(PFSC_ZLIB_LEVEL)
@@ -77,6 +79,9 @@ LDADD += $(ZLIB_LIB)
 
 all: $(BIN)
 
+check-sdk-fw1360:
+	$(PYTHON) tools/check_sdk_fw1360.py "$(PS5_PAYLOAD_SDK)"
+
 gen/assets:
 	mkdir -p $@
 
@@ -89,11 +94,18 @@ $(FAST_OBJS): build/%.o: %.c Makefile
 
 build/src/gc_app_installer.o: $(APP_ASSETS)
 
+build/zlib/%.o: third_party/zlib/%.c $(ZLIB_HEADERS) Makefile
+	mkdir -p $(dir $@)
+	"$(CC)" -O2 -I$(ZLIB_INCLUDE) -c $< -o $@
+
+$(ZLIB_LIB): $(ZLIB_OBJS)
+	"$(AR)" rcs $@ $(ZLIB_OBJS)
+
 build/%.o: %.c Makefile
 	mkdir -p $(dir $@)
 	"$(CC)" $(CFLAGS_COMMON) -c $< -o $@
 
-$(BIN): $(OBJS) $(APP_ASSETS)
+$(BIN): $(OBJS) $(APP_ASSETS) $(ZLIB_LIB) | check-sdk-fw1360
 	"$(CC)" $(CFLAGS_COMMON) $(LDFLAGS_COMMON) -o $@ $(OBJS) $(LDADD)
 	"$(STRIP)" --strip-all $@
 
@@ -101,4 +113,4 @@ clean:
 	rm -rf build gen $(BIN)
 
 .SECONDARY: $(GEN_SRCS)
-.PHONY: all clean
+.PHONY: all clean check-sdk-fw1360

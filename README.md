@@ -94,18 +94,36 @@ first.
 
 ## Build
 
-Set `PS5_PAYLOAD_SDK` to your local SDK path, then run `make`:
+For firmware 13.60, use [ps5-payload-sdk v0.43](https://github.com/ps5-payload-dev/sdk/releases/tag/v0.43)
+or newer. Its CRT contains the 13.60 kernel initialization case. Earlier
+Game Compressor builds can fail before `main()` and create no application log.
+The build checks the SDK CRT for that case and refuses an unsupported SDK.
+
+On Linux or WSL, install `make`, Python 3, Clang 18, and LLD 18. Set
+`PS5_PAYLOAD_SDK` to the extracted SDK path, then run `make`:
 
 ```sh
 export PS5_PAYLOAD_SDK=/path/to/ps5-payload-sdk
 make
 ```
 
+The needed zlib 1.3.1 sources are included under `third_party/zlib` and are
+built for PS5 along with the payload. No external zlib path is required.
+
 The build output is:
 
 ```text
 game-compressor.elf
 ```
+
+The 13.60 build has been checked for successful compilation and ELF format.
+A locally built payload was also launched successfully on a PS5 running
+firmware 13.60.
+
+GitHub Actions builds the ELF on pushes and pull requests. Pushing a `v*` tag
+also creates or updates a GitHub Release containing `game-compressor.elf` and
+`SHA256SUMS`. The workflow downloads the pinned SDK v0.43 release, verifies its
+SHA-256 checksum, and checks that its CRT contains the firmware 13.60 case.
 
 Generated build outputs are intentionally ignored by git:
 
