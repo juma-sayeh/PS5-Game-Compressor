@@ -8,6 +8,23 @@ mounted through ShadowMountPlus: pick a title, choose an action, and let the PS5
 do the work. The app keeps long operations running on the console even if the
 browser window is closed.
 
+## Rest mode and interrupted jobs
+
+During ordinary copying, compression, unpacking, scanning, and validation,
+Game Compressor allows automatic rest mode. If the PS5 preserves the payload
+process, the worker continues after wake and the web UI refreshes its progress
+and history when reopened. During source deletion, destructive stream
+compression, block repair, and mount/configuration changes, Game Compressor
+renews the console's automatic rest timer until the critical phase ends.
+
+The power timer cannot prevent someone from choosing rest mode manually.
+Avoid manual rest while an operation is changing existing game data. If the
+payload stops during rest or restarts afterward, unfinished jobs are recorded
+as interrupted in history. Queued jobs are cancelled, and running jobs are
+marked failed; neither is restarted automatically. Inspect the source and
+output paths before retrying, especially after destructive compression or
+deletion.
+
 ## Main Features
 
 - Compress mounted game folders or images into FF-PFSC output.

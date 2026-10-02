@@ -1,5 +1,5 @@
 /*
- * Game Compressor - keep PS5 idle/display timers reset during operations.
+ * Game Compressor - inhibit automatic rest only while data is at risk.
  */
 
 #include "gc_power_guard.h"
@@ -95,12 +95,15 @@ power_guard_thread_main(void *arg) {
   time_t last_fail_log = 0;
 
   for(;;) {
-    int busy = atomic_load(&g_job.busy) != 0;
+    int busy = atomic_load(&g_job.busy) != 0 &&
+        (atomic_load(&g_job.rest_blocked) != 0 ||
+         atomic_load(&g_job.cancel_disabled) != 0 ||
+         atomic_load(&g_job.destructive_stream_active) != 0);
     time_t now = time(NULL);
 
     if(!busy) {
       if(was_busy) {
-        gc_log("power guard idle");
+        gc_log("power guard allowing automatic rest");
       }
       was_busy = 0;
       success_logged = 0;
@@ -110,7 +113,7 @@ power_guard_thread_main(void *arg) {
     }
 
     if(!was_busy) {
-      gc_log("power guard active");
+      gc_log("power guard blocking automatic rest during destructive phase");
       next_tick = 0;
       last_fail_log = 0;
     }
