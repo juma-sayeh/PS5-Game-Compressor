@@ -8,6 +8,36 @@ mounted through ShadowMountPlus: pick a title, choose an action, and let the PS5
 do the work. The app keeps long operations running on the console even if the
 browser window is closed.
 
+## Firmware 13.60 + ShadowMountPlus 1.7 support (v1.1.2-smp17)
+
+This branch adds the missing compatibility between Game Compressor and the
+newer mount stack so `Validate`, `Validate and Repair`, and `Update APR-EMU`
+work again on current consoles:
+
+- **Built with ps5-payload-sdk v0.43**, whose CRT supports firmware 13.60
+  (build lineage from gcoding97's v1.1.x work).
+- **Accepts ShadowMountPlus 1.7's layered `mount_img.lnk` format.** SMP 1.7
+  writes the link to the *outer* container (`layers=2`, e.g.
+  `/data/homebrew/GAME.ffpfsc`) instead of the 1.6-style nested path
+  (`/mnt/shadowmnt/pfsc/<name>/GAME.exfat`). The remount verification now
+  derives the expected nested directory from the actual link and accepts the
+  layered form, so compressed `.ffpfsc` titles pass the mount gate again.
+- **Accepts folder titles exposed as real files on `/system_ex`** (firmware
+  13.60 behavior with kstuff 1.11), not only `nullfs` overlays, in the
+  `system_ex` binding check used by `Update APR-EMU` and mount verification.
+- **Operational note:** SMP keeps its LVD image mounts across restarts while
+  Game Compressor clears mount links at the start of mount-dependent
+  operations. If a mount cycle was interrupted, request a fresh mount through
+  SMP's API before validating:
+  `POST http://<PS5_IP>:10101/api/v1/games/mount {"title_id":"PPSAxxxxx","mode":"ro"}`
+  (the API listens on 127.0.0.1 by default; enable it with
+  `api_bind_address=0.0.0.0` in `/data/shadowmount/config.ini`).
+
+Tested on PS5 firmware **13.60** with **kstuff-lite 1.11** and
+**ShadowMountPlus 1.7beta3/1.7beta4**: a 67 GB title compressed to `.ffpfsc`
+(19.5 GB) and its full hash validation (1,029,215 blocks) completed clean,
+with the title mounted and launchable afterwards.
+
 ## Rest mode and interrupted jobs
 
 During ordinary copying, compression, unpacking, scanning, and validation,

@@ -2973,13 +2973,38 @@ system_ex_title_bound_to(const char *title_id,
 
   if(stat(eboot, &st) != 0 || !S_ISREG(st.st_mode)) return 0;
   if(!statfs_ok) return 0;
-  if(strcmp(fs.f_fstypename, "nullfs") != 0) return 0;
-  if(expected_mount_source && expected_mount_source[0] &&
-     !paths_equal_ignoring_trailing_slash(fs.f_mntfromname,
-                                          expected_mount_source)) {
+  if(strcmp(fs.f_fstypename, "nullfs") == 0) {
+    if(expected_mount_source && expected_mount_source[0] &&
+       !paths_equal_ignoring_trailing_slash(fs.f_mntfromname,
+                                            expected_mount_source)) {
+      return 0;
+    }
+  } else if(strcmp(fs.f_fstypename, "exfatfs") != 0) {
+    /* SMP 1.7 on FW 13.60 exposes some titles as real files on the stock
+       system_ex exFAT partition instead of a nullfs overlay; the eboot
+       check above already proves the title is live there. */
     return 0;
   }
   return 1;
+}
+
+/* SMP 1.7 writes mount_img.lnk to the outer container (layers=2) instead of
+ * the nested image path. Accept the outer link when unwrapping that container
+ * mounts at the directory that holds the expected nested image. */
+static int
+image_link_matches_expected(const char *image_link,
+                            const char *expected_image_link) {
+  char outer_mount[1024];
+  char expected_parent[1024];
+
+  if(strcmp(image_link, expected_image_link) == 0) return 1;
+  if(strncmp(expected_image_link, GC_SHADOW_PFSC_BASE,
+             strlen(GC_SHADOW_PFSC_BASE)) != 0) return 0;
+  if(path_parent(expected_image_link, expected_parent,
+                 sizeof(expected_parent)) != 0) return 0;
+  if(shadow_pfsc_mount_dir_for_outer(image_link, outer_mount,
+                                      sizeof(outer_mount)) != 0) return 0;
+  return paths_equal_ignoring_trailing_slash(outer_mount, expected_parent);
 }
 
 static int
@@ -3017,7 +3042,8 @@ wait_for_shadowmount_links(const char *title_id,
     int mount_ok = has_mount && expected_mount_link &&
         strcmp(mount_link, expected_mount_link) == 0;
     int image_ok = expected_image_link && expected_image_link[0]
-        ? (has_image && strcmp(image_link, expected_image_link) == 0)
+        ? (has_image && image_link_matches_expected(image_link,
+                                                    expected_image_link))
         : !has_image;
     int system_ex_ok = system_ex_title_bound_to(
         title_id, expected_mount_link, actual_type, sizeof(actual_type),
