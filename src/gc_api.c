@@ -59,6 +59,8 @@
 #define GC_REMOUNT_WAIT_SECONDS 10
 #define GC_REMOUNT_WAIT_STEP_SECONDS 1
 #define GC_MOUNT_SCAN_REQUEST_SECONDS 2
+#define GC_MOUNT_NUDGE_FIRST_SECONDS 5
+#define GC_MOUNT_NUDGE_STEP_SECONDS 15
 #define GC_SHADOWMOUNT_RESTART_WAIT_SECONDS 4
 #define GC_CANCEL_POLL_USEC 100000U
 #define GC_FORCE_REMOUNT_PREFIX ".__gc_remount_"
@@ -3020,6 +3022,7 @@ wait_for_shadowmount_links(const char *title_id,
   char actual_mountpoint[1024];
   char scan_err[256];
   time_t next_scan_at = 0;
+  time_t next_mount_nudge_at = time(NULL) + GC_MOUNT_NUDGE_FIRST_SECONDS;
   int stale_logged = 0;
   int restart_recovery_attempted = 0;
 
@@ -3091,6 +3094,17 @@ wait_for_shadowmount_links(const char *title_id,
                title_id ? title_id : "", scan_err[0] ? scan_err : "unknown");
         next_scan_at = now + GC_MOUNT_SCAN_REQUEST_SECONDS;
       }
+    }
+
+    if(now >= next_mount_nudge_at) {
+      if(gc_shadowmount_request_mount(title_id) == 0) {
+        gc_log("shadowmount mount nudge sent title=%s",
+               title_id ? title_id : "");
+      } else {
+        gc_log("shadowmount mount nudge unavailable title=%s",
+               title_id ? title_id : "");
+      }
+      next_mount_nudge_at = now + GC_MOUNT_NUDGE_STEP_SECONDS;
     }
 
     if(gc_cancel_requested(err, err_size)) {

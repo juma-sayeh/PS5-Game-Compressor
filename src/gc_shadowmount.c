@@ -1262,6 +1262,72 @@ local_send_all(int fd, const char *data, size_t size) {
   return 0;
 }
 
+#define SHADOWMOUNT_API_PORT 10101
+
+/* Ask ShadowMountPlus to (re)mount a managed title through its local HTTP
+   API. SMP 1.7 keeps LVD image mounts across restarts and skips re-creating
+   the /user/app links after Game Compressor cleared them, so a mount request
+   is the reliable way to restore a live mount. Non-fatal when the API is
+   disabled: callers treat a failure as a hint, not an error. */
+int
+gc_shadowmount_request_mount(const char *title_id) {
+  int fd;
+  struct timeval timeout;
+  struct sockaddr_in addr;
+  char body[128];
+  char request[512];
+  char response[1024];
+  size_t used = 0;
+  int status = 0;
+  int n;
+
+  if(!title_id || !title_id[0]) return -1;
+  n = snprintf(body, sizeof(body), "{\"title_id\":\"%s\"}", title_id);
+  if(n < 0 || (size_t)n >= sizeof(body)) return -1;
+  fd = socket(AF_INET, SOCK_STREAM, 0);
+  if(fd < 0) return -1;
+  timeout.tv_sec = LOCAL_HTTP_TIMEOUT_SECONDS;
+  timeout.tv_usec = 0;
+  setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(SHADOWMOUNT_API_PORT);
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  if(connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+    close(fd);
+    return -1;
+  }
+  n = snprintf(request, sizeof(request),
+               "POST /api/v1/games/mount HTTP/1.1\r\n"
+               "Host: 127.0.0.1:%d\r\n"
+               "Content-Type: application/json\r\n"
+               "Content-Length: %d\r\n"
+               "Connection: close\r\n"
+               "\r\n"
+               "%s",
+               SHADOWMOUNT_API_PORT, (int)strlen(body), body);
+  if(n < 0 || (size_t)n >= sizeof(request)) {
+    close(fd);
+    return -1;
+  }
+  if(local_send_all(fd, request, (size_t)n) != 0) {
+    close(fd);
+    return -1;
+  }
+  while(used + 1 < sizeof(response)) {
+    ssize_t got = recv(fd, response + used, sizeof(response) - 1 - used, 0);
+    if(got < 0 && errno == EINTR) continue;
+    if(got <= 0) break;
+    used += (size_t)got;
+  }
+  close(fd);
+  response[used] = 0;
+  if(sscanf(response, "HTTP/%*s %d", &status) != 1) return -1;
+  if(status >= 400) return -1;
+  return 0;
+}
+
 static int
 payload_manager_launch(const char *elf_path, char *detail, size_t detail_size) {
   int fd;

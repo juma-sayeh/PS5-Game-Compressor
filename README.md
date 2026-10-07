@@ -8,7 +8,7 @@ mounted through ShadowMountPlus: pick a title, choose an action, and let the PS5
 do the work. The app keeps long operations running on the console even if the
 browser window is closed.
 
-## Firmware 13.60 + ShadowMountPlus 1.7 support (v1.1.2-smp17)
+## Firmware 13.60 + ShadowMountPlus 1.7 support (v1.1.3-smp17)
 
 This branch adds the missing compatibility between Game Compressor and the
 newer mount stack so `Validate`, `Validate and Repair`, and `Update APR-EMU`
@@ -25,13 +25,15 @@ work again on current consoles:
 - **Accepts folder titles exposed as real files on `/system_ex`** (firmware
   13.60 behavior with kstuff 1.11), not only `nullfs` overlays, in the
   `system_ex` binding check used by `Update APR-EMU` and mount verification.
-- **Operational note:** SMP keeps its LVD image mounts across restarts while
-  Game Compressor clears mount links at the start of mount-dependent
-  operations. If a mount cycle was interrupted, request a fresh mount through
-  SMP's API before validating:
-  `POST http://<PS5_IP>:10101/api/v1/games/mount {"title_id":"PPSAxxxxx","mode":"ro"}`
-  (the API listens on 127.0.0.1 by default; enable it with
-  `api_bind_address=0.0.0.0` in `/data/shadowmount/config.ini`).
+- **Self-healing mounts (v1.1.3):** SMP keeps its LVD image mounts across
+  restarts while Game Compressor clears mount links at the start of
+  mount-dependent operations, which could previously leave both sides waiting
+  on each other. While waiting for a remount, Game Compressor now asks SMP's
+  local API to mount the title (`POST 127.0.0.1:10101/api/v1/games/mount`)
+  after 5 s and every 15 s afterwards, so `Validate`, `Validate and Repair`,
+  and compress finalize recover on their own. The nudge is a best-effort
+  hint: if SMP's API is disabled the wait falls back to the previous
+  scan/restart behavior.
 
 Tested on PS5 firmware **13.60** with **kstuff-lite 1.11** and
 **ShadowMountPlus 1.7beta3/1.7beta4**: a 67 GB title compressed to `.ffpfsc`
