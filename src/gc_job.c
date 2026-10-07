@@ -336,6 +336,7 @@ job_begin(const char *verb) {
   atomic_store(&g_job.failed_files, 0);
   atomic_store(&g_job.cancel_disabled, 0);
   atomic_store(&g_job.destructive_stream_active, 0);
+  atomic_store(&g_job.rest_blocked, 0);
   atomic_store(&g_job.rollback_requested, 0);
   snprintf(g_job.verb, sizeof(g_job.verb), "%s", verb ? verb : "");
   g_job.current[0] = 0;
@@ -357,6 +358,7 @@ job_end(int rc, const char *err) {
   g_job.ended_at = time(NULL);
   if(rc != 0) snprintf(g_job.error, sizeof(g_job.error), "%s", err ? err : "");
   atomic_store(&g_job.cancel_disabled, 0);
+  atomic_store(&g_job.rest_blocked, 0);
   g_job.cancel_disabled_reason[0] = 0;
   pthread_mutex_unlock(&g_job.lock);
   atomic_store(&g_job.busy, 0);

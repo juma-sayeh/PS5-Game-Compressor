@@ -59,6 +59,8 @@
 #define GC_REMOUNT_WAIT_SECONDS 10
 #define GC_REMOUNT_WAIT_STEP_SECONDS 1
 #define GC_MOUNT_SCAN_REQUEST_SECONDS 2
+#define GC_MOUNT_NUDGE_FIRST_SECONDS 5
+#define GC_MOUNT_NUDGE_STEP_SECONDS 15
 #define GC_SHADOWMOUNT_RESTART_WAIT_SECONDS 4
 #define GC_CANCEL_POLL_USEC 100000U
 #define GC_FORCE_REMOUNT_PREFIX ".__gc_remount_"
@@ -2973,13 +2975,38 @@ system_ex_title_bound_to(const char *title_id,
 
   if(stat(eboot, &st) != 0 || !S_ISREG(st.st_mode)) return 0;
   if(!statfs_ok) return 0;
-  if(strcmp(fs.f_fstypename, "nullfs") != 0) return 0;
-  if(expected_mount_source && expected_mount_source[0] &&
-     !paths_equal_ignoring_trailing_slash(fs.f_mntfromname,
-                                          expected_mount_source)) {
+  if(strcmp(fs.f_fstypename, "nullfs") == 0) {
+    if(expected_mount_source && expected_mount_source[0] &&
+       !paths_equal_ignoring_trailing_slash(fs.f_mntfromname,
+                                            expected_mount_source)) {
+      return 0;
+    }
+  } else if(strcmp(fs.f_fstypename, "exfatfs") != 0) {
+    /* SMP 1.7 on FW 13.60 exposes some titles as real files on the stock
+       system_ex exFAT partition instead of a nullfs overlay; the eboot
+       check above already proves the title is live there. */
     return 0;
   }
   return 1;
+}
+
+/* SMP 1.7 writes mount_img.lnk to the outer container (layers=2) instead of
+ * the nested image path. Accept the outer link when unwrapping that container
+ * mounts at the directory that holds the expected nested image. */
+static int
+image_link_matches_expected(const char *image_link,
+                            const char *expected_image_link) {
+  char outer_mount[1024];
+  char expected_parent[1024];
+
+  if(strcmp(image_link, expected_image_link) == 0) return 1;
+  if(strncmp(expected_image_link, GC_SHADOW_PFSC_BASE,
+             strlen(GC_SHADOW_PFSC_BASE)) != 0) return 0;
+  if(path_parent(expected_image_link, expected_parent,
+                 sizeof(expected_parent)) != 0) return 0;
+  if(shadow_pfsc_mount_dir_for_outer(image_link, outer_mount,
+                                      sizeof(outer_mount)) != 0) return 0;
+  return paths_equal_ignoring_trailing_slash(outer_mount, expected_parent);
 }
 
 static int
@@ -2995,6 +3022,7 @@ wait_for_shadowmount_links(const char *title_id,
   char actual_mountpoint[1024];
   char scan_err[256];
   time_t next_scan_at = 0;
+  time_t next_mount_nudge_at = time(NULL) + GC_MOUNT_NUDGE_FIRST_SECONDS;
   int stale_logged = 0;
   int restart_recovery_attempted = 0;
 
@@ -3017,7 +3045,8 @@ wait_for_shadowmount_links(const char *title_id,
     int mount_ok = has_mount && expected_mount_link &&
         strcmp(mount_link, expected_mount_link) == 0;
     int image_ok = expected_image_link && expected_image_link[0]
-        ? (has_image && strcmp(image_link, expected_image_link) == 0)
+        ? (has_image && image_link_matches_expected(image_link,
+                                                    expected_image_link))
         : !has_image;
     int system_ex_ok = system_ex_title_bound_to(
         title_id, expected_mount_link, actual_type, sizeof(actual_type),
@@ -3065,6 +3094,17 @@ wait_for_shadowmount_links(const char *title_id,
                title_id ? title_id : "", scan_err[0] ? scan_err : "unknown");
         next_scan_at = now + GC_MOUNT_SCAN_REQUEST_SECONDS;
       }
+    }
+
+    if(now >= next_mount_nudge_at) {
+      if(gc_shadowmount_request_mount(title_id) == 0) {
+        gc_log("shadowmount mount nudge sent title=%s",
+               title_id ? title_id : "");
+      } else {
+        gc_log("shadowmount mount nudge unavailable title=%s",
+               title_id ? title_id : "");
+      }
+      next_mount_nudge_at = now + GC_MOUNT_NUDGE_STEP_SECONDS;
     }
 
     if(gc_cancel_requested(err, err_size)) {
@@ -4293,6 +4333,13 @@ operation_result_is_intermediate_phase(const char *phase) {
 static void
 append_operation_phase(gc_operation_t *op, const char *phase) {
   if(!op || !phase || !phase[0]) return;
+  /* These phases change existing files or mount state. Copying to a staging
+     path and reading source data may safely suspend with the process. */
+  atomic_store(&g_job.rest_blocked,
+      !strcmp(phase, "hiding") || !strcmp(phase, "mounting") ||
+      !strcmp(phase, "restoring") || !strcmp(phase, "deleting") ||
+      !strcmp(phase, "repairing") || !strcmp(phase, "patching") ||
+      !strcmp(phase, "configuring"));
   pthread_mutex_lock(&g_gc_lock);
   snprintf(op->phase, sizeof(op->phase), "%s", phase);
   snprintf(op->result, sizeof(op->result), "%s", phase);
@@ -4665,10 +4712,12 @@ static int
 delete_source_after_success_with_title(const char *path, gc_source_kind_t kind,
                                        const char *title_id,
                                        char *err, size_t err_size) {
+  int previous_rest_blocked = atomic_exchange(&g_job.rest_blocked, 1);
   int rc = delete_source_after_success(path, kind, err, err_size);
   if(rc == 0 && kind != GC_SOURCE_FOLDER) {
     delete_vhash_sidecar_if_present(path, "delete source", title_id);
   }
+  atomic_store(&g_job.rest_blocked, previous_rest_blocked);
   return rc;
 }
 
@@ -4795,9 +4844,13 @@ quarantine_uncompress_source(const char *source_path,
              strerror(errno));
     return -1;
   }
+  int previous_rest_blocked = atomic_exchange(&g_job.rest_blocked, 1);
   if(rename(source_path, quarantine_path) != 0) {
+    int rename_errno = errno;
+    atomic_store(&g_job.rest_blocked, previous_rest_blocked);
     snprintf(err, err_size, "quarantine compressed source: %s",
-             strerror(errno));
+             strerror(rename_errno));
+    errno = rename_errno;
     return -1;
   }
   snprintf(q->original_path, sizeof(q->original_path), "%s", source_path);
@@ -6658,6 +6711,7 @@ compress_delete_source_after_success(gc_operation_t *op, const gc_game_t *game,
                                      size_t hidden_count) {
   char delete_err[256] = {0};
   gc_checkpoint("compress delete source");
+  atomic_store(&g_job.rest_blocked, 1);
   job_set_current("Deleting original source");
   if(mount_switch_delete_hidden_source(op, hidden, hidden_count,
                                        game->source_path,
@@ -6745,6 +6799,7 @@ preserve_original_source_after_success(gc_operation_t *op,
   }
   if(!rename_from) rename_from = game->source_path;
 
+  atomic_store(&g_job.rest_blocked, 1);
   if(rename(rename_from, hidden_path) != 0) {
     snprintf(err, err_size, "preserve original source: %s", strerror(errno));
     return -1;
@@ -11230,6 +11285,144 @@ key_in_list(const char *key, char keys[][GC_HISTORY_KEY_SIZE], size_t count) {
   return 0;
 }
 
+static uint64_t
+history_created_at(const char *row) {
+  const char *value, *end;
+  if(!json_find_value_span(row, NULL, "createdAt", &value, &end) ||
+     !value || !end || value >= end) return 0;
+  return (uint64_t)strtoull(value, NULL, 10);
+}
+
+/* History rows are written by append_operation_json, so each field occurs
+   once and has a known JSON type. Keep the original operation metadata when
+   adding a terminal recovery row instead of reconstructing a partial row. */
+static int
+history_replace_field(char **row, const char *field, const char *replacement) {
+  const char *start;
+  const char *end;
+  if(!json_find_value_span(*row, NULL, field, &start, &end) ||
+     !start || !end) return -1;
+  size_t prefix = (size_t)(start - *row);
+  size_t suffix = strlen(end);
+  size_t value_len = strlen(replacement);
+  char *updated = malloc(prefix + value_len + suffix + 1);
+  if(!updated) return -1;
+  memcpy(updated, *row, prefix);
+  memcpy(updated + prefix, replacement, value_len);
+  memcpy(updated + prefix + value_len, end, suffix + 1);
+  free(*row);
+  *row = updated;
+  return 0;
+}
+
+static int
+history_replace_string(char **row, const char *field, const char *value) {
+  json_buf_t encoded = {0};
+  int rc = json_string(&encoded, value);
+  if(rc == 0) rc = history_replace_field(row, field, encoded.data);
+  free(encoded.data);
+  return rc;
+}
+
+static void
+recover_interrupted_history(const char *history_log) {
+  typedef struct recovery_slot {
+    char key[GC_HISTORY_KEY_SIZE];
+    char *row;
+    uint64_t order;
+  } recovery_slot_t;
+  recovery_slot_t slots[GC_MAX_OPS] = {0};
+  size_t count = 0;
+  uint64_t order = 1;
+  int scan_failed = 0;
+  char line[16384];
+  FILE *input = fopen(history_log, "r");
+  if(!input) return;
+  while(fgets(line, sizeof(line), input)) {
+    char id[64], key[GC_HISTORY_KEY_SIZE];
+    int slot = -1;
+    if(!strchr(line, '\n') && !feof(input)) {
+      int ch;
+      while((ch = fgetc(input)) != '\n' && ch != EOF) {}
+      continue;
+    }
+    line[strcspn(line, "\r\n")] = 0;
+    if(!json_find_string_span(line, NULL, "id", id, sizeof(id)) ||
+       history_operation_key(id,
+           history_created_at(line), key,
+           sizeof(key)) != 0) continue;
+    for(size_t i = 0; i < count; i++) {
+      if(!strcmp(slots[i].key, key)) { slot = (int)i; break; }
+    }
+    if(slot < 0) {
+      if(count < GC_MAX_OPS) {
+        slot = (int)count++;
+      } else {
+        slot = 0;
+        for(size_t i = 1; i < count; i++) {
+          if(slots[i].order < slots[slot].order) slot = (int)i;
+        }
+      }
+      snprintf(slots[slot].key, sizeof(slots[slot].key), "%s", key);
+    }
+    char *copy = strdup(line);
+    if(!copy) { scan_failed = 1; break; }
+    free(slots[slot].row);
+    slots[slot].row = copy;
+    slots[slot].order = order++;
+  }
+  fclose(input);
+  if(scan_failed) {
+    gc_log("history recovery skipped: out of memory");
+    for(size_t i = 0; i < count; i++) free(slots[i].row);
+    return;
+  }
+
+  int fd = -1;
+  for(size_t i = 0; i < count; i++) {
+    char status[32], id[64], ended_at[32];
+    char *row = slots[i].row;
+    if(!row || !json_find_string_span(row, NULL, "status", status,
+                                     sizeof(status)) ||
+       (strcmp(status, "pending") && strcmp(status, "running")) ||
+       !json_find_string_span(row, NULL, "id", id, sizeof(id))) continue;
+    char *colon = strchr(id, ':');
+    if(colon) *colon = 0;
+    snprintf(ended_at, sizeof(ended_at), "%ld", (long)time(NULL));
+    char *recovered = strdup(row);
+    if(!recovered) continue;
+    if(history_replace_string(&recovered, "id", id) != 0 ||
+       history_replace_string(&recovered, "status",
+           !strcmp(status, "pending") ? "cancelled" : "failed") != 0 ||
+       history_replace_string(&recovered, "phase", "interrupted") != 0 ||
+       history_replace_string(&recovered, "result", "interrupted") != 0 ||
+       history_replace_string(&recovered, "error",
+           "Payload stopped during operation; inspect files before retrying") != 0 ||
+       history_replace_field(&recovered, "endedAt", ended_at) != 0) {
+      free(recovered);
+      continue;
+    }
+    if(fd < 0) fd = open(history_log, O_WRONLY | O_APPEND);
+    if(fd < 0) {
+      gc_log("history recovery could not open log: %s", strerror(errno));
+      free(recovered);
+      break;
+    }
+    off_t end = lseek(fd, 0, SEEK_END);
+    if(write_all_fd(fd, recovered, strlen(recovered)) != 0 ||
+       write_all_fd(fd, "\n", 1) != 0) {
+      if(end >= 0) (void)ftruncate(fd, end);
+      gc_log("history recovery append failed: %s", strerror(errno));
+      free(recovered);
+      break;
+    }
+    gc_log("recovered interrupted operation id=%s status=%s", id, status);
+    free(recovered);
+  }
+  if(fd >= 0) { fsync(fd); close(fd); }
+  for(size_t i = 0; i < count; i++) free(slots[i].row);
+}
+
 static int
 append_history_json_line(json_buf_t *b, int *first, const char *line) {
   const char *p = line;
@@ -11271,7 +11464,7 @@ append_persisted_history(json_buf_t *b, int *first,
     int slot = -1;
     line[strcspn(line, "\r\n")] = 0;
     if(!json_find_string_value(line, "id", id, sizeof(id))) continue;
-    created_at = json_find_u64_value(line, "createdAt", 0);
+    created_at = history_created_at(line);
     if(history_operation_key(id, created_at, key, sizeof(key)) != 0) {
       continue;
     }
@@ -12055,6 +12248,7 @@ gc_api_recover_on_startup(void) {
   cleanup_force_remount_temps_on_startup();
   cleanup_delete_pending_temps_on_startup();
   mount_switch_restore_recovery_log();
+  recover_interrupted_history(GC_HISTORY_LOG);
 }
 
 int

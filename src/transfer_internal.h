@@ -69,6 +69,7 @@ struct job_state {
   atomic_int      failed_files;
   atomic_int      cancel_disabled;
   atomic_int      destructive_stream_active;
+  atomic_int      rest_blocked;
   atomic_int      rollback_requested;
   char            current[512];
   char            phase[32];

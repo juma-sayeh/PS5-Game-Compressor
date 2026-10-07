@@ -6314,6 +6314,7 @@
       if (state.speed.activeId !== activeId ||
         state.speed.metricKey !== metricKey ||
         state.speed.sampledAt <= 0 ||
+        now - state.speed.sampledAt > 30000 ||
         metricBytes < state.speed.metricBytes) {
         if (cancelingActiveId && cancelingActiveId !== activeId) {
           cancelingActiveId = '';
@@ -8456,6 +8457,10 @@
         if (state.secondaryMenuFor) positionSecondaryMenu();
         if (languageMenuIsOpen()) positionLanguageMenu();
       }, true);
+      document.addEventListener('visibilitychange', () => {
+        if (!document.hidden) startPollBurst(5000);
+      });
+      window.addEventListener('pageshow', () => startPollBurst(5000));
 
       refreshLocalizedUi();
       loadAppStatus();
